@@ -30,6 +30,7 @@ char _license[] SEC("license") = "GPL";
 #define BABY_CPU_DSQ_BASE	100ULL
 
 static u64 nr_cpu_ids;
+static u32 rr_cursor;
 
 static u64 cpu2dsq(s32 cpu)
 {
@@ -169,6 +170,14 @@ struct task_ctx {
 	 * the MIN_DEADLINE_NS floor before preempting it.
 	 */
 	u64 last_run_at;
+
+	/*
+	 * Set by ops.enqueue() to the CPU whose queue the task was
+	 * placed in. The per-CPU queues are sticky, so this is where the
+	 * task will run next; ops.dispatch() re-arms the running task
+	 * only when this still matches the CPU it is running on.
+	 */
+	s32 cpu;
 
 	/*
 	 * Number of interactive priority boosts the task has earned by
@@ -359,23 +368,57 @@ static int init_cpumask(struct bpf_cpumask **cpumask)
 
 /*
  * A task is interactive when it used little CPU in its previous burst
- * window. The boost counter feeds the deadline, not the placement: on a
- * desktop almost every task sleeps early often enough to earn boost, so
- * it is useless for telling latency-sensitive tasks apart from hogs.
+ * window and has run long enough to complete one: fresh tasks start on
+ * the little cores and only move to a big core once their history shows
+ * light usage, so that a spawn that turns into a CPU hog never touches
+ * a big core. The boost counter feeds the deadline, not the placement:
+ * on a desktop almost every task sleeps early often enough to earn
+ * boost, so it is useless for telling latency-sensitive tasks apart
+ * from hogs.
  */
 static bool is_interactive(const struct task_ctx *tctx)
 {
-	return tctx->prev_bursts < TIME_PERIOD / 4;
+	return tctx->prev_bursts < TIME_PERIOD / 4 &&
+	       tctx->prev_bursts + tctx->bursts > 0;
 }
 
 /*
- * A task is heavy when it used more than a quarter of a CPU in its
- * previous burst window.
+ * Return the little CPUs round robin, spreading tasks that must wait
+ * for a little core across the little queues.
  */
-static bool is_heavy(const struct task_ctx *tctx)
+static s32 pick_rr_little(void)
 {
-	return tctx->prev_bursts > TIME_PERIOD / 4;
+	struct bpf_cpumask *little = little_cpumask;
+	s32 cpu, picked = -1;
+	u32 i, n, seen = 0;
+
+	if (!little)
+		return -1;
+
+	bpf_rcu_read_lock();
+	n = bpf_cpumask_weight(cast_mask(little));
+	if (n) {
+		u32 want = __sync_fetch_and_add(&rr_cursor, 1) % n;
+
+		bpf_for(i, 0, nr_cpu_ids) {
+			if (!bpf_cpumask_test_cpu(i, cast_mask(little)))
+				continue;
+			if (seen == want) {
+				picked = i;
+				break;
+			}
+			seen++;
+		}
+	}
+	bpf_rcu_read_unlock();
+
+	return picked;
 }
+
+/*
+ * Return true if @cpu is one of the big cores.
+ */
+static bool is_big_cpu(s32 cpu);
 
 /*
  * Return an idle CPU from @pref that @p is allowed to run on, or a
@@ -421,6 +464,7 @@ s32 BPF_STRUCT_OPS(baby_select_cpu, struct task_struct *p,
 		cpu = pick_idle_cpu_pref(p, big_cpumask);
 		bpf_rcu_read_unlock();
 		if (cpu >= 0) {
+			tctx->cpu = cpu;
 			scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, deadline_ns, 0);
 			__sync_fetch_and_add(&nr_direct_dispatches, 1);
 			return cpu;
@@ -430,14 +474,46 @@ s32 BPF_STRUCT_OPS(baby_select_cpu, struct task_struct *p,
 		cpu = pick_idle_cpu_pref(p, little_cpumask);
 		bpf_rcu_read_unlock();
 		if (cpu >= 0) {
+			tctx->cpu = cpu;
 			scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, deadline_ns, 0);
 			__sync_fetch_and_add(&nr_direct_dispatches, 1);
 			return cpu;
+		}
+
+		/*
+		 * No idle little CPU: keep the task off the big cores
+		 * anyway by queueing it round robin on a little queue,
+		 * unless the big cores are busy too (the system is then
+		 * saturated and every core must work). Queueing behind a
+		 * busy little core keeps the big cores free to sleep.
+		 */
+		{
+			bool idle_big = false;
+			const struct cpumask *idle;
+			s32 lc;
+
+			bpf_rcu_read_lock();
+			idle = scx_bpf_get_idle_cpumask();
+			idle_big = big_cpumask &&
+				bpf_cpumask_intersects(cast_mask(big_cpumask),
+						       idle);
+			scx_bpf_put_cpumask(idle);
+			bpf_rcu_read_unlock();
+
+			lc = idle_big ? pick_rr_little() : -1;
+			if (lc >= 0 && bpf_cpumask_test_cpu(lc, p->cpus_ptr)) {
+				tctx->cpu = lc;
+				return lc;
+			}
+			tctx->cpu = prev_cpu;
+			return prev_cpu;
 		}
 	}
 
 	cpu = scx_bpf_select_cpu_dfl(p, prev_cpu, wake_flags, &is_idle);
 	if (is_idle) {
+		if (tctx)
+			tctx->cpu = cpu;
 		scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, deadline_ns, 0);
 		__sync_fetch_and_add(&nr_direct_dispatches, 1);
 	}
@@ -469,19 +545,6 @@ void BPF_STRUCT_OPS(baby_enqueue, struct task_struct *p, u64 enq_flags)
 	 * this the task would never leave the big core on its own.
 	 */
 	target = prev_cpu;
-	if ((enq_flags & SCX_ENQ_LAST) && is_heavy(tctx)) {
-		bool on_big;
-
-		bpf_rcu_read_lock();
-		on_big = big_cpumask &&
-			 bpf_cpumask_test_cpu(prev_cpu, cast_mask(big_cpumask));
-		bpf_rcu_read_unlock();
-		if (on_big) {
-			cpu = pick_idle_cpu_pref(p, little_cpumask);
-			if (cpu >= 0)
-				target = cpu;
-		}
-	}
 
 	if (tctx->yield_pending) {
 		/*
@@ -507,7 +570,36 @@ void BPF_STRUCT_OPS(baby_enqueue, struct task_struct *p, u64 enq_flags)
 		tctx->deadline = calc_deadline(p, tctx, now);
 	}
 
-	if (enq_flags & SCX_ENQ_WAKEUP) {
+	/*
+	 * Keep non-interactive tasks off the big cores: redirect them to
+	 * an idle little core, or round robin over the little queues
+	 * while the big cores are idle. Without this a task that entered
+	 * the scheduler on a big core (at attach, or forked on one)
+	 * would stay there forever, since a CPU-bound task never wakes
+	 * up to be re-placed.
+	 */
+	if (!is_interactive(tctx) && is_big_cpu(target)) {
+		cpu = pick_idle_cpu_pref(p, little_cpumask);
+		if (cpu < 0) {
+			const struct cpumask *idle;
+			bool idle_big = false;
+
+			bpf_rcu_read_lock();
+			idle = scx_bpf_get_idle_cpumask();
+			idle_big = big_cpumask &&
+				bpf_cpumask_intersects(cast_mask(big_cpumask),
+						       idle);
+			scx_bpf_put_cpumask(idle);
+			bpf_rcu_read_unlock();
+
+			if (idle_big)
+				cpu = pick_rr_little();
+		}
+		if (cpu >= 0 && bpf_cpumask_test_cpu(cpu, p->cpus_ptr))
+			target = cpu;
+	}
+
+	if ((enq_flags & SCX_ENQ_WAKEUP) && is_interactive(tctx)) {
 		/*
 		 * check_preempt_wakeup(): preempt the task running on the
 		 * target CPU if the waker has an earlier deadline and does
@@ -515,6 +607,8 @@ void BPF_STRUCT_OPS(baby_enqueue, struct task_struct *p, u64 enq_flags)
 		 * protecting its CPU burst. The waker is placed directly
 		 * in front of the victim on the local DSQ, skipping the
 		 * global deadline order like the original resched_curr().
+		 * Non-interactive tasks skip this and take their place in
+		 * the little-core queues instead.
 		 */
 		struct task_struct *curr = __COMPAT_scx_bpf_cpu_curr(prev_cpu);
 		struct task_ctx *cctx;
@@ -525,6 +619,7 @@ void BPF_STRUCT_OPS(baby_enqueue, struct task_struct *p, u64 enq_flags)
 			    (s64)(tctx->deadline - cctx->deadline) < 0 &&
 			    p->static_prio <= curr->static_prio &&
 			    can_resched(cctx)) {
+				tctx->cpu = prev_cpu;
 				scx_bpf_dsq_insert(p,
 						   SCX_DSQ_LOCAL_ON | prev_cpu,
 						   deadline_ns,
@@ -542,9 +637,25 @@ void BPF_STRUCT_OPS(baby_enqueue, struct task_struct *p, u64 enq_flags)
 		scx_bpf_kick_cpu(target, SCX_KICK_IDLE);
 	}
 
+	tctx->cpu = target;
 	scx_bpf_dsq_insert_vtime(p, cpu2dsq(target), deadline_ns,
 				 tctx->deadline, enq_flags);
 	__sync_fetch_and_add(&nr_shared_dispatches, 1);
+}
+
+/*
+ * Return true if @cpu is one of the big cores.
+ */
+static bool is_big_cpu(s32 cpu)
+{
+	bool big = false;
+
+	bpf_rcu_read_lock();
+	big = big_cpumask &&
+	      bpf_cpumask_test_cpu(cpu, cast_mask(big_cpumask));
+	bpf_rcu_read_unlock();
+
+	return big;
 }
 
 /*
@@ -552,18 +663,21 @@ void BPF_STRUCT_OPS(baby_enqueue, struct task_struct *p, u64 enq_flags)
  */
 void BPF_STRUCT_OPS(baby_dispatch, s32 cpu, struct task_struct *prev)
 {
+	struct task_ctx *tctx = prev ? try_lookup_task_ctx(prev) : NULL;
 	bool need_running = prev && is_queued(prev);
 
-	if (need_running) {
+	if (need_running && tctx) {
 		/*
 		 * pick_next_entity() keeps the current task only when its
-		 * deadline is strictly earlier than the queued one.
+		 * deadline is strictly earlier than the queued one, and
+		 * only while it actually runs where it is queued: ops-
+		 * enqueue() may have moved the task to another CPU's
+		 * queue, and then it must stop here and resume there.
 		 */
-		struct task_ctx *tctx = try_lookup_task_ctx(prev);
 		struct task_struct *q = __COMPAT_scx_bpf_dsq_peek(cpu2dsq(cpu));
 		u64 q_dl = q ? q->scx.dsq_vtime : ~0ULL;
 
-		if (tctx && (s64)(tctx->deadline - q_dl) < 0) {
+		if (tctx->cpu == cpu && (s64)(tctx->deadline - q_dl) < 0) {
 			scx_bpf_task_set_slice(prev, deadline_ns);
 			return;
 		}
@@ -574,9 +688,12 @@ void BPF_STRUCT_OPS(baby_dispatch, s32 cpu, struct task_struct *prev)
 
 	/*
 	 * newidle_balance(): the local queue is empty, pull a task from
-	 * the most-loaded CPU that can spare one.
+	 * the most-loaded queue that can spare one. Only little CPUs
+	 * steal: an idle big CPU stays idle so that it can sleep, while
+	 * a stealing little CPU also drains stray tasks off the big
+	 * cores.
 	 */
-	{
+	if (!is_big_cpu(cpu)) {
 		u64 max_nr = 1;
 		s32 src = -1;
 		u64 i;
@@ -598,8 +715,20 @@ void BPF_STRUCT_OPS(baby_dispatch, s32 cpu, struct task_struct *prev)
 			return;
 	}
 
-	if (need_running)
+	if (need_running && tctx && tctx->cpu == cpu) {
+		/*
+		 * Nothing else is queued where the task is queued: keep
+		 * it running, as the original does across its deadline
+		 * renewals.
+		 */
 		scx_bpf_task_set_slice(prev, deadline_ns);
+	} else if (!need_running && cpuperf_lvl < 0) {
+		/*
+		 * The CPU is going idle: drop its performance level so
+		 * that it clocks down until the next task runs.
+		 */
+		scx_bpf_cpuperf_set(cpu, 0);
+	}
 }
 
 /*
@@ -834,6 +963,7 @@ s32 BPF_STRUCT_OPS(baby_init_task, struct task_struct *p,
 	tctx->deadline = calc_deadline(p, tctx, now);
 	tctx->start_time = now;
 	tctx->last_acc_at = now;
+	tctx->cpu = -1;
 
 	return 0;
 }
