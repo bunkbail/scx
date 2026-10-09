@@ -716,6 +716,41 @@ void BPF_STRUCT_OPS(baby_enqueue, struct task_struct *p, u64 enq_flags)
 			target = cpu;
 	}
 
+	/*
+	 * Saturation rebalance: with no idle CPU anywhere, a task that
+	 * returns to a deep home queue waits out the whole rotation, and
+	 * the idle steal cannot fix that, because a stolen task comes
+	 * back to its home queue on the next wake. Move a wakeup whose
+	 * home queue holds at least two tasks to the allowed queue with
+	 * the fewest waiting ones when that queue is at least two
+	 * shallower, so wake-driven load spreads over the rotation
+	 * instead of piling up on the cores the tasks happened to land
+	 * on while the machine was still idle. The lowest CPU wins ties,
+	 * which keeps the wakeups stacked.
+	 */
+	if ((enq_flags & SCX_ENQ_WAKEUP) && !scx_bpf_task_running(p) &&
+	    scx_bpf_dsq_nr_queued(cpu2dsq(target)) >= 2) {
+		s32 best = -1;
+		u64 best_nr = 0, i;
+
+		bpf_for(i, 0, nr_cpu_ids) {
+			u64 nr;
+
+			if (!bpf_cpumask_test_cpu(i, p->cpus_ptr))
+				continue;
+
+			nr = scx_bpf_dsq_nr_queued(cpu2dsq(i));
+			if (best < 0 || nr < best_nr) {
+				best = i;
+				best_nr = nr;
+			}
+		}
+
+		if (best >= 0 && best_nr + 2 <=
+		    scx_bpf_dsq_nr_queued(cpu2dsq(target)))
+			target = best;
+	}
+
 	if ((enq_flags & SCX_ENQ_WAKEUP) &&
 	    (is_interactive(tctx) || is_foreground(tctx))) {
 		/*
@@ -749,7 +784,8 @@ void BPF_STRUCT_OPS(baby_enqueue, struct task_struct *p, u64 enq_flags)
 			if (cctx &&
 			    (s64)(tctx->deadline - cctx->deadline) < 0 &&
 			    p->static_prio <= curr->static_prio &&
-			    can_resched(cctx)) {
+			    can_resched(cctx) &&
+			    !scx_bpf_dsq_nr_queued(cpu2dsq(target_cpu))) {
 				tctx->cpu = target_cpu;
 				scx_bpf_dsq_insert(p,
 						   SCX_DSQ_LOCAL_ON | target_cpu,
