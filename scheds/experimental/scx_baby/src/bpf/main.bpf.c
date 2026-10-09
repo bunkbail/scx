@@ -428,23 +428,35 @@ static s32 pick_idle_cpu_pref(struct task_struct *p,
 			      const struct bpf_cpumask *pref)
 {
 	const struct cpumask *idle;
-	s32 cpu;
+	s32 cpu, picked = -1;
+	u64 i;
 
 	if (!pref)
 		return -1;
 
+	/*
+	 * Take the lowest-numbered idle CPU of the preferred class:
+	 * wakeups stack onto the same cores, so that at idle only a
+	 * handful of cores are ever woken instead of the whole class
+	 * rotating. The vtime order of the queues keeps interactive
+	 * tasks at the front when a core does fill up.
+	 */
 	bpf_rcu_read_lock();
 	idle = scx_bpf_get_idle_cpumask();
-	cpu = bpf_cpumask_any_and_distribute(cast_mask(pref), idle);
+	bpf_for(i, 0, nr_cpu_ids) {
+		cpu = i;
+		if (!bpf_cpumask_test_cpu(cpu, cast_mask(pref)) ||
+		    !bpf_cpumask_test_cpu(cpu, idle) ||
+		    !bpf_cpumask_test_cpu(cpu, p->cpus_ptr))
+			continue;
+		if (scx_bpf_test_and_clear_cpu_idle(cpu))
+			picked = cpu;
+		break;
+	}
 	scx_bpf_put_cpumask(idle);
 	bpf_rcu_read_unlock();
 
-	if (cpu >= nr_cpu_ids || !bpf_cpumask_test_cpu(cpu, p->cpus_ptr))
-		return -1;
-	if (!scx_bpf_test_and_clear_cpu_idle(cpu))
-		return -1;
-
-	return cpu;
+	return picked;
 }
 
 /*
@@ -460,21 +472,13 @@ s32 BPF_STRUCT_OPS(baby_select_cpu, struct task_struct *p,
 	s32 cpu;
 
 	/*
-	 * Interactive tasks are sticky: take the previous CPU when it is
-	 * idle (likely in a shallow idle state, cache warm), then the
-	 * little cores, then the big cores. Everything else prefers the
-	 * little cores, so the big cores are only woken by tasks with a
+	 * Interactive tasks prefer the little cores and then the big
+	 * ones, always taking the lowest-numbered idle CPU so that
+	 * wakeups stack onto few cores. Everything else prefers the
+	 * little cores too. A big core is woken only by a task with a
 	 * proven light usage history once the little cores are all busy.
 	 */
 	if (tctx && is_interactive(tctx)) {
-		if (prev_cpu >= 0 && prev_cpu < (s32)nr_cpu_ids &&
-		    scx_bpf_test_and_clear_cpu_idle(prev_cpu)) {
-			tctx->cpu = prev_cpu;
-			scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, deadline_ns, 0);
-			__sync_fetch_and_add(&nr_direct_dispatches, 1);
-			return prev_cpu;
-		}
-
 		bpf_rcu_read_lock();
 		cpu = pick_idle_cpu_pref(p, little_cpumask);
 		if (cpu < 0)
@@ -880,7 +884,7 @@ static void update_cpuperf(struct cpu_ctx *cctx, s32 cpu)
 	if (cctx->perf_lvl >= CPUPERF_HIGH_THRESH)
 		perf_lvl = SCX_CPUPERF_ONE;
 	else if (cctx->perf_lvl <= CPUPERF_LOW_THRESH)
-		perf_lvl = SCX_CPUPERF_ONE / 2;
+		perf_lvl = SCX_CPUPERF_ONE / 4;
 	else
 		perf_lvl = cctx->perf_lvl;
 
