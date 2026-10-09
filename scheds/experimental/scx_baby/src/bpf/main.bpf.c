@@ -673,11 +673,19 @@ void BPF_STRUCT_OPS(baby_dispatch, s32 cpu, struct task_struct *prev)
 		 * only while it actually runs where it is queued: ops-
 		 * enqueue() may have moved the task to another CPU's
 		 * queue, and then it must stop here and resume there.
+		 *
+		 * The queued task always wins when the queue is non-
+		 * empty: the core interleaves the running task and the
+		 * queued one fairly through the local queue FIFO, so a
+		 * heavy task can never starve a waiting one. The
+		 * continuous runtime cap is a second line of defense for
+		 * anything this check cannot see.
 		 */
 		struct task_struct *q = __COMPAT_scx_bpf_dsq_peek(cpu2dsq(cpu));
-		u64 q_dl = q ? q->scx.dsq_vtime : ~0ULL;
+		u64 ran = bpf_ktime_get_ns() - tctx->last_run_at;
 
-		if (tctx->cpu == cpu && (s64)(tctx->deadline - q_dl) < 0) {
+		if (tctx->cpu == cpu && !q &&
+		    ran < 10 * deadline_ns) {
 			scx_bpf_task_set_slice(prev, deadline_ns);
 			return;
 		}
