@@ -459,9 +459,26 @@ s32 BPF_STRUCT_OPS(baby_select_cpu, struct task_struct *p,
 	bool is_idle = false;
 	s32 cpu;
 
+	/*
+	 * Interactive tasks are sticky: take the previous CPU when it is
+	 * idle (likely in a shallow idle state, cache warm), then the
+	 * little cores, then the big cores. Everything else prefers the
+	 * little cores, so the big cores are only woken by tasks with a
+	 * proven light usage history once the little cores are all busy.
+	 */
 	if (tctx && is_interactive(tctx)) {
+		if (prev_cpu >= 0 && prev_cpu < (s32)nr_cpu_ids &&
+		    scx_bpf_test_and_clear_cpu_idle(prev_cpu)) {
+			tctx->cpu = prev_cpu;
+			scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, deadline_ns, 0);
+			__sync_fetch_and_add(&nr_direct_dispatches, 1);
+			return prev_cpu;
+		}
+
 		bpf_rcu_read_lock();
-		cpu = pick_idle_cpu_pref(p, big_cpumask);
+		cpu = pick_idle_cpu_pref(p, little_cpumask);
+		if (cpu < 0)
+			cpu = pick_idle_cpu_pref(p, big_cpumask);
 		bpf_rcu_read_unlock();
 		if (cpu >= 0) {
 			tctx->cpu = cpu;
