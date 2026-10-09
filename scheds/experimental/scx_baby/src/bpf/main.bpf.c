@@ -100,6 +100,46 @@ static const s64 prio_factor[PRIO_FACTOR_NR] = {
 };
 
 /*
+ * The CPU frequency performance level: a negative value will not affect the
+ * performance level and will be ignored.
+ */
+volatile s64 cpuperf_lvl;
+
+/*
+ * Thresholds for applying hysteresis to the CPU performance scaling:
+ *  - below the low threshold, reduce performance to half
+ *  - above the high threshold, raise performance to maximum
+ *
+ * Values between the two thresholds retain the smoothed performance level.
+ */
+#define CPUPERF_LOW_THRESH	(SCX_CPUPERF_ONE / 4)
+#define CPUPERF_HIGH_THRESH	(SCX_CPUPERF_ONE - SCX_CPUPERF_ONE / 4)
+
+/*
+ * Per-CPU context.
+ */
+struct cpu_ctx {
+	u64 last_running;
+	u64 tot_runtime;
+	u64 prev_runtime;
+	u64 perf_lvl;
+};
+
+struct {
+	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+	__type(key, u32);
+	__type(value, struct cpu_ctx);
+	__uint(max_entries, 1);
+} cpu_ctx_stor SEC(".maps");
+
+static struct cpu_ctx *try_lookup_cpu_ctx(s32 cpu)
+{
+	const u32 idx = 0;
+
+	return bpf_map_lookup_percpu_elem(&cpu_ctx_stor, &idx, cpu);
+}
+
+/*
  * Per-task local storage.
  *
  * This is the counterpart of the original struct bs_node, plus the boost
@@ -498,6 +538,91 @@ void BPF_STRUCT_OPS(baby_stopping, struct task_struct *p, bool runnable)
 	 */
 	if (reached_deadline(tctx, now))
 		tctx->deadline = calc_deadline(p, tctx, now);
+
+	/*
+	 * Update CPU runtime for the performance scaling.
+	 */
+	if (cpuperf_lvl < 0) {
+		struct cpu_ctx *cctx;
+
+		cctx = try_lookup_cpu_ctx(scx_bpf_task_cpu(p));
+		if (cctx)
+			cctx->tot_runtime += now - cctx->last_running;
+	}
+}
+
+/*
+ * Exponential weighted moving average (EWMA). Returns the new average as:
+ *
+ *	new_avg := (old_avg * .75) + (new_val * .25);
+ */
+static u64 calc_avg(u64 old_val, u64 new_val)
+{
+	return (old_val - (old_val >> 2)) + (new_val >> 2);
+}
+
+/*
+ * Update the CPU load and scale its target performance level accordingly,
+ * using the utilization observed in the last window, smoothed and applied
+ * with hysteresis.
+ */
+static void update_cpuperf(struct cpu_ctx *cctx, s32 cpu)
+{
+	u64 now = bpf_ktime_get_ns();
+	u64 perf_lvl, delta_runtime, delta_t;
+
+	delta_t = now - cctx->last_running;
+	if (!delta_t)
+		return;
+
+	/*
+	 * Evaluate the CPU utilization of the last window, normalized in
+	 * the range [0 .. SCX_CPUPERF_ONE].
+	 */
+	delta_runtime = cctx->tot_runtime - cctx->prev_runtime;
+	perf_lvl = MIN(delta_runtime * SCX_CPUPERF_ONE / delta_t,
+		       SCX_CPUPERF_ONE);
+
+	/*
+	 * Smooth the target performance level, so that short spikes are
+	 * absorbed while load variations still react quickly.
+	 */
+	cctx->perf_lvl = calc_avg(perf_lvl, cctx->perf_lvl);
+
+	if (cctx->perf_lvl >= CPUPERF_HIGH_THRESH)
+		perf_lvl = SCX_CPUPERF_ONE;
+	else if (cctx->perf_lvl <= CPUPERF_LOW_THRESH)
+		perf_lvl = SCX_CPUPERF_ONE / 2;
+	else
+		perf_lvl = cctx->perf_lvl;
+
+	scx_bpf_cpuperf_set(cpu, perf_lvl);
+
+	cctx->last_running = now;
+	cctx->prev_runtime = cctx->tot_runtime;
+}
+
+/*
+ * Initialize the CPU frequency performance level on all online CPUs.
+ */
+static void init_cpuperf_target(void)
+{
+	const struct cpumask *online_cpumask;
+	u64 perf_lvl;
+	s32 cpu;
+
+	online_cpumask = scx_bpf_get_online_cpumask();
+	bpf_for(cpu, 0, nr_cpu_ids) {
+		if (!bpf_cpumask_test_cpu(cpu, online_cpumask))
+			continue;
+
+		if (cpuperf_lvl < 0)
+			perf_lvl = SCX_CPUPERF_ONE;
+		else
+			perf_lvl = MIN(cpuperf_lvl, SCX_CPUPERF_ONE);
+		scx_bpf_cpuperf_set(cpu, perf_lvl);
+	}
+	scx_bpf_put_cpumask(online_cpumask);
 }
 
 /*
@@ -515,6 +640,17 @@ void BPF_STRUCT_OPS(baby_running, struct task_struct *p)
 
 	tctx->last_run_at = now;
 	tctx->last_acc_at = now;
+
+	/*
+	 * Adjust the target CPU frequency before the task starts to run.
+	 */
+	if (cpuperf_lvl < 0) {
+		struct cpu_ctx *cctx;
+
+		cctx = try_lookup_cpu_ctx(scx_bpf_task_cpu(p));
+		if (cctx)
+			update_cpuperf(cctx, scx_bpf_task_cpu(p));
+	}
 
 	/*
 	 * set_next_entity(): a task picked with a deadline that is already
@@ -586,6 +722,9 @@ s32 BPF_STRUCT_OPS(baby_init_task, struct task_struct *p,
 				return err;
 			}
 		}
+
+		/* Initialize the CPU frequency performance level. */
+		init_cpuperf_target();
 
 		return 0;
 	}

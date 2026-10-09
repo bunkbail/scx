@@ -77,6 +77,13 @@ struct Opts {
     #[clap(short = 'd', long, default_value = "1180")]
     deadline_us: u64,
 
+    /// CPU frequency performance level (0 = min, 1024 = max).
+    ///
+    /// By default (auto) the scheduler scales the performance level of
+    /// each CPU in function of its utilization.
+    #[clap(short = 'p', long, allow_hyphen_values = true, default_value = "-1")]
+    perf_lvl: i64,
+
     /// Enable stats monitoring with the specified interval.
     #[clap(long)]
     stats: Option<f64>,
@@ -140,6 +147,18 @@ impl<'a> Scheduler<'a> {
         let rodata = skel.maps.rodata_data.as_mut().unwrap();
         rodata.debug = opts.debug;
         rodata.deadline_ns = opts.deadline_us * 1000;
+
+        // Set the CPU frequency performance level (-1 = automatic).
+        info!(
+            "cpuperf level: {}",
+            match opts.perf_lvl {
+                n if n < 0 => "auto".into(),
+                0 => "min".into(),
+                1024 => "max".into(),
+                n => n.to_string(),
+            }
+        );
+        skel.maps.bss_data.as_mut().unwrap().cpuperf_lvl = opts.perf_lvl;
 
         // Set scheduler flags.
         //
