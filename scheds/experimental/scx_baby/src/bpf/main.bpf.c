@@ -180,6 +180,24 @@ struct task_ctx {
 	s32 cpu;
 
 	/*
+	 * Wake frequency: an EWMA of how often the task wakes, in wakes
+	 * per 100ms (flash's update_freq()). High values mark foreground
+	 * workers: tasks that wake constantly with real work to do, as
+	 * opposed to CPU hogs that never wake and blips that use almost
+	 * no CPU.
+	 */
+	u64 wakeup_freq;
+	u64 last_woke_at;
+
+	/*
+	 * Completed wake-frequency samples: foreground status requires a
+	 * few samples so that the EWMA of a freshly forked task (whose
+	 * first wakeup interval is tiny) cannot read as high frequency
+	 * from one sample.
+	 */
+	u32 wake_samples;
+
+	/*
 	 * Number of interactive priority boosts the task has earned by
 	 * sleeping before consuming its deadline.
 	 */
@@ -383,6 +401,23 @@ static bool is_interactive(const struct task_ctx *tctx)
 }
 
 /*
+ * A task is foreground when it wakes frequently and does real work:
+ * a browser renderer or an audio thread wakes dozens of times per
+ * window with sizable bursts, a CPU hog never wakes, and a UI blip
+ * barely uses the CPU. Foreground tasks deserve the fast cores even
+ * when their bursts are too large for the interactive class, which is
+ * what breaks them under heavy overcommit otherwise.
+ */
+#define FOREGROUND_WAKE_FREQ	10
+
+static bool is_foreground(const struct task_ctx *tctx)
+{
+	return tctx->wake_samples >= 4 &&
+	       tctx->wakeup_freq >= FOREGROUND_WAKE_FREQ &&
+	       tctx->prev_bursts + tctx->bursts > TIME_PERIOD / 20;
+}
+
+/*
  * Return the little CPUs round robin, spreading tasks that must wait
  * for a little core across the little queues.
  */
@@ -478,7 +513,7 @@ s32 BPF_STRUCT_OPS(baby_select_cpu, struct task_struct *p,
 	 * little cores too. A big core is woken only by a task with a
 	 * proven light usage history once the little cores are all busy.
 	 */
-	if (tctx && is_interactive(tctx)) {
+	if (tctx && (is_interactive(tctx) || is_foreground(tctx))) {
 		bpf_rcu_read_lock();
 		cpu = pick_idle_cpu_pref(p, little_cpumask);
 		if (cpu < 0)
@@ -543,6 +578,47 @@ s32 BPF_STRUCT_OPS(baby_select_cpu, struct task_struct *p,
 }
 
 /*
+ * Return the big core whose running task has the latest deadline among
+ * the ones a foreground task may preempt, or -1 if there is none.
+ * Foreground work is memory-bound and crawls on the low-power overflow
+ * cores, so given no idle fast core it should still steal one.
+ */
+static s32 pick_foreground_target(struct task_struct *p,
+				  struct task_ctx *tctx)
+{
+	struct task_struct *curr;
+	struct task_ctx *cctx;
+	s32 cpu, picked = -1;
+	u64 i, best_dl = 0;
+
+	bpf_for(i, 0, nr_cpu_ids) {
+		cpu = i;
+
+		if (!is_big_cpu(cpu))
+			continue;
+
+		curr = __COMPAT_scx_bpf_cpu_curr(cpu);
+		if (!curr || curr == p || (curr->flags & PF_IDLE))
+			continue;
+
+		cctx = try_lookup_task_ctx(curr);
+		if (!cctx || !can_resched(cctx))
+			continue;
+
+		if ((s64)(tctx->deadline - cctx->deadline) >= 0 ||
+		    p->static_prio > curr->static_prio)
+			continue;
+
+		if (picked == -1 || (s64)(cctx->deadline - best_dl) > 0) {
+			best_dl = cctx->deadline;
+			picked = cpu;
+		}
+	}
+
+	return picked;
+}
+
+/*
  * Enqueue a task that has no idle CPU to run on.
  *
  * The deadline order is the scheduling decision: tasks are placed in the
@@ -599,7 +675,8 @@ void BPF_STRUCT_OPS(baby_enqueue, struct task_struct *p, u64 enq_flags)
 	 * would stay there forever, since a CPU-bound task never wakes
 	 * up to be re-placed.
 	 */
-	if (!is_interactive(tctx) && is_big_cpu(target)) {
+	if (!is_interactive(tctx) && !is_foreground(tctx) &&
+	    is_big_cpu(target)) {
 		cpu = pick_idle_cpu_pref(p, little_cpumask);
 		if (cpu < 0) {
 			const struct cpumask *idle;
@@ -620,7 +697,8 @@ void BPF_STRUCT_OPS(baby_enqueue, struct task_struct *p, u64 enq_flags)
 			target = cpu;
 	}
 
-	if ((enq_flags & SCX_ENQ_WAKEUP) && is_interactive(tctx)) {
+	if ((enq_flags & SCX_ENQ_WAKEUP) &&
+	    (is_interactive(tctx) || is_foreground(tctx))) {
 		/*
 		 * check_preempt_wakeup(): preempt the task running on the
 		 * target CPU if the waker has an earlier deadline and does
@@ -629,10 +707,23 @@ void BPF_STRUCT_OPS(baby_enqueue, struct task_struct *p, u64 enq_flags)
 		 * in front of the victim on the local DSQ, skipping the
 		 * global deadline order like the original resched_curr().
 		 * Non-interactive tasks skip this and take their place in
-		 * the little-core queues instead.
+		 * the little-core queues instead. Foreground workers
+		 * preempt on a big core even when they last ran elsewhere:
+		 * their work is memory-bound and crawls on the low-power
+		 * overflow cores.
 		 */
-		struct task_struct *curr = __COMPAT_scx_bpf_cpu_curr(prev_cpu);
+		struct task_struct *curr;
 		struct task_ctx *cctx;
+		s32 target_cpu = prev_cpu;
+
+		if (is_foreground(tctx) && !is_big_cpu(target_cpu)) {
+			s32 big_cpu = pick_foreground_target(p, tctx);
+
+			if (big_cpu >= 0)
+				target_cpu = big_cpu;
+		}
+
+		curr = __COMPAT_scx_bpf_cpu_curr(target_cpu);
 
 		if (curr && curr != p && !(curr->flags & PF_IDLE)) {
 			cctx = try_lookup_task_ctx(curr);
@@ -640,9 +731,9 @@ void BPF_STRUCT_OPS(baby_enqueue, struct task_struct *p, u64 enq_flags)
 			    (s64)(tctx->deadline - cctx->deadline) < 0 &&
 			    p->static_prio <= curr->static_prio &&
 			    can_resched(cctx)) {
-				tctx->cpu = prev_cpu;
+				tctx->cpu = target_cpu;
 				scx_bpf_dsq_insert(p,
-						   SCX_DSQ_LOCAL_ON | prev_cpu,
+						   SCX_DSQ_LOCAL_ON | target_cpu,
 						   deadline_ns,
 						   enq_flags | SCX_ENQ_PREEMPT);
 				__sync_fetch_and_add(&nr_preemptions, 1);
@@ -918,6 +1009,35 @@ static void init_cpuperf_target(void)
 }
 
 /*
+ * The task has become runnable: track how often it wakes. Frequent
+ * wakers with real work to do are foreground tasks.
+ */
+void BPF_STRUCT_OPS(baby_runnable, struct task_struct *p, u64 enq_flags)
+{
+	struct task_ctx *tctx = try_lookup_task_ctx(p);
+	u64 now, delta;
+
+	if (!tctx)
+		return;
+
+	now = bpf_ktime_get_ns();
+	delta = now - tctx->last_woke_at;
+	if (!delta)
+		return;
+	tctx->last_woke_at = now;
+
+	/*
+	 * Wakes per 100ms, smoothed (EWMA) and capped: a task that wakes
+	 * every millisecond or faster saturates the counter.
+	 */
+	tctx->wakeup_freq = calc_avg(tctx->wakeup_freq,
+				     (100 * NSEC_PER_MSEC) / delta);
+	tctx->wakeup_freq = MIN(tctx->wakeup_freq, 100);
+	if (tctx->wake_samples < 255)
+		tctx->wake_samples++;
+}
+
+/*
  * The task has started to run on a CPU.
  */
 void BPF_STRUCT_OPS(baby_running, struct task_struct *p)
@@ -992,6 +1112,7 @@ s32 BPF_STRUCT_OPS(baby_init_task, struct task_struct *p,
 	tctx->deadline = calc_deadline(p, tctx, now);
 	tctx->start_time = now;
 	tctx->last_acc_at = now;
+	tctx->last_woke_at = now;
 	tctx->cpu = -1;
 
 	return 0;
@@ -1055,6 +1176,7 @@ SCX_OPS_DEFINE(baby_ops,
 	       .dispatch		= (void *)baby_dispatch,
 	       .tick			= (void *)baby_tick,
 	       .running			= (void *)baby_running,
+	       .runnable		= (void *)baby_runnable,
 	       .stopping		= (void *)baby_stopping,
 	       .yield			= (void *)baby_yield,
 	       .init_task		= (void *)baby_init_task,
