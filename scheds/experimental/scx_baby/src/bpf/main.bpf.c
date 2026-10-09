@@ -648,7 +648,7 @@ void BPF_STRUCT_OPS(baby_enqueue, struct task_struct *p, u64 enq_flags)
 	struct task_ctx *tctx = try_lookup_task_ctx(p);
 	s32 prev_cpu = scx_bpf_task_cpu(p);
 	s32 target, cpu;
-	u64 now = bpf_ktime_get_ns();
+	u64 slice, now = bpf_ktime_get_ns();
 
 	if (!tctx)
 		return;
@@ -805,7 +805,19 @@ void BPF_STRUCT_OPS(baby_enqueue, struct task_struct *p, u64 enq_flags)
 	}
 
 	tctx->cpu = target;
-	scx_bpf_dsq_insert_vtime(p, cpu2dsq(target), task_slice(tctx),
+
+	/*
+	 * Saturation slice: on a queue two or more deep the task will
+	 * rotate anyway, and every extra rotation costs a full switch,
+	 * so grant twice the slice while the queue stays deep. A queue
+	 * of zero or one keeps the interactive slice.
+	 */
+	if (scx_bpf_dsq_nr_queued(cpu2dsq(target)) >= 2)
+		slice = 2 * deadline_ns;
+	else
+		slice = task_slice(tctx);
+
+	scx_bpf_dsq_insert_vtime(p, cpu2dsq(target), slice,
 				 tctx->deadline, enq_flags);
 	__sync_fetch_and_add(&nr_shared_dispatches, 1);
 }
