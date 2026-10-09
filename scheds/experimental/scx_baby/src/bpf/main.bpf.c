@@ -23,9 +23,18 @@
 char _license[] SEC("license") = "GPL";
 
 /*
- * Deadline-ordered queue that holds every runnable task.
+ * Every CPU owns a deadline-ordered queue, mirroring the original
+ * per-CPU run lists. The base offset keeps the ids clear of the
+ * kernel-reserved DSQ ids.
  */
-#define BABY_DSQ_ID		4096ULL
+#define BABY_CPU_DSQ_BASE	100ULL
+
+static u64 nr_cpu_ids;
+
+static u64 cpu2dsq(s32 cpu)
+{
+	return BABY_CPU_DSQ_BASE + cpu;
+}
 
 /*
  * Scheduling constants, carried over from the original bs.c.
@@ -359,7 +368,7 @@ void BPF_STRUCT_OPS(baby_enqueue, struct task_struct *p, u64 enq_flags)
 		scx_bpf_kick_cpu(prev_cpu, SCX_KICK_IDLE);
 	}
 
-	scx_bpf_dsq_insert_vtime(p, BABY_DSQ_ID, deadline_ns,
+	scx_bpf_dsq_insert_vtime(p, cpu2dsq(prev_cpu), deadline_ns,
 				 tctx->deadline, enq_flags);
 	__sync_fetch_and_add(&nr_shared_dispatches, 1);
 }
@@ -377,7 +386,7 @@ void BPF_STRUCT_OPS(baby_dispatch, s32 cpu, struct task_struct *prev)
 		 * deadline is strictly earlier than the queued one.
 		 */
 		struct task_ctx *tctx = try_lookup_task_ctx(prev);
-		struct task_struct *q = __COMPAT_scx_bpf_dsq_peek(BABY_DSQ_ID);
+		struct task_struct *q = __COMPAT_scx_bpf_dsq_peek(cpu2dsq(cpu));
 		u64 q_dl = q ? q->scx.dsq_vtime : ~0ULL;
 
 		if (tctx && (s64)(tctx->deadline - q_dl) < 0) {
@@ -386,13 +395,37 @@ void BPF_STRUCT_OPS(baby_dispatch, s32 cpu, struct task_struct *prev)
 		}
 	}
 
-	if (!scx_bpf_dsq_move_to_local(BABY_DSQ_ID, 0) && need_running) {
-		/*
-		 * Nothing else is queued: keep the task running, as the
-		 * original does across its deadline renewals.
-		 */
-		scx_bpf_task_set_slice(prev, deadline_ns);
+	if (scx_bpf_dsq_move_to_local(cpu2dsq(cpu), 0))
+		return;
+
+	/*
+	 * newidle_balance(): the local queue is empty, pull a task from
+	 * the most-loaded CPU that can spare one.
+	 */
+	{
+		u64 max_nr = 1;
+		s32 src = -1;
+		u64 i;
+
+		bpf_for(i, 0, nr_cpu_ids) {
+			u64 nr;
+
+			if ((s32)i == cpu)
+				continue;
+
+			nr = scx_bpf_dsq_nr_queued(cpu2dsq(i));
+			if (nr > max_nr) {
+				max_nr = nr;
+				src = i;
+			}
+		}
+
+		if (src >= 0 && scx_bpf_dsq_move_to_local(cpu2dsq(src), 0))
+			return;
 	}
+
+	if (need_running)
+		scx_bpf_task_set_slice(prev, deadline_ns);
 }
 
 /*
@@ -425,7 +458,7 @@ void BPF_STRUCT_OPS(baby_tick, struct task_struct *p)
 	if (now - tctx->last_run_at < MIN_DEADLINE_NS)
 		return;
 
-	q = __COMPAT_scx_bpf_dsq_peek(BABY_DSQ_ID);
+	q = __COMPAT_scx_bpf_dsq_peek(cpu2dsq(scx_bpf_task_cpu(p)));
 	if (q && (s64)(q->scx.dsq_vtime - tctx->deadline) < 0) {
 		__sync_fetch_and_add(&nr_preemptions, 1);
 		scx_bpf_kick_cpu(scx_bpf_task_cpu(p), SCX_KICK_PREEMPT);
@@ -504,7 +537,7 @@ bool BPF_STRUCT_OPS(baby_yield, struct task_struct *p)
 	if (!tctx)
 		return false;
 
-	if (!scx_bpf_dsq_nr_queued(BABY_DSQ_ID))
+	if (!scx_bpf_dsq_nr_queued(cpu2dsq(scx_bpf_task_cpu(p))))
 		return false;
 
 	tctx->yield_pending = true;
@@ -535,22 +568,27 @@ s32 BPF_STRUCT_OPS(baby_init_task, struct task_struct *p,
 	return 0;
 }
 
-s32 BPF_STRUCT_OPS_SLEEPABLE(baby_init)
-{
-	s32 err;
+	s32 BPF_STRUCT_OPS_SLEEPABLE(baby_init)
+	{
+		u64 cpu;
+		s32 err;
 
-	/*
-	 * Create the global deadline-ordered queue.
-	 */
-	err = scx_bpf_create_dsq(BABY_DSQ_ID, -1);
-	if (err) {
-		scx_bpf_error("failed to create baby DSQ %llu: %d",
-			      BABY_DSQ_ID, err);
-		return err;
+		nr_cpu_ids = scx_bpf_nr_cpu_ids();
+
+		/*
+		 * Create the per-CPU deadline-ordered queues.
+		 */
+		bpf_for(cpu, 0, nr_cpu_ids) {
+			err = scx_bpf_create_dsq(cpu2dsq(cpu), -1);
+			if (err) {
+				scx_bpf_error("failed to create DSQ %llu: %d",
+					      cpu2dsq(cpu), err);
+				return err;
+			}
+		}
+
+		return 0;
 	}
-
-	return 0;
-}
 
 void BPF_STRUCT_OPS(baby_exit, struct scx_exit_info *ei)
 {
