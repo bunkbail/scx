@@ -34,6 +34,13 @@ it can reach:
   waker (earlier deadline, no lower priority) is placed directly in front
   of the task running on its target CPU and preempts it, like the original
   check_preempt_wakeup().
+- On hybrid platforms the highest-capacity cores (read from the kernel's
+  capacity ranking) are preferred by interactive tasks, while everything
+  else prefers the remaining cores, keeping the big cores available and
+  parked for interactive bursts.
+- CPU frequency is driven explicitly with `scx_bpf_cpuperf_set()` from the
+  per-CPU utilization, smoothed and applied with hysteresis, because
+  utilization-based frequency governors are blind under sched_ext.
 
 ## Mapping to sched_ext
 
@@ -53,6 +60,8 @@ it can reach:
 
 - `-d, --deadline-us` : deadline offset (and time slice) in microseconds,
   default 1180 (the original DEADLINE_NS).
+- `-p, --perf` : CPU frequency performance level, 0 (min) to 1024 (max),
+  default -1 (automatic, scaled from each CPU's utilization).
 
 ## Building a static musl binary
 

@@ -313,15 +313,108 @@ static bool can_resched(const struct task_ctx *tctx)
 }
 
 /*
- * Pick a target CPU for a task which is being woken up. If an idle CPU is
- * found, the task is dispatched directly to it and ops.enqueue() is
- * skipped.
+ * Big and little CPU sets, built from the platform's core types by
+ * userspace at startup. Interactive tasks prefer an idle big CPU,
+ * everything else prefers an idle little one, so that the big cores
+ * stay available (and parked) for interactive bursts.
+ */
+private(BABY) struct bpf_cpumask __kptr *big_cpumask;
+private(BABY) struct bpf_cpumask __kptr *little_cpumask;
+
+/*
+ * Allocate/re-allocate a new cpumask.
+ */
+static int calloc_cpumask(struct bpf_cpumask **p_cpumask)
+{
+	struct bpf_cpumask *cpumask;
+
+	cpumask = bpf_cpumask_create();
+	if (!cpumask)
+		return -ENOMEM;
+
+	cpumask = bpf_kptr_xchg(p_cpumask, cpumask);
+	if (cpumask)
+		bpf_cpumask_release(cpumask);
+
+	return 0;
+}
+
+static int init_cpumask(struct bpf_cpumask **cpumask)
+{
+	struct bpf_cpumask *mask;
+	int err = 0;
+
+	mask = *cpumask;
+	if (mask)
+		return 0;
+
+	err = calloc_cpumask(cpumask);
+	if (!err)
+		mask = *cpumask;
+	if (!mask)
+		err = -ENOMEM;
+
+	return err;
+}
+
+/*
+ * Return an idle CPU from @pref that @p is allowed to run on, or a
+ * negative value if there is none.
+ */
+static s32 pick_idle_cpu_pref(struct task_struct *p,
+			      const struct bpf_cpumask *pref)
+{
+	const struct cpumask *idle;
+	s32 cpu;
+
+	if (!pref)
+		return -1;
+
+	bpf_rcu_read_lock();
+	idle = scx_bpf_get_idle_cpumask();
+	cpu = bpf_cpumask_any_and_distribute(cast_mask(pref), idle);
+	scx_bpf_put_cpumask(idle);
+	bpf_rcu_read_unlock();
+
+	if (cpu >= nr_cpu_ids || !bpf_cpumask_test_cpu(cpu, p->cpus_ptr))
+		return -1;
+	if (!scx_bpf_test_and_clear_cpu_idle(cpu))
+		return -1;
+
+	return cpu;
+}
+
+/*
+ * Pick a target CPU for a task which is being woken up: prefer an idle
+ * big CPU for interactive tasks and an idle little CPU for the rest,
+ * falling back to the built-in idle-CPU selection.
  */
 s32 BPF_STRUCT_OPS(baby_select_cpu, struct task_struct *p,
 		   s32 prev_cpu, u64 wake_flags)
 {
+	struct task_ctx *tctx = try_lookup_task_ctx(p);
 	bool is_idle = false;
 	s32 cpu;
+
+	if (tctx && (tctx->boost > 0 || tctx->yield_pending)) {
+		bpf_rcu_read_lock();
+		cpu = pick_idle_cpu_pref(p, big_cpumask);
+		bpf_rcu_read_unlock();
+		if (cpu >= 0) {
+			scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, deadline_ns, 0);
+			__sync_fetch_and_add(&nr_direct_dispatches, 1);
+			return cpu;
+		}
+	} else if (tctx) {
+		bpf_rcu_read_lock();
+		cpu = pick_idle_cpu_pref(p, little_cpumask);
+		bpf_rcu_read_unlock();
+		if (cpu >= 0) {
+			scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, deadline_ns, 0);
+			__sync_fetch_and_add(&nr_direct_dispatches, 1);
+			return cpu;
+		}
+	}
 
 	cpu = scx_bpf_select_cpu_dfl(p, prev_cpu, wake_flags, &is_idle);
 	if (is_idle) {
@@ -732,6 +825,28 @@ s32 BPF_STRUCT_OPS(baby_init_task, struct task_struct *p,
 void BPF_STRUCT_OPS(baby_exit, struct scx_exit_info *ei)
 {
 	UEI_RECORD(uei, ei);
+}
+
+SEC("syscall")
+int enable_core_class(struct core_arg *input)
+{
+	struct bpf_cpumask *mask;
+	int err;
+
+	err = init_cpumask(&big_cpumask);
+	if (err)
+		return err;
+	err = init_cpumask(&little_cpumask);
+	if (err)
+		return err;
+
+	bpf_rcu_read_lock();
+	mask = input->big ? big_cpumask : little_cpumask;
+	if (mask)
+		bpf_cpumask_set_cpu(input->cpu_id, mask);
+	bpf_rcu_read_unlock();
+
+	return 0;
 }
 
 SCX_OPS_DEFINE(baby_ops,

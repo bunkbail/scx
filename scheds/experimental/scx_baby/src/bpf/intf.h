@@ -11,6 +11,8 @@
 #ifndef __INTF_H
 #define __INTF_H
 
+#include <limits.h>
+
 #define MAX(x, y) ((x) > (y) ? (x) : (y))
 #define MIN(x, y) ((x) < (y) ? (x) : (y))
 
@@ -31,5 +33,10 @@ typedef signed short s16;
 typedef signed int s32;
 typedef signed long s64;
 #endif /* __VMLINUX_H__ */
+
+struct core_arg {
+	s32 cpu_id;
+	s32 big;
+};
 
 #endif /* __INTF_H */

@@ -23,10 +23,13 @@ use anyhow::Result;
 use clap::Parser;
 use crossbeam::channel::RecvTimeoutError;
 use libbpf_rs::OpenObject;
+use libbpf_rs::ProgramInput;
 use log::debug;
 use log::info;
 use log::warn;
 use scx_stats::prelude::*;
+use scx_utils::CoreType;
+use scx_utils::Topology;
 use scx_utils::UserExitInfo;
 use scx_utils::build_id;
 use scx_utils::compat;
@@ -123,10 +126,18 @@ impl<'a> Scheduler<'a> {
     fn init(opts: &'a Opts, open_object: &'a mut MaybeUninit<OpenObject>) -> Result<Self> {
         try_set_rlimit_infinity();
 
+        // Initialize CPU topology.
+        let topo = Topology::new().context("failed to read CPU topology")?;
+
         info!(
-            "{} {}",
+            "{} {} {}",
             SCHEDULER_NAME,
-            build_id::full_version(env!("CARGO_PKG_VERSION"))
+            build_id::full_version(env!("CARGO_PKG_VERSION")),
+            if topo.smt_enabled {
+                "SMT on"
+            } else {
+                "SMT off"
+            }
         );
 
         // Print command line.
@@ -177,6 +188,9 @@ impl<'a> Scheduler<'a> {
         // Load the BPF program for validation.
         let mut skel = scx_ops_load!(skel, baby_ops, uei)?;
 
+        // Classify the cores and publish the big/little CPU sets.
+        Self::init_core_classes(&mut skel, &topo)?;
+
         // Attach the scheduler.
         let struct_ops = Some(scx_ops_attach!(skel, baby_ops)?);
         let stats_server = StatsServer::new(stats::server_data()).launch()?;
@@ -186,6 +200,81 @@ impl<'a> Scheduler<'a> {
             struct_ops,
             stats_server,
         })
+    }
+
+    // Interactive tasks steer to the big cores, the rest to the little
+    // ones. On platforms without a core type split every CPU lands in
+    // the little set and the preference is a no-op.
+    fn init_core_classes(skel: &mut BpfSkel<'_>, topo: &Topology) -> Result<()> {
+        // The big cores are the highest-capacity class, read from the
+        // kernel's capacity ranking when available and falling back to
+        // the topology core types otherwise. A machine without a
+        // capacity split has no big cores and the preference is a
+        // no-op.
+        let capacity = |id: usize| {
+            std::fs::read_to_string(format!("/sys/devices/system/cpu/cpu{id}/cpu_capacity"))
+                .ok()
+                .and_then(|s| s.trim().parse::<u32>().ok())
+        };
+        let ids: Vec<usize> = topo.all_cpus.keys().copied().collect();
+        let capacities: Vec<Option<u32>> = ids.iter().map(|id| capacity(*id)).collect();
+        let caps: Vec<u32> = capacities.iter().flatten().copied().collect();
+        let max_cap = caps.iter().max().copied();
+        let min_cap = caps.iter().min().copied();
+        let capacity_split =
+            matches!((min_cap, max_cap), (Some(lo), Some(hi)) if lo * 100 < hi * 85);
+
+        let mut big: Vec<usize> = Vec::new();
+        if capacity_split {
+            for (idx, id) in ids.iter().enumerate() {
+                if capacities[idx] != max_cap {
+                    continue;
+                }
+                big.push(*id);
+            }
+        } else {
+            for cpu in topo.all_cpus.values() {
+                if matches!(cpu.core_type, CoreType::Big { .. }) {
+                    big.push(cpu.id);
+                }
+            }
+        }
+
+        let little: Vec<usize> = ids.iter().copied().filter(|c| !big.contains(c)).collect();
+        info!("core classes: big={big:?} little={little:?}");
+
+        for id in &ids {
+            Self::enable_core_class(skel, *id, big.contains(id))?;
+        }
+
+        Ok(())
+    }
+
+    fn enable_core_class(skel: &mut BpfSkel<'_>, cpu: usize, big: bool) -> Result<()> {
+        let prog = &mut skel.progs.enable_core_class;
+        let mut args = core_arg {
+            cpu_id: cpu as i32,
+            big: big as i32,
+        };
+        let input = ProgramInput {
+            context_in: Some(unsafe {
+                std::slice::from_raw_parts_mut(
+                    &mut args as *mut _ as *mut u8,
+                    std::mem::size_of_val(&args),
+                )
+            }),
+            ..Default::default()
+        };
+        let out = prog.test_run(input).unwrap();
+        if out.return_value != 0 {
+            return Err(anyhow::anyhow!(
+                "enable_core_class failed for CPU {}: {}",
+                cpu,
+                out.return_value
+            ));
+        }
+
+        Ok(())
     }
 
     fn get_metrics(&self) -> Metrics {
