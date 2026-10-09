@@ -190,6 +190,15 @@ struct task_ctx {
 	u64 last_woke_at;
 
 	/*
+	 * Peak hold of wakeup_freq with a slow leak (1/64 per wake): a
+	 * task throttled by CPU overcommit keeps its high-wake credit
+	 * for a long time, so the foreground class does not collapse
+	 * exactly when it matters, while a task whose nature changed
+	 * re-classifies within a few seconds.
+	 */
+	u32 peak_freq;
+
+	/*
 	 * Completed wake-frequency samples: foreground status requires a
 	 * few samples so that the EWMA of a freshly forked task (whose
 	 * first wakeup interval is tiny) cannot read as high frequency
@@ -413,8 +422,18 @@ static bool is_interactive(const struct task_ctx *tctx)
 static bool is_foreground(const struct task_ctx *tctx)
 {
 	return tctx->wake_samples >= 4 &&
-	       tctx->wakeup_freq >= FOREGROUND_WAKE_FREQ &&
+	       tctx->peak_freq >= FOREGROUND_WAKE_FREQ &&
 	       tctx->prev_bursts + tctx->bursts > TIME_PERIOD / 20;
+}
+
+/*
+ * Foreground tasks get a longer slice: their requests are memory-bound
+ * and interleaving them with hog slices on a busy core multiplies the
+ * wall time of each request.
+ */
+static u64 task_slice(const struct task_ctx *tctx)
+{
+	return is_foreground(tctx) ? 4 * deadline_ns : deadline_ns;
 }
 
 /*
@@ -521,7 +540,7 @@ s32 BPF_STRUCT_OPS(baby_select_cpu, struct task_struct *p,
 		bpf_rcu_read_unlock();
 		if (cpu >= 0) {
 			tctx->cpu = cpu;
-			scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, deadline_ns, 0);
+			scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, task_slice(tctx), 0);
 			__sync_fetch_and_add(&nr_direct_dispatches, 1);
 			return cpu;
 		}
@@ -531,7 +550,7 @@ s32 BPF_STRUCT_OPS(baby_select_cpu, struct task_struct *p,
 		bpf_rcu_read_unlock();
 		if (cpu >= 0) {
 			tctx->cpu = cpu;
-			scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, deadline_ns, 0);
+			scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, task_slice(tctx), 0);
 			__sync_fetch_and_add(&nr_direct_dispatches, 1);
 			return cpu;
 		}
@@ -570,7 +589,7 @@ s32 BPF_STRUCT_OPS(baby_select_cpu, struct task_struct *p,
 	if (is_idle) {
 		if (tctx)
 			tctx->cpu = cpu;
-		scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, deadline_ns, 0);
+		scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, tctx ? task_slice(tctx) : deadline_ns, 0);
 		__sync_fetch_and_add(&nr_direct_dispatches, 1);
 	}
 
@@ -734,7 +753,7 @@ void BPF_STRUCT_OPS(baby_enqueue, struct task_struct *p, u64 enq_flags)
 				tctx->cpu = target_cpu;
 				scx_bpf_dsq_insert(p,
 						   SCX_DSQ_LOCAL_ON | target_cpu,
-						   deadline_ns,
+						   task_slice(tctx),
 						   enq_flags | SCX_ENQ_PREEMPT);
 				__sync_fetch_and_add(&nr_preemptions, 1);
 				return;
@@ -750,7 +769,7 @@ void BPF_STRUCT_OPS(baby_enqueue, struct task_struct *p, u64 enq_flags)
 	}
 
 	tctx->cpu = target;
-	scx_bpf_dsq_insert_vtime(p, cpu2dsq(target), deadline_ns,
+	scx_bpf_dsq_insert_vtime(p, cpu2dsq(target), task_slice(tctx),
 				 tctx->deadline, enq_flags);
 	__sync_fetch_and_add(&nr_shared_dispatches, 1);
 }
@@ -798,7 +817,7 @@ void BPF_STRUCT_OPS(baby_dispatch, s32 cpu, struct task_struct *prev)
 
 		if (tctx->cpu == cpu && !q &&
 		    ran < 10 * deadline_ns) {
-			scx_bpf_task_set_slice(prev, deadline_ns);
+			scx_bpf_task_set_slice(prev, task_slice(tctx));
 			return;
 		}
 	}
@@ -841,7 +860,7 @@ void BPF_STRUCT_OPS(baby_dispatch, s32 cpu, struct task_struct *prev)
 		 * it running, as the original does across its deadline
 		 * renewals.
 		 */
-		scx_bpf_task_set_slice(prev, deadline_ns);
+		scx_bpf_task_set_slice(prev, task_slice(tctx));
 	} else if (!need_running && cpuperf_lvl < 0) {
 		/*
 		 * The CPU is going idle: drop its performance level so
@@ -1028,11 +1047,19 @@ void BPF_STRUCT_OPS(baby_runnable, struct task_struct *p, u64 enq_flags)
 
 	/*
 	 * Wakes per 100ms, smoothed (EWMA) and capped: a task that wakes
-	 * every millisecond or faster saturates the counter.
+	 * every millisecond or faster saturates the counter. The peak
+	 * hold remembers the historical maximum with a slow leak, so a
+	 * throttled task keeps its foreground credit.
 	 */
 	tctx->wakeup_freq = calc_avg(tctx->wakeup_freq,
 				     (100 * NSEC_PER_MSEC) / delta);
 	tctx->wakeup_freq = MIN(tctx->wakeup_freq, 100);
+
+	if (tctx->wakeup_freq >= tctx->peak_freq)
+		tctx->peak_freq = (u32)tctx->wakeup_freq;
+	else
+		tctx->peak_freq -= tctx->peak_freq >> 6;
+
 	if (tctx->wake_samples < 255)
 		tctx->wake_samples++;
 }
