@@ -324,31 +324,31 @@ void BPF_STRUCT_OPS(baby_enqueue, struct task_struct *p, u64 enq_flags)
 		tctx->deadline = calc_deadline(p, tctx, now);
 	}
 
-	scx_bpf_dsq_insert_vtime(p, BABY_DSQ_ID, deadline_ns,
-				 tctx->deadline, enq_flags);
-	__sync_fetch_and_add(&nr_shared_dispatches, 1);
-
 	if (enq_flags & SCX_ENQ_WAKEUP) {
 		/*
 		 * check_preempt_wakeup(): preempt the task running on the
 		 * target CPU if the waker has an earlier deadline and does
 		 * not have a lower priority, unless the running task is
-		 * protecting its CPU burst.
+		 * protecting its CPU burst. The waker is placed directly
+		 * in front of the victim on the local DSQ, skipping the
+		 * global deadline order like the original resched_curr().
 		 */
 		struct task_struct *curr = __COMPAT_scx_bpf_cpu_curr(prev_cpu);
 		struct task_ctx *cctx;
 
-		if (!curr || curr == p || (curr->flags & PF_IDLE))
-			return;
-
-		cctx = try_lookup_task_ctx(curr);
-		if (!cctx)
-			return;
-
-		if ((s64)(tctx->deadline - cctx->deadline) < 0 &&
-		    p->static_prio <= curr->static_prio && can_resched(cctx)) {
-			__sync_fetch_and_add(&nr_preemptions, 1);
-			scx_bpf_kick_cpu(prev_cpu, SCX_KICK_PREEMPT);
+		if (curr && curr != p && !(curr->flags & PF_IDLE)) {
+			cctx = try_lookup_task_ctx(curr);
+			if (cctx &&
+			    (s64)(tctx->deadline - cctx->deadline) < 0 &&
+			    p->static_prio <= curr->static_prio &&
+			    can_resched(cctx)) {
+				scx_bpf_dsq_insert(p,
+						   SCX_DSQ_LOCAL_ON | prev_cpu,
+						   deadline_ns,
+						   enq_flags | SCX_ENQ_PREEMPT);
+				__sync_fetch_and_add(&nr_preemptions, 1);
+				return;
+			}
 		}
 	} else if (!scx_bpf_task_running(p) &&
 		   !__COMPAT_is_enq_cpu_selected(enq_flags)) {
@@ -358,6 +358,10 @@ void BPF_STRUCT_OPS(baby_enqueue, struct task_struct *p, u64 enq_flags)
 		 */
 		scx_bpf_kick_cpu(prev_cpu, SCX_KICK_IDLE);
 	}
+
+	scx_bpf_dsq_insert_vtime(p, BABY_DSQ_ID, deadline_ns,
+				 tctx->deadline, enq_flags);
+	__sync_fetch_and_add(&nr_shared_dispatches, 1);
 }
 
 /*
