@@ -37,6 +37,7 @@ char _license[] SEC("license") = "GPL";
 #define TIME_PERIOD		(200ULL * NSEC_PER_MSEC)
 #define TO_COMPLETE		(5ULL * NSEC_PER_MSEC)
 #define RESCHED_DELTA		(25ULL * NSEC_PER_MSEC)
+#define MIN_DEADLINE_NS		590000ULL
 #define MIN_NICE		(-20)
 #define MAX_NICE		19
 #define MAX_RT_PRIO		100
@@ -113,6 +114,12 @@ struct task_ctx {
 	 * Timestamp of the last burst accounting (while the task runs).
 	 */
 	u64 last_acc_at;
+
+	/*
+	 * Timestamp of when the task last started to run, used to honor
+	 * the MIN_DEADLINE_NS floor before preempting it.
+	 */
+	u64 last_run_at;
 
 	/*
 	 * Number of interactive priority boosts the task has earned by
@@ -302,12 +309,17 @@ void BPF_STRUCT_OPS(baby_enqueue, struct task_struct *p, u64 enq_flags)
 		tctx->yield_pending = false;
 		tctx->deadline = now + deadline_ns + deadline_ns +
 				 task_prio_factor(p, tctx);
-	} else if (!(enq_flags & SCX_ENQ_WAKEUP)) {
+	} else if (!(enq_flags & SCX_ENQ_LAST) &&
+		   !(enq_flags & SCX_ENQ_WAKEUP)) {
 		/*
-		 * Preempted, migrated and freshly created tasks are
-		 * renormalized to a fresh deadline. Woken tasks keep the
-		 * deadline they had when they went to sleep, which is what
-		 * makes interactive tasks run first when they wake up.
+		 * Migrated and freshly created tasks are renormalized to
+		 * a fresh deadline. Woken tasks keep the deadline they
+		 * had when they went to sleep, which is what makes
+		 * interactive tasks run first when they wake up, and a
+		 * task that stopped but stays runnable keeps its
+		 * deadline too, like the original put_prev_entity():
+		 * ops.stopping() has already renewed it if it was
+		 * reached.
 		 */
 		tctx->deadline = calc_deadline(p, tctx, now);
 	}
@@ -402,6 +414,13 @@ void BPF_STRUCT_OPS(baby_tick, struct task_struct *p)
 	if (!can_resched(tctx))
 		return;
 
+	/*
+	 * hrtick: never preempt a task that has not run MIN_DEADLINE_NS
+	 * yet; its deadline renewal is close enough.
+	 */
+	if (now - tctx->last_run_at < MIN_DEADLINE_NS)
+		return;
+
 	q = __COMPAT_scx_bpf_dsq_peek(BABY_DSQ_ID);
 	if (q && (s64)(q->scx.dsq_vtime - tctx->deadline) < 0) {
 		__sync_fetch_and_add(&nr_preemptions, 1);
@@ -457,6 +476,7 @@ void BPF_STRUCT_OPS(baby_running, struct task_struct *p)
 	if (!tctx)
 		return;
 
+	tctx->last_run_at = now;
 	tctx->last_acc_at = now;
 
 	/*
