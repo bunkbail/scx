@@ -358,6 +358,26 @@ static int init_cpumask(struct bpf_cpumask **cpumask)
 }
 
 /*
+ * A task is interactive when it used little CPU in its previous burst
+ * window. The boost counter feeds the deadline, not the placement: on a
+ * desktop almost every task sleeps early often enough to earn boost, so
+ * it is useless for telling latency-sensitive tasks apart from hogs.
+ */
+static bool is_interactive(const struct task_ctx *tctx)
+{
+	return tctx->prev_bursts < TIME_PERIOD / 4;
+}
+
+/*
+ * A task is heavy when it used more than a quarter of a CPU in its
+ * previous burst window.
+ */
+static bool is_heavy(const struct task_ctx *tctx)
+{
+	return tctx->prev_bursts > TIME_PERIOD / 4;
+}
+
+/*
  * Return an idle CPU from @pref that @p is allowed to run on, or a
  * negative value if there is none.
  */
@@ -396,7 +416,7 @@ s32 BPF_STRUCT_OPS(baby_select_cpu, struct task_struct *p,
 	bool is_idle = false;
 	s32 cpu;
 
-	if (tctx && (tctx->boost > 0 || tctx->yield_pending)) {
+	if (tctx && is_interactive(tctx)) {
 		bpf_rcu_read_lock();
 		cpu = pick_idle_cpu_pref(p, big_cpumask);
 		bpf_rcu_read_unlock();
@@ -435,12 +455,33 @@ void BPF_STRUCT_OPS(baby_enqueue, struct task_struct *p, u64 enq_flags)
 {
 	struct task_ctx *tctx = try_lookup_task_ctx(p);
 	s32 prev_cpu = scx_bpf_task_cpu(p);
+	s32 target, cpu;
 	u64 now = bpf_ktime_get_ns();
 
 	if (!tctx)
 		return;
 
 	tctx->last_acc_at = now;
+
+	/*
+	 * A heavy task that stopped on a big core gives it back when a
+	 * little core is idle: the per-CPU queues are sticky, so without
+	 * this the task would never leave the big core on its own.
+	 */
+	target = prev_cpu;
+	if ((enq_flags & SCX_ENQ_LAST) && is_heavy(tctx)) {
+		bool on_big;
+
+		bpf_rcu_read_lock();
+		on_big = big_cpumask &&
+			 bpf_cpumask_test_cpu(prev_cpu, cast_mask(big_cpumask));
+		bpf_rcu_read_unlock();
+		if (on_big) {
+			cpu = pick_idle_cpu_pref(p, little_cpumask);
+			if (cpu >= 0)
+				target = cpu;
+		}
+	}
 
 	if (tctx->yield_pending) {
 		/*
@@ -498,10 +539,10 @@ void BPF_STRUCT_OPS(baby_enqueue, struct task_struct *p, u64 enq_flags)
 		 * The task is placed without the wakeup side effect of
 		 * ops.select_cpu(), so wake the target CPU if it is idle.
 		 */
-		scx_bpf_kick_cpu(prev_cpu, SCX_KICK_IDLE);
+		scx_bpf_kick_cpu(target, SCX_KICK_IDLE);
 	}
 
-	scx_bpf_dsq_insert_vtime(p, cpu2dsq(prev_cpu), deadline_ns,
+	scx_bpf_dsq_insert_vtime(p, cpu2dsq(target), deadline_ns,
 				 tctx->deadline, enq_flags);
 	__sync_fetch_and_add(&nr_shared_dispatches, 1);
 }

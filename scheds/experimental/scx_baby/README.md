@@ -35,9 +35,11 @@ it can reach:
   of the task running on its target CPU and preempts it, like the original
   check_preempt_wakeup().
 - On hybrid platforms the highest-capacity cores (read from the kernel's
-  capacity ranking) are preferred by interactive tasks, while everything
-  else prefers the remaining cores, keeping the big cores available and
-  parked for interactive bursts.
+  capacity ranking) are preferred by tasks that measured as interactive
+  in their last burst window, while everything else prefers the
+  remaining cores, keeping the big cores available and parked for
+  interactive bursts; heavy tasks give a big core back when a little
+  core is idle.
 - CPU frequency is driven explicitly with `scx_bpf_cpuperf_set()` from the
   per-CPU utilization, smoothed and applied with hysteresis, because
   utilization-based frequency governors are blind under sched_ext.
