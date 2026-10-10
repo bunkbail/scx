@@ -956,14 +956,15 @@ void BPF_STRUCT_OPS(baby_tick, struct task_struct *p)
 	 * Saturation preemption lag: with a queue two or more deep, the
 	 * rotation peers carry deadlines within one renewal of each other
 	 * and tick-preempting on every tick turns the run into a swap
-	 * storm. Demand that the queued task be two offsets more overdue
-	 * than the running deadline before it may preempt. A task that
-	 * just woke with a slept-in deadline is overdue by its whole
-	 * sleep and clears the bar at once; only the rotation peers are
-	 * held off, and their chunks lengthen by roughly the lag.
+	 * storm. Demand that the queued task be three offsets more
+	 * overdue than the running deadline before it may preempt. A
+	 * task that just woke with a slept-in deadline is overdue by its
+	 * whole sleep and clears the bar at once; only the rotation
+	 * peers are held off, and their chunks lengthen by roughly the
+	 * lag.
 	 */
 	if (scx_bpf_dsq_nr_queued(cpu2dsq(scx_bpf_task_cpu(p))) >= 2 &&
-	    (s64)(tctx->deadline - 2 * deadline_ns - q->scx.dsq_vtime) <= 0)
+	    (s64)(tctx->deadline - 3 * deadline_ns - q->scx.dsq_vtime) <= 0)
 		return;
 
 	__sync_fetch_and_add(&nr_preemptions, 1);
