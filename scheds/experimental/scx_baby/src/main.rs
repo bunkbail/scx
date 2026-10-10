@@ -241,10 +241,34 @@ impl<'a> Scheduler<'a> {
             }
         }
 
-        let little: Vec<usize> = ids.iter().copied().filter(|c| !big.contains(c)).collect();
-        info!("core classes: big={big:?} little={little:?}");
+        let rest: Vec<usize> = ids.iter().copied().filter(|c| !big.contains(c)).collect();
+
+        // Cores far below the little tier - the L3-less low-power
+        // islands on hybrid laptop parts - stay out of the little set:
+        // that set is the homing pool the wake path stacks on and
+        // round-robins over, and a worker homed on an LP core runs at
+        // a fraction of the little cores' speed with no last-level
+        // cache, which stretches every batch of a batch-parallel
+        // workload to its slowest worker. They are not lost to
+        // scheduling: the kernel's own placement and prev-CPU homing
+        // still run work there when nothing else fits, and an idle LP
+        // core still steals from the deepest queue in ops.dispatch().
+        // Only deliberate homing stops targeting them.
+        let little_cap = rest.iter().filter_map(|c| capacity(*c)).max();
+        let mut little = Vec::new();
+        let mut lp = Vec::new();
+        for c in rest {
+            match (capacity(c), little_cap) {
+                (Some(cap), Some(max)) if cap * 2 < max => lp.push(c),
+                _ => little.push(c),
+            }
+        }
+        info!("core classes: big={big:?} little={little:?} lp={lp:?}");
 
         for id in &ids {
+            if !big.contains(id) && lp.contains(id) {
+                continue;
+            }
             Self::enable_core_class(skel, *id, big.contains(id))?;
         }
 
