@@ -1029,6 +1029,8 @@ void BPF_STRUCT_OPS(baby_dispatch, s32 cpu, struct task_struct *prev)
  * preempt the current task for an earlier-deadline one, unless it is a
  * burst hog (original entity_tick() / hrtick handling).
  */
+static void update_cpuperf(struct cpu_ctx *cctx, s32 cpu);
+
 void BPF_STRUCT_OPS(baby_tick, struct task_struct *p)
 {
 	struct task_ctx *tctx = try_lookup_task_ctx(p);
@@ -1040,6 +1042,28 @@ void BPF_STRUCT_OPS(baby_tick, struct task_struct *p)
 
 	now = bpf_ktime_get_ns();
 	update_bursts(tctx, now);
+
+	/*
+	 * The performance floor must not depend on ops.running() alone:
+	 * a never-descheduling task fires it once, the idle drop has set
+	 * the floor to zero, and nothing ever refreshes it - the core
+	 * then sits at its base clock for as long as the task runs.
+	 * Advance the CPU runtime ledger every tick and re-evaluate the
+	 * floor from it, so sustained work boosts within a couple of
+	 * ticks and the ledger stays consistent with ops.stopping(),
+	 * which charges the time since the last advance.
+	 */
+	if (cpuperf_lvl < 0) {
+		struct cpu_ctx *cctx;
+		s32 cpu = scx_bpf_task_cpu(p);
+
+		cctx = try_lookup_cpu_ctx(cpu);
+		if (cctx) {
+			cctx->tot_runtime += now - cctx->last_running;
+			cctx->last_running = now;
+			update_cpuperf(cctx, cpu);
+		}
+	}
 
 	if (reached_deadline(tctx, now))
 		tctx->deadline = calc_deadline(p, tctx, now);
@@ -1303,7 +1327,13 @@ s32 BPF_STRUCT_OPS(baby_init_task, struct task_struct *p,
 
 	/*
 	 * task_fork_fair(): start the task with a fresh deadline and an
-	 * empty burst history.
+	 * empty burst history - except for a quarter of its parent's
+	 * recent runtime. The child of a busy task is likely busy too (a
+	 * compiler, a benchmark worker), and without credit it would
+	 * spend its first moments on a little core before the up-ramp
+	 * notices. Children of light tasks inherit almost nothing and
+	 * keep the compaction. This also covers the tasks that exist at
+	 * attach: their parents have no context yet and seed nothing.
 	 */
 	now = bpf_ktime_get_ns();
 	tctx->deadline = calc_deadline(p, tctx, now);
@@ -1311,6 +1341,15 @@ s32 BPF_STRUCT_OPS(baby_init_task, struct task_struct *p,
 	tctx->last_acc_at = now;
 	tctx->last_woke_at = now;
 	tctx->cpu = -1;
+	{
+		struct task_struct *parent = p->real_parent;
+		struct task_ctx *ptctx;
+
+		ptctx = parent ? try_lookup_task_ctx(parent) : NULL;
+		if (ptctx)
+			tctx->bursts = (ptctx->prev_bursts +
+					ptctx->bursts) >> 2;
+	}
 
 	return 0;
 }
