@@ -805,8 +805,18 @@ void BPF_STRUCT_OPS(baby_enqueue, struct task_struct *p, u64 enq_flags)
 		}
 
 		if (best >= 0 && best_nr + 2 <=
-		    scx_bpf_dsq_nr_queued(cpu2dsq(target)))
+		    scx_bpf_dsq_nr_queued(cpu2dsq(target))) {
 			target = best;
+			/*
+			 * The shallowest queue can belong to an idle CPU,
+			 * and this is the wake path: ops.select_cpu owns
+			 * the placement and the insert below wakes nobody,
+			 * so kick the target or the task waits for the
+			 * next unrelated wake on that CPU. A busy CPU
+			 * ignores the idle kick.
+			 */
+			scx_bpf_kick_cpu(best, SCX_KICK_IDLE);
+		}
 	}
 
 	if ((enq_flags & SCX_ENQ_WAKEUP) &&
