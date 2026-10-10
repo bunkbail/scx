@@ -928,6 +928,18 @@ void BPF_STRUCT_OPS(baby_dispatch, s32 cpu, struct task_struct *prev)
 		 * it in, and a losing race just means it queues behind
 		 * the winner and retries on a later expiry.
 		 *
+		 * The claimed core's queue must also be empty: the pick
+		 * returns the lowest idle big, and the idle bit only
+		 * clears when the kicked core wakes, so claimants racing
+		 * in that window all choose the same one. Without the
+		 * check a fully parallel load piles every proven worker
+		 * onto the few big cores, each waiting out the whole
+		 * rotation while the little cores idle; one claimant per
+		 * empty big keeps the little cores working. The queue
+		 * probe stays outside the RCU section: the verifier
+		 * rejects scx_bpf_dsq_nr_queued() under
+		 * bpf_rcu_read_lock().
+		 *
 		 * Handing the task away does not end the dispatch: a
 		 * user queue insert wakes nobody, and the wake path
 		 * never kicks its target CPU, so returning here would
@@ -945,7 +957,8 @@ void BPF_STRUCT_OPS(baby_dispatch, s32 cpu, struct task_struct *prev)
 		big = pick_idle_cpu_pref(prev, big_cpumask, false);
 		bpf_rcu_read_unlock();
 
-		if (big >= 0 && bpf_cpumask_test_cpu(big, prev->cpus_ptr)) {
+		if (big >= 0 && bpf_cpumask_test_cpu(big, prev->cpus_ptr) &&
+		    !scx_bpf_dsq_nr_queued(cpu2dsq(big))) {
 			tctx->cpu = big;
 			scx_bpf_dsq_insert_vtime(prev, cpu2dsq(big),
 						 task_slice(tctx),
