@@ -48,10 +48,15 @@ a desktop almost every task earns:
   latency-bound all the same. Same core preference as interactive, and
   under saturation it preempts onto a big core rather than running on the
   low-power overflow cores, where memory-bound work crawls.
-- **Heavy** (everything else, including fresh tasks): always prefers the
-  little cores, is redirected off a big core when found there, and is
-  never replenished past its queue. This is what keeps the big cores free
-  and parked.
+- **Heavy** (everything else, including fresh tasks): prefers the little
+  cores and is redirected off a big core when found there, which keeps
+  the big cores free and parked. A task whose previous burst window used
+  more than a quarter of the period is a *proven* consumer: it claims an
+  idle big core when no little core is free, and - because a CPU-bound
+  task never wakes up to be re-placed - re-queues itself onto an idle
+  big core at every slice expiry. A sustained compile or a benchmark
+  thread ends up on a fast core; the big cores still sleep whenever
+  nothing proven-heavy needs them.
 
 ### Fairness
 

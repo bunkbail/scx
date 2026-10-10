@@ -72,6 +72,7 @@ const volatile bool debug;
  */
 volatile u64 nr_running, nr_direct_dispatches, nr_shared_dispatches;
 volatile u64 nr_preemptions, nr_boosts;
+volatile u64 nr_claims, nr_claim_misses;
 
 /*
  * Exit information.
@@ -350,9 +351,10 @@ static bool can_resched(const struct task_ctx *tctx)
 
 /*
  * Big and little CPU sets, built from the platform's core types by
- * userspace at startup. Interactive tasks prefer an idle big CPU,
- * everything else prefers an idle little one, so that the big cores
- * stay available (and parked) for interactive bursts.
+ * userspace at startup. Everything prefers an idle little core so that
+ * the big cores stay parked; interactive and foreground tasks fall back
+ * to an idle big one, and a proven CPU consumer claims one when no
+ * little core is free and on its slice-expiry requeues.
  */
 private(BABY) struct bpf_cpumask __kptr *big_cpumask;
 private(BABY) struct bpf_cpumask __kptr *little_cpumask;
@@ -407,6 +409,21 @@ static bool is_interactive(const struct task_ctx *tctx)
 {
 	return tctx->prev_bursts < TIME_PERIOD / 4 &&
 	       tctx->prev_bursts + tctx->bursts > 0;
+}
+
+/*
+ * A task is a proven CPU consumer once its recent burst accounting
+ * holds more than a quarter of the period across the current and the
+ * previous window. The accounting covers both windows so that a task
+ * sharing a contended little core - and rolling windows with a fraction
+ * of the core each - does not lose the status it has earned. The
+ * history means the task will keep running for a while, so the fast
+ * core finishes the work sooner and returns to sleep (race to idle),
+ * while a blip with no history stays stacked on the little cores.
+ */
+static bool is_heavy_proven(const struct task_ctx *tctx)
+{
+	return tctx->prev_bursts + tctx->bursts > TIME_PERIOD / 4;
 }
 
 /*
@@ -476,10 +493,12 @@ static bool is_big_cpu(s32 cpu);
 
 /*
  * Return an idle CPU from @pref that @p is allowed to run on, or a
- * negative value if there is none.
+ * negative value if there is none. With @claim the CPU is taken out of
+ * the idle set for a direct dispatch; without it the CPU stays idle,
+ * for a caller that will only re-queue the task onto it.
  */
 static s32 pick_idle_cpu_pref(struct task_struct *p,
-			      const struct bpf_cpumask *pref)
+			      const struct bpf_cpumask *pref, bool claim)
 {
 	const struct cpumask *idle;
 	s32 cpu, picked = -1;
@@ -503,7 +522,7 @@ static s32 pick_idle_cpu_pref(struct task_struct *p,
 		    !bpf_cpumask_test_cpu(cpu, idle) ||
 		    !bpf_cpumask_test_cpu(cpu, p->cpus_ptr))
 			continue;
-		if (scx_bpf_test_and_clear_cpu_idle(cpu))
+		if (!claim || scx_bpf_test_and_clear_cpu_idle(cpu))
 			picked = cpu;
 		break;
 	}
@@ -534,9 +553,9 @@ s32 BPF_STRUCT_OPS(baby_select_cpu, struct task_struct *p,
 	 */
 	if (tctx && (is_interactive(tctx) || is_foreground(tctx))) {
 		bpf_rcu_read_lock();
-		cpu = pick_idle_cpu_pref(p, little_cpumask);
+		cpu = pick_idle_cpu_pref(p, little_cpumask, true);
 		if (cpu < 0)
-			cpu = pick_idle_cpu_pref(p, big_cpumask);
+			cpu = pick_idle_cpu_pref(p, big_cpumask, true);
 		bpf_rcu_read_unlock();
 		if (cpu >= 0) {
 			tctx->cpu = cpu;
@@ -546,7 +565,9 @@ s32 BPF_STRUCT_OPS(baby_select_cpu, struct task_struct *p,
 		}
 	} else if (tctx) {
 		bpf_rcu_read_lock();
-		cpu = pick_idle_cpu_pref(p, little_cpumask);
+		cpu = pick_idle_cpu_pref(p, little_cpumask, true);
+		if (cpu < 0 && is_heavy_proven(tctx))
+			cpu = pick_idle_cpu_pref(p, big_cpumask, true);
 		bpf_rcu_read_unlock();
 		if (cpu >= 0) {
 			tctx->cpu = cpu;
@@ -557,10 +578,14 @@ s32 BPF_STRUCT_OPS(baby_select_cpu, struct task_struct *p,
 
 		/*
 		 * No idle little CPU: keep the task off the big cores
-		 * anyway by queueing it round robin on a little queue,
-		 * unless the big cores are busy too (the system is then
+		 * by queueing it round robin on a little queue, unless
+		 * the big cores are busy too (the system is then
 		 * saturated and every core must work). Queueing behind a
 		 * busy little core keeps the big cores free to sleep.
+		 * A proven consumer skips this: with no idle little core
+		 * anywhere it already claimed one of the idle big cores
+		 * above, so this is only reached when the bigs are busy
+		 * as well, and then the task waits where it ran.
 		 */
 		{
 			bool idle_big = false;
@@ -575,7 +600,8 @@ s32 BPF_STRUCT_OPS(baby_select_cpu, struct task_struct *p,
 			scx_bpf_put_cpumask(idle);
 			bpf_rcu_read_unlock();
 
-			lc = idle_big ? pick_rr_little() : -1;
+			lc = idle_big && !is_heavy_proven(tctx) ?
+			     pick_rr_little() : -1;
 			if (lc >= 0 && bpf_cpumask_test_cpu(lc, p->cpus_ptr)) {
 				tctx->cpu = lc;
 				return lc;
@@ -662,6 +688,16 @@ void BPF_STRUCT_OPS(baby_enqueue, struct task_struct *p, u64 enq_flags)
 	 */
 	target = prev_cpu;
 
+	/*
+	 * ops.dispatch() may have just decided a still-runnable task's
+	 * next core (the big-core claim): requeue it there verbatim and
+	 * stay out of the placement below, none of which applies without
+	 * a wake.
+	 */
+	if ((enq_flags & SCX_ENQ_LAST) && tctx->cpu >= 0 &&
+	    tctx->cpu != prev_cpu)
+		target = tctx->cpu;
+
 	if (tctx->yield_pending) {
 		/*
 		 * yield_task_fair() marks the deadline so the task is
@@ -687,16 +723,18 @@ void BPF_STRUCT_OPS(baby_enqueue, struct task_struct *p, u64 enq_flags)
 	}
 
 	/*
-	 * Keep non-interactive tasks off the big cores: redirect them to
-	 * an idle little core, or round robin over the little queues
-	 * while the big cores are idle. Without this a task that entered
-	 * the scheduler on a big core (at attach, or forked on one)
-	 * would stay there forever, since a CPU-bound task never wakes
-	 * up to be re-placed.
+	 * Keep non-proven tasks off the big cores: redirect them to an
+	 * idle little core, or round robin over the little queues while
+	 * the big cores are idle. Without this a task that entered the
+	 * scheduler on a big core (at attach, or forked on one) would
+	 * stay there forever, since a CPU-bound task never wakes up to
+	 * be re-placed. A proven consumer keeps its big core instead:
+	 * the claim below would only win it straight back, and yanking a
+	 * spinning task between core classes every slice is pure churn.
 	 */
 	if (!is_interactive(tctx) && !is_foreground(tctx) &&
-	    is_big_cpu(target)) {
-		cpu = pick_idle_cpu_pref(p, little_cpumask);
+	    !is_heavy_proven(tctx) && is_big_cpu(target)) {
+		cpu = pick_idle_cpu_pref(p, little_cpumask, true);
 		if (cpu < 0) {
 			const struct cpumask *idle;
 			bool idle_big = false;
@@ -845,6 +883,41 @@ void BPF_STRUCT_OPS(baby_dispatch, s32 cpu, struct task_struct *prev)
 	struct task_ctx *tctx = prev ? try_lookup_task_ctx(prev) : NULL;
 	bool need_running = prev && is_queued(prev);
 
+	if (need_running && tctx && tctx->cpu == cpu && !is_big_cpu(cpu) &&
+	    is_heavy_proven(tctx)) {
+		/*
+		 * Big-core claim: a proven consumer being replenished on
+		 * a little core hands itself to an idle big core instead.
+		 * A CPU-bound task never wakes again after its initial
+		 * placement, so the replenish is the only event that can
+		 * still move it - and a task that is never descheduled
+		 * outruns the continuous-runtime cap below within
+		 * moments, so the claim has to sit ahead of it, on every
+		 * replenish. The pick leaves the idle bit alone: the
+		 * task starts running there once the kicked core pulls
+		 * it in, and a losing race just means it queues behind
+		 * the winner and retries on a later expiry.
+		 */
+		s32 big;
+
+		__sync_fetch_and_add(&nr_claims, 1);
+
+		bpf_rcu_read_lock();
+		big = pick_idle_cpu_pref(prev, big_cpumask, false);
+		bpf_rcu_read_unlock();
+
+		if (big >= 0 && bpf_cpumask_test_cpu(big, prev->cpus_ptr)) {
+			tctx->cpu = big;
+			scx_bpf_dsq_insert_vtime(prev, cpu2dsq(big),
+						 task_slice(tctx),
+						 tctx->deadline, 0);
+			scx_bpf_kick_cpu(big, SCX_KICK_IDLE);
+			return;
+		}
+
+		__sync_fetch_and_add(&nr_claim_misses, 1);
+	}
+
 	if (need_running && tctx) {
 		/*
 		 * pick_next_entity() keeps the current task only when its
@@ -863,8 +936,7 @@ void BPF_STRUCT_OPS(baby_dispatch, s32 cpu, struct task_struct *prev)
 		struct task_struct *q = __COMPAT_scx_bpf_dsq_peek(cpu2dsq(cpu));
 		u64 ran = bpf_ktime_get_ns() - tctx->last_run_at;
 
-		if (tctx->cpu == cpu && !q &&
-		    ran < 10 * deadline_ns) {
+		if (tctx->cpu == cpu && !q && ran < 10 * deadline_ns) {
 			scx_bpf_task_set_slice(prev, task_slice(tctx));
 			return;
 		}
@@ -875,10 +947,14 @@ void BPF_STRUCT_OPS(baby_dispatch, s32 cpu, struct task_struct *prev)
 
 	/*
 	 * newidle_balance(): the local queue is empty, pull a task from
-	 * the most-loaded queue that can spare one. Only little CPUs
-	 * steal: an idle big CPU stays idle so that it can sleep, while
+	 * the most-loaded queue that can spare one. Little CPUs steal
+	 * freely: an idle big CPU stays idle so that it can sleep, while
 	 * a stealing little CPU also drains stray tasks off the big
-	 * cores.
+	 * cores. An idle big CPU steals only a proven consumer, and only
+	 * when one waits in a queue two or more deep: a queued heavy
+	 * backlog while a fast core sleeps is throughput left on the
+	 * table, but the gate keeps desktop blips from ever waking a
+	 * big core.
 	 */
 	if (!is_big_cpu(cpu)) {
 		u64 max_nr = 1;
@@ -896,6 +972,36 @@ void BPF_STRUCT_OPS(baby_dispatch, s32 cpu, struct task_struct *prev)
 				max_nr = nr;
 				src = i;
 			}
+		}
+
+		if (src >= 0 && scx_bpf_dsq_move_to_local(cpu2dsq(src), 0))
+			return;
+	} else {
+		u64 max_nr = 1;
+		s32 src = -1;
+		u64 i;
+
+		bpf_for(i, 0, nr_cpu_ids) {
+			struct task_struct *head;
+			struct task_ctx *hctx;
+			u64 nr;
+
+			if ((s32)i == cpu)
+				continue;
+
+			nr = scx_bpf_dsq_nr_queued(cpu2dsq(i));
+			if (nr <= max_nr)
+				continue;
+
+			head = __COMPAT_scx_bpf_dsq_peek(cpu2dsq(i));
+			if (!head)
+				continue;
+			hctx = try_lookup_task_ctx(head);
+			if (!hctx || !is_heavy_proven(hctx))
+				continue;
+
+			max_nr = nr;
+			src = i;
 		}
 
 		if (src >= 0 && scx_bpf_dsq_move_to_local(cpu2dsq(src), 0))

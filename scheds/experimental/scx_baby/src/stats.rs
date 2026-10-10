@@ -25,19 +25,25 @@ pub struct Metrics {
     pub nr_preemptions: u64,
     #[stat(desc = "Number of interactive priority boosts granted")]
     pub nr_boosts: u64,
+    #[stat(desc = "Number of big-core claims attempted")]
+    pub nr_claims: u64,
+    #[stat(desc = "Number of big-core claims with no idle big core")]
+    pub nr_claim_misses: u64,
 }
 
 impl Metrics {
     fn format<W: Write>(&self, w: &mut W) -> Result<()> {
         writeln!(
             w,
-            "[{}] tasks -> r: {:>2} | dispatch -> d: {:<5} s: {:<5} | preempt: {:<5} | boost: {:<5}",
+            "[{}] tasks -> r: {:>2} | dispatch -> d: {:<5} s: {:<5} | preempt: {:<5} | boost: {:<5} | claim: {:<5} miss: {:<5}",
             crate::SCHEDULER_NAME,
             self.nr_running,
             self.nr_direct_dispatches,
             self.nr_shared_dispatches,
             self.nr_preemptions,
             self.nr_boosts,
+            self.nr_claims,
+            self.nr_claim_misses,
         )?;
         Ok(())
     }
@@ -48,6 +54,8 @@ impl Metrics {
             nr_shared_dispatches: self.nr_shared_dispatches - rhs.nr_shared_dispatches,
             nr_preemptions: self.nr_preemptions - rhs.nr_preemptions,
             nr_boosts: self.nr_boosts - rhs.nr_boosts,
+            nr_claims: self.nr_claims - rhs.nr_claims,
+            nr_claim_misses: self.nr_claim_misses - rhs.nr_claim_misses,
             ..self.clone()
         }
     }

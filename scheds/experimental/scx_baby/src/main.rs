@@ -285,6 +285,8 @@ impl<'a> Scheduler<'a> {
             nr_shared_dispatches: bss_data.nr_shared_dispatches,
             nr_preemptions: bss_data.nr_preemptions,
             nr_boosts: bss_data.nr_boosts,
+            nr_claims: bss_data.nr_claims,
+            nr_claim_misses: bss_data.nr_claim_misses,
         }
     }
 
