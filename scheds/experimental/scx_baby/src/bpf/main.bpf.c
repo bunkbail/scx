@@ -103,9 +103,17 @@ static const s64 prio_factor[PRIO_FACTOR_NR] = {
 
 /*
  * The CPU frequency performance level: a negative value will not affect the
- * performance level and will be ignored.
+ * performance level and will be ignored. -1 selects the automatic
+ * utilization-driven level; -2 leaves the platform governor entirely
+ * alone.
  */
 volatile s64 cpuperf_lvl;
+
+/* True when the platform governor is left alone entirely. */
+static bool cpuperf_offline(void)
+{
+	return cpuperf_lvl < -1;
+}
 
 /*
  * Thresholds for applying hysteresis to the CPU performance scaling:
@@ -125,6 +133,18 @@ struct cpu_ctx {
 	u64 tot_runtime;
 	u64 prev_runtime;
 	u64 perf_lvl;
+
+	/*
+	 * The performance level last requested from the platform.
+	 * Redundant requests are suppressed: on an HWP platform every
+	 * cpufreq update is also the hook that expires the intel_pstate
+	 * iowait boost (it decays when an update arrives more than its
+	 * hold time after the previous one), so a scheduler that writes
+	 * the same level over and over keeps tearing down the boost its
+	 * workload earned. Requesting a level only when it changed is
+	 * what lets the boost latch for the duration of a burst.
+	 */
+	u64 perf_req;
 };
 
 struct {
@@ -1018,9 +1038,17 @@ void BPF_STRUCT_OPS(baby_dispatch, s32 cpu, struct task_struct *prev)
 	} else if (!need_running && cpuperf_lvl < 0) {
 		/*
 		 * The CPU is going idle: drop its performance level so
-		 * that it clocks down until the next task runs.
+		 * that it clocks down until the next task runs. The
+		 * write happens once, when the level actually changes -
+		 * see the comment on perf_req for why the idle path must
+		 * not churn the request either.
 		 */
-		scx_bpf_cpuperf_set(cpu, 0);
+		struct cpu_ctx *cctx = try_lookup_cpu_ctx(cpu);
+
+		if (cctx && cctx->perf_req) {
+			scx_bpf_cpuperf_set(cpu, 0);
+			cctx->perf_req = 0;
+		}
 	}
 }
 
@@ -1029,7 +1057,7 @@ void BPF_STRUCT_OPS(baby_dispatch, s32 cpu, struct task_struct *prev)
  * preempt the current task for an earlier-deadline one, unless it is a
  * burst hog (original entity_tick() / hrtick handling).
  */
-static void update_cpuperf(struct cpu_ctx *cctx, s32 cpu);
+static void update_cpuperf(struct cpu_ctx *cctx, s32 cpu, bool max_floor);
 
 void BPF_STRUCT_OPS(baby_tick, struct task_struct *p)
 {
@@ -1061,7 +1089,9 @@ void BPF_STRUCT_OPS(baby_tick, struct task_struct *p)
 		if (cctx) {
 			cctx->tot_runtime += now - cctx->last_running;
 			cctx->last_running = now;
-			update_cpuperf(cctx, cpu);
+			update_cpuperf(cctx, cpu,
+				       is_heavy_proven(tctx) ||
+				       is_foreground(tctx));
 		}
 	}
 
@@ -1138,7 +1168,7 @@ void BPF_STRUCT_OPS(baby_stopping, struct task_struct *p, bool runnable)
 	/*
 	 * Update CPU runtime for the performance scaling.
 	 */
-	if (cpuperf_lvl < 0) {
+	if (!cpuperf_offline()) {
 		struct cpu_ctx *cctx;
 
 		cctx = try_lookup_cpu_ctx(scx_bpf_task_cpu(p));
@@ -1160,9 +1190,13 @@ static u64 calc_avg(u64 old_val, u64 new_val)
 /*
  * Update the CPU load and scale its target performance level accordingly,
  * using the utilization observed in the last window, smoothed and applied
- * with hysteresis.
+ * with hysteresis. A caller that knows the CPU is about to be saturated
+ * (@max_floor) skips the ramp: the utilization ledger reads near zero
+ * across a brief sleep, and climbing back through the smoothing would
+ * keep the core below its boost clock for the first windows of every
+ * work chunk.
  */
-static void update_cpuperf(struct cpu_ctx *cctx, s32 cpu)
+static void update_cpuperf(struct cpu_ctx *cctx, s32 cpu, bool max_floor)
 {
 	u64 now = bpf_ktime_get_ns();
 	u64 perf_lvl, delta_runtime, delta_t;
@@ -1170,6 +1204,17 @@ static void update_cpuperf(struct cpu_ctx *cctx, s32 cpu)
 	delta_t = now - cctx->last_running;
 	if (!delta_t)
 		return;
+
+	/*
+	 * The utilization window cannot predate the last few slices:
+	 * runtime charged before a sleep is recent history, not a load
+	 * spike to average away. Without the cap a wake after a short
+	 * sleep divides that runtime by the whole sleep and the floor
+	 * collapses, so a task that blocks between chunks never holds
+	 * its boost clock.
+	 */
+	if (delta_t > 4 * deadline_ns)
+		delta_t = 4 * deadline_ns;
 
 	/*
 	 * Evaluate the CPU utilization of the last window, normalized in
@@ -1185,14 +1230,24 @@ static void update_cpuperf(struct cpu_ctx *cctx, s32 cpu)
 	 */
 	cctx->perf_lvl = calc_avg(perf_lvl, cctx->perf_lvl);
 
-	if (cctx->perf_lvl >= CPUPERF_HIGH_THRESH)
+	if (max_floor)
+		perf_lvl = SCX_CPUPERF_ONE;
+	else if (cctx->perf_lvl >= CPUPERF_HIGH_THRESH)
 		perf_lvl = SCX_CPUPERF_ONE;
 	else if (cctx->perf_lvl <= CPUPERF_LOW_THRESH)
 		perf_lvl = SCX_CPUPERF_ONE / 4;
 	else
 		perf_lvl = cctx->perf_lvl;
 
-	scx_bpf_cpuperf_set(cpu, perf_lvl);
+	/*
+	 * Request the level only when it changed. Beyond saving the
+	 * write, the suppression is what keeps the platform's iowait
+	 * boost latched: see the comment on perf_req.
+	 */
+	if (cctx->perf_req != perf_lvl) {
+		scx_bpf_cpuperf_set(cpu, perf_lvl);
+		cctx->perf_req = perf_lvl;
+	}
 
 	cctx->last_running = now;
 	cctx->prev_runtime = cctx->tot_runtime;
@@ -1206,6 +1261,9 @@ static void init_cpuperf_target(void)
 	const struct cpumask *online_cpumask;
 	u64 perf_lvl;
 	s32 cpu;
+
+	if (cpuperf_offline())
+		return;
 
 	online_cpumask = scx_bpf_get_online_cpumask();
 	bpf_for(cpu, 0, nr_cpu_ids) {
@@ -1276,13 +1334,18 @@ void BPF_STRUCT_OPS(baby_running, struct task_struct *p)
 
 	/*
 	 * Adjust the target CPU frequency before the task starts to run.
+	 * A proven consumer or a foreground task saturates the core for
+	 * as long as it runs, so give it the boost clock at once instead
+	 * of re-climbing the smoothing after every sleep.
 	 */
 	if (cpuperf_lvl < 0) {
 		struct cpu_ctx *cctx;
 
 		cctx = try_lookup_cpu_ctx(scx_bpf_task_cpu(p));
 		if (cctx)
-			update_cpuperf(cctx, scx_bpf_task_cpu(p));
+			update_cpuperf(cctx, scx_bpf_task_cpu(p),
+				       is_heavy_proven(tctx) ||
+				       is_foreground(tctx));
 	}
 
 	/*

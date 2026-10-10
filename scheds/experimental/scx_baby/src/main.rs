@@ -82,8 +82,9 @@ struct Opts {
 
     /// CPU frequency performance level (0 = min, 1024 = max).
     ///
-    /// By default (auto) the scheduler scales the performance level of
-    /// each CPU in function of its utilization.
+    /// By default (-1, auto) the scheduler scales the performance level
+    /// of each CPU in function of its utilization. -2 leaves the
+    /// platform's cpufreq setup entirely alone.
     #[clap(short = 'p', long, allow_hyphen_values = true, default_value = "-1")]
     perf_lvl: i64,
 
