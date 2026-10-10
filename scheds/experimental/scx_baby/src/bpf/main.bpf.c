@@ -917,6 +917,15 @@ void BPF_STRUCT_OPS(baby_dispatch, s32 cpu, struct task_struct *prev)
 		 * task starts running there once the kicked core pulls
 		 * it in, and a losing race just means it queues behind
 		 * the winner and retries on a later expiry.
+		 *
+		 * Handing the task away does not end the dispatch: a
+		 * user queue insert wakes nobody, and the wake path
+		 * never kicks its target CPU, so returning here would
+		 * idle the CPU on top of its own queued backlog until
+		 * an unrelated wake lands on it. Fall through and
+		 * consume the queue - the keep-running check below no
+		 * longer matches, the task is homed on the big core
+		 * now.
 		 */
 		s32 big;
 
@@ -932,7 +941,6 @@ void BPF_STRUCT_OPS(baby_dispatch, s32 cpu, struct task_struct *prev)
 						 task_slice(tctx),
 						 tctx->deadline, 0);
 			scx_bpf_kick_cpu(big, SCX_KICK_IDLE);
-			return;
 		}
 
 		__sync_fetch_and_add(&nr_claim_misses, 1);
