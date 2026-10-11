@@ -584,6 +584,59 @@ s32 BPF_STRUCT_OPS(baby_select_cpu, struct task_struct *p,
 			return cpu;
 		}
 	} else if (tctx) {
+		/*
+		 * Placement pin: a proven consumer whose previous run was
+		 * on a big core goes back to a big core when it wakes,
+		 * instead of taking the first idle little core. The P-to-E
+		 * yank is what keeps a single compute thread off its boost
+		 * clock: the two cores' performance levels diverge across
+		 * the move and the platform keeps tearing the boost down on
+		 * every change. The proven history is what keeps request
+		 * workers out: a worker that sleeps within its slice never
+		 * accumulates a quarter window of runtime, while a compute
+		 * phase crosses the bar within its first 50ms.
+		 */
+		if (is_heavy_proven(tctx)) {
+			bool took_prev = false;
+			s32 pinned = -1;
+
+			if (is_big_cpu(prev_cpu) &&
+			    bpf_cpumask_test_cpu(prev_cpu, p->cpus_ptr)) {
+				bpf_rcu_read_lock();
+				took_prev =
+					scx_bpf_test_and_clear_cpu_idle(prev_cpu);
+				bpf_rcu_read_unlock();
+
+				if (took_prev)
+					pinned = prev_cpu;
+			}
+
+			/*
+			 * The home core is busy: any other idle big core
+			 * still beats the little-first path below, which
+			 * is the yank this pin exists to prevent.
+			 */
+			if (pinned < 0) {
+				bpf_rcu_read_lock();
+				pinned = pick_idle_cpu_pref(p, big_cpumask,
+							    true);
+				bpf_rcu_read_unlock();
+			}
+
+			if (pinned >= 0) {
+				tctx->cpu = pinned;
+				scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL,
+						   task_slice(tctx), 0);
+				__sync_fetch_and_add(&nr_direct_dispatches, 1);
+				return pinned;
+			}
+
+			/*
+			 * No big core free at all: the little-first path
+			 * below takes over.
+			 */
+		}
+
 		bpf_rcu_read_lock();
 		cpu = pick_idle_cpu_pref(p, little_cpumask, true);
 		if (cpu < 0 && is_heavy_proven(tctx))
