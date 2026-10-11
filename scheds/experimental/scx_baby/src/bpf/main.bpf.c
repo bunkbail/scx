@@ -145,6 +145,16 @@ struct cpu_ctx {
 	 * what lets the boost latch for the duration of a burst.
 	 */
 	u64 perf_req;
+
+	/*
+	 * When this CPU last ran ops.dispatch(). A CPU that stopped
+	 * calling in while tasks remain queued on it is stuck running
+	 * something the sched_ext class cannot preempt - an RT task:
+	 * CachyOS ships sched_rt_runtime_us=1000000, so nothing bounds
+	 * the hog, and the kernel watchdog force-unloads the whole
+	 * scheduler after 5s of a queued task waiting behind one.
+	 */
+	u64 last_consume_at;
 };
 
 struct {
@@ -961,10 +971,22 @@ static bool is_big_cpu(s32 cpu)
 /*
  * Dispatch the earliest-deadline task to the CPU.
  */
+/*
+ * A queue that has not been consumed for this long is stranded behind
+ * something the sched_ext class cannot preempt (an RT task; RT runtime
+ * is unthrottled on some shipping configs). Rescue it well before the
+ * kernel's 5s watchdog force-unloads the scheduler.
+ */
+#define STARVE_RESCUE_NS	1000000000ull
+
 void BPF_STRUCT_OPS(baby_dispatch, s32 cpu, struct task_struct *prev)
 {
 	struct task_ctx *tctx = prev ? try_lookup_task_ctx(prev) : NULL;
+	struct cpu_ctx *my_cctx = try_lookup_cpu_ctx(cpu);
 	bool need_running = prev && is_queued(prev);
+
+	if (my_cctx)
+		my_cctx->last_consume_at = bpf_ktime_get_ns();
 
 	if (need_running && tctx && tctx->cpu == cpu && !is_big_cpu(cpu) &&
 	    is_heavy_proven(tctx)) {
@@ -1050,9 +1072,13 @@ void BPF_STRUCT_OPS(baby_dispatch, s32 cpu, struct task_struct *prev)
 	if (!is_big_cpu(cpu)) {
 		u64 max_nr = 1;
 		s32 src = -1;
+		s32 starved = -1;
+		u64 starved_at = 0;
+		u64 now = bpf_ktime_get_ns();
 		u64 i;
 
 		bpf_for(i, 0, nr_cpu_ids) {
+			struct cpu_ctx *cc;
 			u64 nr;
 
 			if ((s32)i == cpu)
@@ -1063,13 +1089,31 @@ void BPF_STRUCT_OPS(baby_dispatch, s32 cpu, struct task_struct *prev)
 				max_nr = nr;
 				src = i;
 			}
+
+			cc = try_lookup_cpu_ctx(i);
+			if (nr && cc && now - cc->last_consume_at > STARVE_RESCUE_NS &&
+			    (starved < 0 ||
+			     (s64)(cc->last_consume_at - starved_at) < 0)) {
+				struct task_struct *head;
+
+				head = __COMPAT_scx_bpf_dsq_peek(cpu2dsq(i));
+				if (head && bpf_cpumask_test_cpu(cpu, head->cpus_ptr)) {
+					starved = i;
+					starved_at = cc->last_consume_at;
+				}
+			}
 		}
 
 		if (src >= 0 && scx_bpf_dsq_move_to_local(cpu2dsq(src), 0))
 			return;
+		if (starved >= 0 && scx_bpf_dsq_move_to_local(cpu2dsq(starved), 0))
+			return;
 	} else {
 		u64 max_nr = 1;
 		s32 src = -1;
+		s32 starved = -1;
+		u64 starved_at = 0;
+		u64 now = bpf_ktime_get_ns();
 		u64 i;
 
 		bpf_for(i, 0, nr_cpu_ids) {
@@ -1095,7 +1139,35 @@ void BPF_STRUCT_OPS(baby_dispatch, s32 cpu, struct task_struct *prev)
 			src = i;
 		}
 
+		if (src < 0) {
+			bpf_for(i, 0, nr_cpu_ids) {
+				struct task_struct *head;
+				struct cpu_ctx *cc;
+				u64 nr;
+
+				if ((s32)i == cpu)
+					continue;
+
+				nr = scx_bpf_dsq_nr_queued(cpu2dsq(i));
+				if (!nr)
+					continue;
+
+				cc = try_lookup_cpu_ctx(i);
+				if (cc && now - cc->last_consume_at > STARVE_RESCUE_NS &&
+				    (starved < 0 ||
+				     (s64)(cc->last_consume_at - starved_at) < 0)) {
+					head = __COMPAT_scx_bpf_dsq_peek(cpu2dsq(i));
+					if (head && bpf_cpumask_test_cpu(cpu, head->cpus_ptr)) {
+						starved = i;
+						starved_at = cc->last_consume_at;
+					}
+				}
+			}
+		}
+
 		if (src >= 0 && scx_bpf_dsq_move_to_local(cpu2dsq(src), 0))
+			return;
+		if (starved >= 0 && scx_bpf_dsq_move_to_local(cpu2dsq(starved), 0))
 			return;
 	}
 
