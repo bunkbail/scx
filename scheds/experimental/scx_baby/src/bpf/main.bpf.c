@@ -790,8 +790,8 @@ void BPF_STRUCT_OPS(baby_enqueue, struct task_struct *p, u64 enq_flags)
 		tctx->yield_pending = false;
 		tctx->deadline = now + deadline_ns + deadline_ns +
 				 task_prio_factor(p, tctx);
-	} else if (!(enq_flags & SCX_ENQ_LAST) &&
-		   !(enq_flags & SCX_ENQ_WAKEUP)) {
+	} else if (!(enq_flags & (SCX_ENQ_LAST | SCX_ENQ_WAKEUP |
+				  SCX_ENQ_REENQ))) {
 		/*
 		 * Migrated and freshly created tasks are renormalized to
 		 * a fresh deadline. Woken tasks keep the deadline they
@@ -800,7 +800,10 @@ void BPF_STRUCT_OPS(baby_enqueue, struct task_struct *p, u64 enq_flags)
 		 * task that stopped but stays runnable keeps its
 		 * deadline too, like the original put_prev_entity():
 		 * ops.stopping() has already renewed it if it was
-		 * reached.
+		 * reached. A task pushed back by ops.cpu_release()
+		 * keeps its deadline as well: it was already runnable
+		 * and waiting, and a fresh one would move it behind
+		 * arrivals that queued after it.
 		 */
 		tctx->deadline = calc_deadline(p, tctx, now);
 	}
@@ -1193,6 +1196,26 @@ void BPF_STRUCT_OPS(baby_dispatch, s32 cpu, struct task_struct *prev)
 			cctx->perf_req = 0;
 		}
 	}
+}
+
+/*
+ * The kernel took the CPU away for an RT or deadline task and has just
+ * given it back. Tasks dispatch() already moved into the local DSQ are
+ * invisible to the other CPUs' idle-steal, so they would wait out the
+ * whole lease; push them back through ops.enqueue(), which re-homes
+ * them onto queues the steal paths can reach. This prevents the strand
+ * the starvation sweep only cures: the sweep reaches the per-CPU
+ * queues after a second, the local queue it never reaches at all.
+ */
+void BPF_STRUCT_OPS(baby_cpu_release, s32 cpu,
+		    struct scx_cpu_release_args *args)
+{
+	/*
+	 * scx_bpf_reenqueue_local() returns a count on some kernels and
+	 * is shimmed to void through the compat layer on others; call it
+	 * as void, the re-enqueue happens either way.
+	 */
+	scx_bpf_reenqueue_local();
 }
 
 /*
@@ -1620,8 +1643,9 @@ SCX_OPS_DEFINE(baby_ops,
 	       .running			= (void *)baby_running,
 	       .runnable		= (void *)baby_runnable,
 	       .stopping		= (void *)baby_stopping,
-	       .yield			= (void *)baby_yield,
-	       .init_task		= (void *)baby_init_task,
+		       .yield			= (void *)baby_yield,
+		       .cpu_release		= (void *)baby_cpu_release,
+		       .init_task		= (void *)baby_init_task,
 	       .init			= (void *)baby_init,
 	       .exit			= (void *)baby_exit,
 	       .timeout_ms		= 5000,
