@@ -23,19 +23,13 @@
 char _license[] SEC("license") = "GPL";
 
 /*
- * Every CPU owns a deadline-ordered queue, mirroring the original
- * per-CPU run lists. The base offset keeps the ids clear of the
- * kernel-reserved DSQ ids.
+ * The tasks wait in one deadline-ordered queue per NUMA node, mirroring
+ * the original global run list. The DSQ id is the node id; on a
+ * single-node machine there is exactly one queue. There is no per-CPU
+ * queue and nothing to steal: an idle CPU pulls the earliest-deadline
+ * task, so the queue order IS the placement.
  */
-#define BABY_CPU_DSQ_BASE	100ULL
-
 static u64 nr_cpu_ids;
-static u32 rr_cursor;
-
-static u64 cpu2dsq(s32 cpu)
-{
-	return BABY_CPU_DSQ_BASE + cpu;
-}
 
 /*
  * Scheduling constants, carried over from the original bs.c.
@@ -47,7 +41,6 @@ static u64 cpu2dsq(s32 cpu)
 #define TIME_PERIOD		(200ULL * NSEC_PER_MSEC)
 #define TO_COMPLETE		(5ULL * NSEC_PER_MSEC)
 #define RESCHED_DELTA		(25ULL * NSEC_PER_MSEC)
-#define MIN_DEADLINE_NS		590000ULL
 #define MIN_NICE		(-20)
 #define MAX_NICE		19
 #define MAX_RT_PRIO		100
@@ -71,8 +64,7 @@ const volatile bool debug;
  * Scheduling statistics.
  */
 volatile u64 nr_running, nr_direct_dispatches, nr_shared_dispatches;
-volatile u64 nr_preemptions, nr_boosts;
-volatile u64 nr_claims, nr_claim_misses;
+volatile u64 nr_preemptions, nr_boosts, nr_sticky;
 
 /*
  * Exit information.
@@ -145,16 +137,6 @@ struct cpu_ctx {
 	 * what lets the boost latch for the duration of a burst.
 	 */
 	u64 perf_req;
-
-	/*
-	 * When this CPU last ran ops.dispatch(). A CPU that stopped
-	 * calling in while tasks remain queued on it is stuck running
-	 * something the sched_ext class cannot preempt - an RT task:
-	 * CachyOS ships sched_rt_runtime_us=1000000, so nothing bounds
-	 * the hog, and the kernel watchdog force-unloads the whole
-	 * scheduler after 5s of a queued task waiting behind one.
-	 */
-	u64 last_consume_at;
 };
 
 struct {
@@ -195,20 +177,6 @@ struct task_ctx {
 	 * Timestamp of the last burst accounting (while the task runs).
 	 */
 	u64 last_acc_at;
-
-	/*
-	 * Timestamp of when the task last started to run, used to honor
-	 * the MIN_DEADLINE_NS floor before preempting it.
-	 */
-	u64 last_run_at;
-
-	/*
-	 * Set by ops.enqueue() to the CPU whose queue the task was
-	 * placed in. The per-CPU queues are sticky, so this is where the
-	 * task will run next; ops.dispatch() re-arms the running task
-	 * only when this still matches the CPU it is running on.
-	 */
-	s32 cpu;
 
 	/*
 	 * Wake frequency: an EWMA of how often the task wakes, in wakes
@@ -269,6 +237,14 @@ static struct task_ctx *try_lookup_task_ctx(const struct task_struct *p)
 static bool is_queued(const struct task_struct *p)
 {
 	return p->scx.flags & SCX_TASK_QUEUED;
+}
+
+/*
+ * Return true if @p can only run on a single CPU, false otherwise.
+ */
+static bool is_pcpu_task(const struct task_struct *p)
+{
+	return p->nr_cpus_allowed == 1 || is_migration_disabled(p);
 }
 
 /*
@@ -380,11 +356,11 @@ static bool can_resched(const struct task_ctx *tctx)
 }
 
 /*
- * Big and little CPU sets, built from the platform's core types by
- * userspace at startup. Everything prefers an idle little core so that
- * the big cores stay parked; interactive and foreground tasks fall back
- * to an idle big one, and a proven CPU consumer claims one when no
- * little core is free and on its slice-expiry requeues.
+ * Big and little CPU sets, published by userspace at startup from the
+ * platform's core types. The deadline order is placement-blind - an
+ * idle CPU pulls the earliest-deadline task from wherever it waits -
+ * so the sets steer nothing on a single-tier machine; they stay for
+ * the per-tier queues a hybrid platform needs.
  */
 private(BABY) struct bpf_cpumask __kptr *big_cpumask;
 private(BABY) struct bpf_cpumask __kptr *little_cpumask;
@@ -484,221 +460,63 @@ static u64 task_slice(const struct task_ctx *tctx)
 }
 
 /*
- * Return the little CPUs round robin, spreading tasks that must wait
- * for a little core across the little queues.
+ * Find an idle CPU for @p through the kernel's selector, which knows
+ * the SMT topology and spreads wakeups across the LLCs. Returns the
+ * CPU, with @is_idle set when it was picked idle.
  */
-static s32 pick_rr_little(void)
+static s32 pick_idle_cpu(struct task_struct *p, s32 prev_cpu,
+			 u64 wake_flags, bool *is_idle)
 {
-	struct bpf_cpumask *little = little_cpumask;
-	s32 cpu, picked = -1;
-	u32 i, n, seen = 0;
-
-	if (!little)
-		return -1;
-
-	bpf_rcu_read_lock();
-	n = bpf_cpumask_weight(cast_mask(little));
-	if (n) {
-		u32 want = __sync_fetch_and_add(&rr_cursor, 1) % n;
-
-		bpf_for(i, 0, nr_cpu_ids) {
-			if (!bpf_cpumask_test_cpu(i, cast_mask(little)))
-				continue;
-			if (seen == want) {
-				picked = i;
-				break;
-			}
-			seen++;
-		}
-	}
-	bpf_rcu_read_unlock();
-
-	return picked;
-}
-
-/*
- * Return true if @cpu is one of the big cores.
- */
-static bool is_big_cpu(s32 cpu);
-
-/*
- * Return an idle CPU from @pref that @p is allowed to run on, or a
- * negative value if there is none. With @claim the CPU is taken out of
- * the idle set for a direct dispatch; without it the CPU stays idle,
- * for a caller that will only re-queue the task onto it.
- */
-static s32 pick_idle_cpu_pref(struct task_struct *p,
-			      const struct bpf_cpumask *pref, bool claim)
-{
-	const struct cpumask *idle;
-	s32 cpu, picked = -1;
-	u64 i;
-
-	if (!pref)
-		return -1;
+	s32 cpu;
 
 	/*
-	 * Take the lowest-numbered idle CPU of the preferred class:
-	 * wakeups stack onto the same cores, so that at idle only a
-	 * handful of cores are ever woken instead of the whole class
-	 * rotating. The vtime order of the queues keeps interactive
-	 * tasks at the front when a core does fill up.
+	 * Compatibility with older kernels.
 	 */
-	bpf_rcu_read_lock();
-	idle = scx_bpf_get_idle_cpumask();
-	bpf_for(i, 0, nr_cpu_ids) {
-		cpu = i;
-		if (!bpf_cpumask_test_cpu(cpu, cast_mask(pref)) ||
-		    !bpf_cpumask_test_cpu(cpu, idle) ||
-		    !bpf_cpumask_test_cpu(cpu, p->cpus_ptr))
-			continue;
-		if (!claim || scx_bpf_test_and_clear_cpu_idle(cpu))
-			picked = cpu;
-		break;
-	}
-	scx_bpf_put_cpumask(idle);
-	bpf_rcu_read_unlock();
+	if (!__COMPAT_HAS_scx_bpf_select_cpu_and) {
+		if (wake_flags)
+			return scx_bpf_select_cpu_dfl(p, prev_cpu, wake_flags,
+						      is_idle);
 
-	return picked;
+		return prev_cpu;
+	}
+
+	cpu = scx_bpf_select_cpu_and(p, prev_cpu, wake_flags, p->cpus_ptr, 0);
+	if (cpu < 0)
+		return prev_cpu;
+
+	*is_idle = true;
+
+	return cpu;
 }
 
 /*
- * Pick a target CPU for a task which is being woken up: prefer an idle
- * big CPU for interactive tasks and an idle little CPU for the rest,
- * falling back to the built-in idle-CPU selection.
+ * Pick a target CPU for a task which is being woken up, and dispatch it
+ * straight to the CPU when the pick found an idle one. Placement is
+ * delegated to the kernel's idle-CPU selection: SMT-aware, biased to
+ * the previous CPU, spread across the LLCs - the cache warmth the
+ * per-CPU queues used to pin comes from the kernel's own sense of the
+ * topology.
  */
 s32 BPF_STRUCT_OPS(baby_select_cpu, struct task_struct *p,
 		   s32 prev_cpu, u64 wake_flags)
 {
-	struct task_ctx *tctx = try_lookup_task_ctx(p);
 	bool is_idle = false;
 	s32 cpu;
 
 	/*
-	 * Interactive tasks prefer the little cores and then the big
-	 * ones, always taking the lowest-numbered idle CPU so that
-	 * wakeups stack onto few cores. Everything else prefers the
-	 * little cores too. A big core is woken only by a task with a
-	 * proven light usage history once the little cores are all busy.
+	 * Don't trust userspace about the waker releasing the CPU: a
+	 * waker that keeps running after the wake leaves the wakee
+	 * stacked behind it on a hot core while other cores idle, and
+	 * the sync hint is exactly how one hot core starves the rest.
 	 */
-	if (tctx && (is_interactive(tctx) || is_foreground(tctx))) {
-		bpf_rcu_read_lock();
-		cpu = pick_idle_cpu_pref(p, little_cpumask, true);
-		if (cpu < 0)
-			cpu = pick_idle_cpu_pref(p, big_cpumask, true);
-		bpf_rcu_read_unlock();
-		if (cpu >= 0) {
-			tctx->cpu = cpu;
-			scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, task_slice(tctx), 0);
-			__sync_fetch_and_add(&nr_direct_dispatches, 1);
-			return cpu;
-		}
-	} else if (tctx) {
-		/*
-		 * Placement pin: a proven consumer whose previous run was
-		 * on a big core goes back to a big core when it wakes,
-		 * instead of taking the first idle little core. The P-to-E
-		 * yank is what keeps a single compute thread off its boost
-		 * clock: the two cores' performance levels diverge across
-		 * the move and the platform keeps tearing the boost down on
-		 * every change. The proven history is what keeps request
-		 * workers out: a worker that sleeps within its slice never
-		 * accumulates a quarter window of runtime, while a compute
-		 * phase crosses the bar within its first 50ms.
-		 */
-		if (is_heavy_proven(tctx)) {
-			bool took_prev = false;
-			s32 pinned = -1;
+	wake_flags &= ~SCX_WAKE_SYNC;
 
-			if (is_big_cpu(prev_cpu) &&
-			    bpf_cpumask_test_cpu(prev_cpu, p->cpus_ptr)) {
-				bpf_rcu_read_lock();
-				took_prev =
-					scx_bpf_test_and_clear_cpu_idle(prev_cpu);
-				bpf_rcu_read_unlock();
-
-				if (took_prev)
-					pinned = prev_cpu;
-			}
-
-			/*
-			 * The home core is busy: any other idle big core
-			 * still beats the little-first path below, which
-			 * is the yank this pin exists to prevent.
-			 */
-			if (pinned < 0) {
-				bpf_rcu_read_lock();
-				pinned = pick_idle_cpu_pref(p, big_cpumask,
-							    true);
-				bpf_rcu_read_unlock();
-			}
-
-			if (pinned >= 0) {
-				tctx->cpu = pinned;
-				scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL,
-						   task_slice(tctx), 0);
-				__sync_fetch_and_add(&nr_direct_dispatches, 1);
-				return pinned;
-			}
-
-			/*
-			 * No big core free at all: the little-first path
-			 * below takes over.
-			 */
-		}
-
-		bpf_rcu_read_lock();
-		cpu = pick_idle_cpu_pref(p, little_cpumask, true);
-		if (cpu < 0 && is_heavy_proven(tctx))
-			cpu = pick_idle_cpu_pref(p, big_cpumask, true);
-		bpf_rcu_read_unlock();
-		if (cpu >= 0) {
-			tctx->cpu = cpu;
-			scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, task_slice(tctx), 0);
-			__sync_fetch_and_add(&nr_direct_dispatches, 1);
-			return cpu;
-		}
-
-		/*
-		 * No idle little CPU: keep the task off the big cores
-		 * by queueing it round robin on a little queue, unless
-		 * the big cores are busy too (the system is then
-		 * saturated and every core must work). Queueing behind a
-		 * busy little core keeps the big cores free to sleep.
-		 * A proven consumer skips this: with no idle little core
-		 * anywhere it already claimed one of the idle big cores
-		 * above, so this is only reached when the bigs are busy
-		 * as well, and then the task waits where it ran.
-		 */
-		{
-			bool idle_big = false;
-			const struct cpumask *idle;
-			s32 lc;
-
-			bpf_rcu_read_lock();
-			idle = scx_bpf_get_idle_cpumask();
-			idle_big = big_cpumask &&
-				bpf_cpumask_intersects(cast_mask(big_cpumask),
-						       idle);
-			scx_bpf_put_cpumask(idle);
-			bpf_rcu_read_unlock();
-
-			lc = idle_big && !is_heavy_proven(tctx) ?
-			     pick_rr_little() : -1;
-			if (lc >= 0 && bpf_cpumask_test_cpu(lc, p->cpus_ptr)) {
-				tctx->cpu = lc;
-				return lc;
-			}
-			tctx->cpu = prev_cpu;
-			return prev_cpu;
-		}
-	}
-
-	cpu = scx_bpf_select_cpu_dfl(p, prev_cpu, wake_flags, &is_idle);
+	cpu = pick_idle_cpu(p, prev_cpu, wake_flags, &is_idle);
 	if (is_idle) {
-		if (tctx)
-			tctx->cpu = cpu;
-		scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, tctx ? task_slice(tctx) : deadline_ns, 0);
+		struct task_ctx *tctx = try_lookup_task_ctx(p);
+
+		scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL,
+				   tctx ? task_slice(tctx) : deadline_ns, 0);
 		__sync_fetch_and_add(&nr_direct_dispatches, 1);
 	}
 
@@ -706,80 +524,87 @@ s32 BPF_STRUCT_OPS(baby_select_cpu, struct task_struct *p,
 }
 
 /*
- * Return the big core whose running task has the latest deadline among
- * the ones a foreground task may preempt, or -1 if there is none.
- * Foreground work is memory-bound and crawls on the low-power overflow
- * cores, so given no idle fast core it should still steal one.
+ * Attempt to dispatch a task directly to an idle CPU.
+ *
+ * Return true if the task is dispatched, false otherwise.
  */
-static s32 pick_foreground_target(struct task_struct *p,
-				  struct task_ctx *tctx)
+static bool try_direct_dispatch(struct task_struct *p, struct task_ctx *tctx,
+				s32 prev_cpu, u64 enq_flags, bool is_running)
 {
-	struct task_struct *curr;
-	struct task_ctx *cctx;
-	s32 cpu, picked = -1;
-	u64 i, best_dl = 0;
+	bool is_idle = false;
+	s32 cpu = prev_cpu;
 
-	bpf_for(i, 0, nr_cpu_ids) {
-		cpu = i;
+	/*
+	 * A task that is running, or whose placement ops.select_cpu()
+	 * already decided, has had its chance at an idle CPU. A
+	 * reenqueued task is worth another scan: its CPU just came back
+	 * from an RT lease and the rest of the machine has moved
+	 * meanwhile.
+	 */
+	if (!is_running && __COMPAT_is_enq_cpu_selected(enq_flags) &&
+	    !(enq_flags & SCX_ENQ_REENQ))
+		return false;
 
-		if (!is_big_cpu(cpu))
-			continue;
-
-		curr = __COMPAT_scx_bpf_cpu_curr(cpu);
-		if (!curr || curr == p || (curr->flags & PF_IDLE))
-			continue;
-
-		cctx = try_lookup_task_ctx(curr);
-		if (!cctx || !can_resched(cctx))
-			continue;
-
-		if ((s64)(tctx->deadline - cctx->deadline) >= 0 ||
-		    p->static_prio > curr->static_prio)
-			continue;
-
-		if (picked == -1 || (s64)(cctx->deadline - best_dl) > 0) {
-			best_dl = cctx->deadline;
-			picked = cpu;
-		}
+	/*
+	 * Migrate only to a confirmed idle CPU: a task pushed onto a
+	 * busy core would wait behind whatever runs there, which is
+	 * exactly the stranding the per-CPU queues used to create.
+	 */
+	if (!is_pcpu_task(p)) {
+		cpu = pick_idle_cpu(p, prev_cpu, 0, &is_idle);
+		if (!is_idle)
+			return false;
+	} else {
+		if (!scx_bpf_test_and_clear_cpu_idle(prev_cpu))
+			return false;
 	}
 
-	return picked;
+	scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL_ON | cpu, task_slice(tctx), 0);
+	__sync_fetch_and_add(&nr_direct_dispatches, 1);
+
+	if (cpu != prev_cpu || !is_running)
+		scx_bpf_kick_cpu(cpu, SCX_KICK_IDLE);
+
+	return true;
+}
+
+/*
+ * Number of tasks waiting in the node queue. scx_bpf_dsq_nr_queued()
+ * fails verification inside an RCU read side section, so callers probe
+ * it outside any.
+ */
+static u64 node_backlog(s32 cpu)
+{
+	return scx_bpf_dsq_nr_queued(__COMPAT_scx_bpf_cpu_node(cpu));
+}
+
+/*
+ * The node queue holds two or more waiting tasks: the task will rotate
+ * behind them anyway, and every extra rotation costs a full switch, so
+ * grant it twice the slice.
+ */
+static bool backlog_deep(u64 backlog)
+{
+	return backlog >= 2;
 }
 
 /*
  * Enqueue a task that has no idle CPU to run on.
  *
  * The deadline order is the scheduling decision: tasks are placed in the
- * global queue by their deadline, and the earliest one is dispatched next.
+ * node queue by their deadline, and the earliest one is dispatched next.
  */
 void BPF_STRUCT_OPS(baby_enqueue, struct task_struct *p, u64 enq_flags)
 {
 	struct task_ctx *tctx = try_lookup_task_ctx(p);
 	s32 prev_cpu = scx_bpf_task_cpu(p);
-	s32 target, cpu;
-	u64 slice, now = bpf_ktime_get_ns();
+	bool is_running = scx_bpf_task_running(p);
+	u64 backlog, slice, now = bpf_ktime_get_ns();
 
 	if (!tctx)
 		return;
 
 	tctx->last_acc_at = now;
-
-	/*
-	 * A heavy task that stopped on a big core gives it back when a
-	 * little core is idle: the per-CPU queues are sticky, so without
-	 * this the task would never leave the big core on its own.
-	 */
-	target = prev_cpu;
-
-	/*
-	 * ops.dispatch() may have just decided a still-runnable task's
-	 * next core (the big-core claim): requeue it there verbatim and
-	 * stay out of the placement below, none of which applies without
-	 * a wake.
-	 */
-	if ((enq_flags & SCX_ENQ_LAST) && tctx->cpu >= 0 &&
-	    tctx->cpu != prev_cpu)
-		target = tctx->cpu;
 
 	if (tctx->yield_pending) {
 		/*
@@ -808,380 +633,112 @@ void BPF_STRUCT_OPS(baby_enqueue, struct task_struct *p, u64 enq_flags)
 		tctx->deadline = calc_deadline(p, tctx, now);
 	}
 
-	/*
-	 * Keep non-proven tasks off the big cores: redirect them to an
-	 * idle little core, or round robin over the little queues while
-	 * the big cores are idle. Without this a task that entered the
-	 * scheduler on a big core (at attach, or forked on one) would
-	 * stay there forever, since a CPU-bound task never wakes up to
-	 * be re-placed. A proven consumer keeps its big core instead:
-	 * the claim below would only win it straight back, and yanking a
-	 * spinning task between core classes every slice is pure churn.
-	 */
-	if (!is_interactive(tctx) && !is_foreground(tctx) &&
-	    !is_heavy_proven(tctx) && is_big_cpu(target)) {
-		cpu = pick_idle_cpu_pref(p, little_cpumask, true);
-		if (cpu < 0) {
-			const struct cpumask *idle;
-			bool idle_big = false;
-
-			bpf_rcu_read_lock();
-			idle = scx_bpf_get_idle_cpumask();
-			idle_big = big_cpumask &&
-				bpf_cpumask_intersects(cast_mask(big_cpumask),
-						       idle);
-			scx_bpf_put_cpumask(idle);
-			bpf_rcu_read_unlock();
-
-			if (idle_big)
-				cpu = pick_rr_little();
-		}
-		if (cpu >= 0 && bpf_cpumask_test_cpu(cpu, p->cpus_ptr))
-			target = cpu;
-	}
+	backlog = node_backlog(prev_cpu);
 
 	/*
-	 * Saturation rebalance: with no idle CPU anywhere, a task that
-	 * returns to a deep home queue waits out the whole rotation, and
-	 * the idle steal cannot fix that, because a stolen task comes
-	 * back to its home queue on the next wake. Move a wakeup whose
-	 * home queue holds at least two tasks to the allowed queue with
-	 * the fewest waiting ones when that queue is at least two
-	 * shallower, so wake-driven load spreads over the rotation
-	 * instead of piling up on the cores the tasks happened to land
-	 * on while the machine was still idle. The lowest CPU wins ties,
-	 * which keeps the wakeups stacked.
+	 * check_preempt_wakeup(): preempt the task running on the
+	 * previous CPU if the waker has an earlier deadline and does not
+	 * have a lower priority, unless the running task is protecting
+	 * its CPU burst. Once every logical CPU is busy the wall is up:
+	 * a preemption then only trades places between rotation peers,
+	 * and the queue order already runs the one with the earlier
+	 * deadline next - preempting there turns the run into a swap
+	 * storm. Interactive and foreground tasks only: a task that
+	 * never wakes has no latency to protect.
 	 */
-	if ((enq_flags & SCX_ENQ_WAKEUP) && !scx_bpf_task_running(p) &&
-	    scx_bpf_dsq_nr_queued(cpu2dsq(target)) >= 2) {
-		s32 best = -1;
-		u64 best_nr = 0, i;
-
-		bpf_for(i, 0, nr_cpu_ids) {
-			u64 nr;
-
-			if (!bpf_cpumask_test_cpu(i, p->cpus_ptr))
-				continue;
-
-			nr = scx_bpf_dsq_nr_queued(cpu2dsq(i));
-			if (best < 0 || nr < best_nr) {
-				best = i;
-				best_nr = nr;
-			}
-		}
-
-		if (best >= 0 && best_nr + 2 <=
-		    scx_bpf_dsq_nr_queued(cpu2dsq(target))) {
-			target = best;
-			/*
-			 * The shallowest queue can belong to an idle CPU,
-			 * and this is the wake path: ops.select_cpu owns
-			 * the placement and the insert below wakes nobody,
-			 * so kick the target or the task waits for the
-			 * next unrelated wake on that CPU. A busy CPU
-			 * ignores the idle kick.
-			 */
-			scx_bpf_kick_cpu(best, SCX_KICK_IDLE);
-		}
-	}
-
-	if ((enq_flags & SCX_ENQ_WAKEUP) &&
+	if ((enq_flags & SCX_ENQ_WAKEUP) && nr_running < nr_cpu_ids &&
 	    (is_interactive(tctx) || is_foreground(tctx))) {
-		/*
-		 * check_preempt_wakeup(): preempt the task running on the
-		 * target CPU if the waker has an earlier deadline and does
-		 * not have a lower priority, unless the running task is
-		 * protecting its CPU burst. The waker is placed directly
-		 * in front of the victim on the local DSQ, skipping the
-		 * global deadline order like the original resched_curr().
-		 * Non-interactive tasks skip this and take their place in
-		 * the little-core queues instead. Foreground workers
-		 * preempt on a big core even when they last ran elsewhere:
-		 * their work is memory-bound and crawls on the low-power
-		 * overflow cores.
-		 */
-		struct task_struct *curr;
-		struct task_ctx *cctx;
-		s32 target_cpu = prev_cpu;
-
-		if (is_foreground(tctx) && !is_big_cpu(target_cpu)) {
-			s32 big_cpu = pick_foreground_target(p, tctx);
-
-			if (big_cpu >= 0)
-				target_cpu = big_cpu;
-		}
-
-		curr = __COMPAT_scx_bpf_cpu_curr(target_cpu);
+		struct task_struct *curr = __COMPAT_scx_bpf_cpu_curr(prev_cpu);
 
 		if (curr && curr != p && !(curr->flags & PF_IDLE)) {
-			cctx = try_lookup_task_ctx(curr);
+			struct task_ctx *cctx = try_lookup_task_ctx(curr);
+
 			if (cctx &&
 			    (s64)(tctx->deadline - cctx->deadline) < 0 &&
 			    p->static_prio <= curr->static_prio &&
-			    can_resched(cctx) &&
-			    !scx_bpf_dsq_nr_queued(cpu2dsq(target_cpu))) {
-				tctx->cpu = target_cpu;
+			    can_resched(cctx)) {
 				scx_bpf_dsq_insert(p,
-						   SCX_DSQ_LOCAL_ON | target_cpu,
+						   SCX_DSQ_LOCAL_ON | prev_cpu,
 						   task_slice(tctx),
 						   enq_flags | SCX_ENQ_PREEMPT);
 				__sync_fetch_and_add(&nr_preemptions, 1);
 				return;
 			}
 		}
-	} else if (!scx_bpf_task_running(p) &&
-		   !__COMPAT_is_enq_cpu_selected(enq_flags)) {
-		/*
-		 * The task is placed without the wakeup side effect of
-		 * ops.select_cpu(), so wake the target CPU if it is idle.
-		 */
-		scx_bpf_kick_cpu(target, SCX_KICK_IDLE);
 	}
 
-	tctx->cpu = target;
+	/*
+	 * The task did not go through ops.select_cpu(), or nothing was
+	 * idle when it did: grab a confirmed idle CPU if the machine
+	 * still has one, which is also how a task that stopped on a
+	 * fully-loaded core spreads to a core that went idle since.
+	 */
+	if (try_direct_dispatch(p, tctx, prev_cpu, enq_flags, is_running))
+		return;
 
 	/*
-	 * Saturation slice: on a queue two or more deep the task will
-	 * rotate anyway, and every extra rotation costs a full switch,
-	 * so grant twice the slice while the queue stays deep. A queue
-	 * of zero or one keeps the interactive slice.
+	 * Nothing idle anywhere: take a place in the deadline order.
+	 * On an oversubscribed machine hand out longer slices, since
+	 * the task will rotate anyway and every extra rotation costs a
+	 * full switch.
 	 */
-	if (scx_bpf_dsq_nr_queued(cpu2dsq(target)) >= 2)
-		slice = 2 * deadline_ns;
-	else
-		slice = task_slice(tctx);
+	slice = backlog_deep(backlog) ? 2 * deadline_ns : task_slice(tctx);
 
-	scx_bpf_dsq_insert_vtime(p, cpu2dsq(target), slice,
-				 tctx->deadline, enq_flags);
+	scx_bpf_dsq_insert_vtime(p, __COMPAT_scx_bpf_cpu_node(prev_cpu),
+				 slice, tctx->deadline, enq_flags);
 	__sync_fetch_and_add(&nr_shared_dispatches, 1);
-}
 
-/*
- * Return true if @cpu is one of the big cores.
- */
-static bool is_big_cpu(s32 cpu)
-{
-	bool big = false;
-
-	bpf_rcu_read_lock();
-	big = big_cpumask &&
-	      bpf_cpumask_test_cpu(cpu, cast_mask(big_cpumask));
-	bpf_rcu_read_unlock();
-
-	return big;
+	/*
+	 * The task is placed without the wake side effect of
+	 * ops.select_cpu(), so wake the CPU that will pull it if idle.
+	 */
+	if (!is_running && !__COMPAT_is_enq_cpu_selected(enq_flags))
+		scx_bpf_kick_cpu(prev_cpu, SCX_KICK_IDLE);
 }
 
 /*
  * Dispatch the earliest-deadline task to the CPU.
  */
-/*
- * A queue that has not been consumed for this long is stranded behind
- * something the sched_ext class cannot preempt (an RT task; RT runtime
- * is unthrottled on some shipping configs). Rescue it well before the
- * kernel's 5s watchdog force-unloads the scheduler.
- */
-#define STARVE_RESCUE_NS	1000000000ull
-
 void BPF_STRUCT_OPS(baby_dispatch, s32 cpu, struct task_struct *prev)
 {
 	struct task_ctx *tctx = prev ? try_lookup_task_ctx(prev) : NULL;
-	struct cpu_ctx *my_cctx = try_lookup_cpu_ctx(cpu);
 	bool need_running = prev && is_queued(prev);
-
-	if (my_cctx)
-		my_cctx->last_consume_at = bpf_ktime_get_ns();
-
-	if (need_running && tctx && tctx->cpu == cpu && !is_big_cpu(cpu) &&
-	    is_heavy_proven(tctx)) {
-		/*
-		 * Big-core claim: a proven consumer being replenished on
-		 * a little core hands itself to an idle big core instead.
-		 * A CPU-bound task never wakes again after its initial
-		 * placement, so the replenish is the only event that can
-		 * still move it - and a task that is never descheduled
-		 * outruns the continuous-runtime cap below within
-		 * moments, so the claim has to sit ahead of it, on every
-		 * replenish. The pick leaves the idle bit alone: the
-		 * task starts running there once the kicked core pulls
-		 * it in, and a losing race just means it queues behind
-		 * the winner and retries on a later expiry.
-		 *
-		 * Handing the task away does not end the dispatch: a
-		 * user queue insert wakes nobody, and the wake path
-		 * never kicks its target CPU, so returning here would
-		 * idle the CPU on top of its own queued backlog until
-		 * an unrelated wake lands on it. Fall through and
-		 * consume the queue - the keep-running check below no
-		 * longer matches, the task is homed on the big core
-		 * now.
-		 */
-		s32 big;
-
-		__sync_fetch_and_add(&nr_claims, 1);
-
-		bpf_rcu_read_lock();
-		big = pick_idle_cpu_pref(prev, big_cpumask, false);
-		bpf_rcu_read_unlock();
-
-		if (big >= 0 && bpf_cpumask_test_cpu(big, prev->cpus_ptr)) {
-			tctx->cpu = big;
-			scx_bpf_dsq_insert_vtime(prev, cpu2dsq(big),
-						 task_slice(tctx),
-						 tctx->deadline, 0);
-			scx_bpf_kick_cpu(big, SCX_KICK_IDLE);
-		}
-
-		__sync_fetch_and_add(&nr_claim_misses, 1);
-	}
+	s32 node = __COMPAT_scx_bpf_cpu_node(cpu);
 
 	if (need_running && tctx) {
 		/*
-		 * pick_next_entity() keeps the current task only when its
-		 * deadline is strictly earlier than the queued one, and
-		 * only while it actually runs where it is queued: ops-
-		 * enqueue() may have moved the task to another CPU's
-		 * queue, and then it must stop here and resume there.
-		 *
-		 * The queued task always wins when the queue is non-
-		 * empty: the core interleaves the running task and the
-		 * queued one fairly through the local queue FIFO, so a
-		 * heavy task can never starve a waiting one. The
-		 * continuous runtime cap is a second line of defense for
-		 * anything this check cannot see.
+		 * pick_next_entity() keeps the current task only while
+		 * its deadline still beats the head of the queue; ties
+		 * go to the waiter. ops.stopping() has already renewed
+		 * the deadline once it was reached, so the task
+		 * competes with the same deadline it would carry into
+		 * the queue - a sticky run in absolute deadlines. No
+		 * continuous-runtime cap is needed: a task that keeps
+		 * running renews its deadline every slice, and any
+		 * waiting task's deadline is older the longer it has
+		 * waited, so a hog yields the moment something waits.
 		 */
-		struct task_struct *q = __COMPAT_scx_bpf_dsq_peek(cpu2dsq(cpu));
-		u64 ran = bpf_ktime_get_ns() - tctx->last_run_at;
+		struct task_struct *q = __COMPAT_scx_bpf_dsq_peek(node);
+		u64 q_dl = q ? q->scx.dsq_vtime : ULLONG_MAX;
 
-		if (tctx->cpu == cpu && !q && ran < 10 * deadline_ns) {
+		if ((s64)(tctx->deadline - q_dl) < 0) {
 			scx_bpf_task_set_slice(prev, task_slice(tctx));
+			__sync_fetch_and_add(&nr_sticky, 1);
 			return;
 		}
 	}
 
-	if (scx_bpf_dsq_move_to_local(cpu2dsq(cpu), 0))
+	if (scx_bpf_dsq_move_to_local(node, 0))
 		return;
 
-	/*
-	 * newidle_balance(): the local queue is empty, pull a task from
-	 * the most-loaded queue that can spare one. Little CPUs steal
-	 * freely: an idle big CPU stays idle so that it can sleep, while
-	 * a stealing little CPU also drains stray tasks off the big
-	 * cores. An idle big CPU steals only a proven consumer, and only
-	 * when one waits in a queue two or more deep: a queued heavy
-	 * backlog while a fast core sleeps is throughput left on the
-	 * table, but the gate keeps desktop blips from ever waking a
-	 * big core.
-	 */
-	if (!is_big_cpu(cpu)) {
-		u64 max_nr = 1;
-		s32 src = -1;
-		s32 starved = -1;
-		u64 starved_at = 0;
-		u64 now = bpf_ktime_get_ns();
-		u64 i;
-
-		bpf_for(i, 0, nr_cpu_ids) {
-			struct cpu_ctx *cc;
-			u64 nr;
-
-			if ((s32)i == cpu)
-				continue;
-
-			nr = scx_bpf_dsq_nr_queued(cpu2dsq(i));
-			if (nr > max_nr) {
-				max_nr = nr;
-				src = i;
-			}
-
-			cc = try_lookup_cpu_ctx(i);
-			if (nr && cc && now - cc->last_consume_at > STARVE_RESCUE_NS &&
-			    (starved < 0 ||
-			     (s64)(cc->last_consume_at - starved_at) < 0)) {
-				struct task_struct *head;
-
-				head = __COMPAT_scx_bpf_dsq_peek(cpu2dsq(i));
-				if (head && bpf_cpumask_test_cpu(cpu, head->cpus_ptr)) {
-					starved = i;
-					starved_at = cc->last_consume_at;
-				}
-			}
-		}
-
-		if (src >= 0 && scx_bpf_dsq_move_to_local(cpu2dsq(src), 0))
-			return;
-		if (starved >= 0 && scx_bpf_dsq_move_to_local(cpu2dsq(starved), 0))
-			return;
-	} else {
-		u64 max_nr = 1;
-		s32 src = -1;
-		s32 starved = -1;
-		u64 starved_at = 0;
-		u64 now = bpf_ktime_get_ns();
-		u64 i;
-
-		bpf_for(i, 0, nr_cpu_ids) {
-			struct task_struct *head;
-			struct task_ctx *hctx;
-			u64 nr;
-
-			if ((s32)i == cpu)
-				continue;
-
-			nr = scx_bpf_dsq_nr_queued(cpu2dsq(i));
-			if (nr <= max_nr)
-				continue;
-
-			head = __COMPAT_scx_bpf_dsq_peek(cpu2dsq(i));
-			if (!head)
-				continue;
-			hctx = try_lookup_task_ctx(head);
-			if (!hctx || !is_heavy_proven(hctx))
-				continue;
-
-			max_nr = nr;
-			src = i;
-		}
-
-		if (src < 0) {
-			bpf_for(i, 0, nr_cpu_ids) {
-				struct task_struct *head;
-				struct cpu_ctx *cc;
-				u64 nr;
-
-				if ((s32)i == cpu)
-					continue;
-
-				nr = scx_bpf_dsq_nr_queued(cpu2dsq(i));
-				if (!nr)
-					continue;
-
-				cc = try_lookup_cpu_ctx(i);
-				if (cc && now - cc->last_consume_at > STARVE_RESCUE_NS &&
-				    (starved < 0 ||
-				     (s64)(cc->last_consume_at - starved_at) < 0)) {
-					head = __COMPAT_scx_bpf_dsq_peek(cpu2dsq(i));
-					if (head && bpf_cpumask_test_cpu(cpu, head->cpus_ptr)) {
-						starved = i;
-						starved_at = cc->last_consume_at;
-					}
-				}
-			}
-		}
-
-		if (src >= 0 && scx_bpf_dsq_move_to_local(cpu2dsq(src), 0))
-			return;
-		if (starved >= 0 && scx_bpf_dsq_move_to_local(cpu2dsq(starved), 0))
-			return;
-	}
-
-	if (need_running && tctx && tctx->cpu == cpu) {
+	if (need_running) {
 		/*
-		 * Nothing else is queued where the task is queued: keep
-		 * it running, as the original does across its deadline
-		 * renewals.
+		 * Nothing is queued anywhere: keep the task running, as
+		 * the original does across its deadline renewals.
 		 */
-		scx_bpf_task_set_slice(prev, task_slice(tctx));
-	} else if (!need_running && cpuperf_lvl < 0) {
+		scx_bpf_task_set_slice(prev,
+				       tctx ? task_slice(tctx) : deadline_ns);
+	} else if (cpuperf_lvl < 0) {
 		/*
 		 * The CPU is going idle: drop its performance level so
 		 * that it clocks down until the next task runs. The
@@ -1200,12 +757,11 @@ void BPF_STRUCT_OPS(baby_dispatch, s32 cpu, struct task_struct *prev)
 
 /*
  * The kernel took the CPU away for an RT or deadline task and has just
- * given it back. Tasks dispatch() already moved into the local DSQ are
- * invisible to the other CPUs' idle-steal, so they would wait out the
- * whole lease; push them back through ops.enqueue(), which re-homes
- * them onto queues the steal paths can reach. This prevents the strand
- * the starvation sweep only cures: the sweep reaches the per-CPU
- * queues after a second, the local queue it never reaches at all.
+ * given it back. Tasks dispatch() already moved into the local DSQ
+ * waited out the whole lease where no other CPU could see them; push
+ * them back through ops.enqueue(), which lands each one on an idle
+ * core or in the deadline order, where the rest of the machine can
+ * reach it.
  */
 void BPF_STRUCT_OPS(baby_cpu_release, s32 cpu,
 		    struct scx_cpu_release_args *args)
@@ -1219,16 +775,17 @@ void BPF_STRUCT_OPS(baby_cpu_release, s32 cpu,
 }
 
 /*
- * Periodic tick: account bursts, renew the deadline once reached and
- * preempt the current task for an earlier-deadline one, unless it is a
- * burst hog (original entity_tick() / hrtick handling).
+ * Periodic tick: account bursts, advance the CPU performance ledger and
+ * renew the deadline once reached. The tick does not preempt: the
+ * rotation order is the deadline order now, and a tick-driven
+ * preemption would only add switches that the queue order does not
+ * ask for.
  */
 static void update_cpuperf(struct cpu_ctx *cctx, s32 cpu, bool max_floor);
 
 void BPF_STRUCT_OPS(baby_tick, struct task_struct *p)
 {
 	struct task_ctx *tctx = try_lookup_task_ctx(p);
-	struct task_struct *q;
 	u64 now;
 
 	if (!tctx)
@@ -1263,38 +820,6 @@ void BPF_STRUCT_OPS(baby_tick, struct task_struct *p)
 
 	if (reached_deadline(tctx, now))
 		tctx->deadline = calc_deadline(p, tctx, now);
-
-	if (!can_resched(tctx))
-		return;
-
-	/*
-	 * hrtick: never preempt a task that has not run MIN_DEADLINE_NS
-	 * yet; its deadline renewal is close enough.
-	 */
-	if (now - tctx->last_run_at < MIN_DEADLINE_NS)
-		return;
-
-	q = __COMPAT_scx_bpf_dsq_peek(cpu2dsq(scx_bpf_task_cpu(p)));
-	if (!q || (s64)(q->scx.dsq_vtime - tctx->deadline) >= 0)
-		return;
-
-	/*
-	 * Saturation preemption lag: with a queue two or more deep, the
-	 * rotation peers carry deadlines within one renewal of each other
-	 * and tick-preempting on every tick turns the run into a swap
-	 * storm. Demand that the queued task be three offsets more
-	 * overdue than the running deadline before it may preempt. A
-	 * task that just woke with a slept-in deadline is overdue by its
-	 * whole sleep and clears the bar at once; only the rotation
-	 * peers are held off, and their chunks lengthen by roughly the
-	 * lag.
-	 */
-	if (scx_bpf_dsq_nr_queued(cpu2dsq(scx_bpf_task_cpu(p))) >= 2 &&
-	    (s64)(tctx->deadline - 3 * deadline_ns - q->scx.dsq_vtime) <= 0)
-		return;
-
-	__sync_fetch_and_add(&nr_preemptions, 1);
-	scx_bpf_kick_cpu(scx_bpf_task_cpu(p), SCX_KICK_PREEMPT);
 }
 
 /*
@@ -1495,7 +1020,6 @@ void BPF_STRUCT_OPS(baby_running, struct task_struct *p)
 	if (!tctx)
 		return;
 
-	tctx->last_run_at = now;
 	tctx->last_acc_at = now;
 
 	/*
@@ -1535,7 +1059,8 @@ bool BPF_STRUCT_OPS(baby_yield, struct task_struct *p)
 	if (!tctx)
 		return false;
 
-	if (!scx_bpf_dsq_nr_queued(cpu2dsq(scx_bpf_task_cpu(p))))
+	if (!scx_bpf_dsq_nr_queued(__COMPAT_scx_bpf_cpu_node(
+					   scx_bpf_task_cpu(p))))
 		return false;
 
 	tctx->yield_pending = true;
@@ -1569,7 +1094,6 @@ s32 BPF_STRUCT_OPS(baby_init_task, struct task_struct *p,
 	tctx->start_time = now;
 	tctx->last_acc_at = now;
 	tctx->last_woke_at = now;
-	tctx->cpu = -1;
 	{
 		struct task_struct *parent = p->real_parent;
 		struct task_ctx *ptctx;
@@ -1583,30 +1107,28 @@ s32 BPF_STRUCT_OPS(baby_init_task, struct task_struct *p,
 	return 0;
 }
 
-	s32 BPF_STRUCT_OPS_SLEEPABLE(baby_init)
-	{
-		u64 cpu;
-		s32 err;
+s32 BPF_STRUCT_OPS_SLEEPABLE(baby_init)
+{
+	s32 node, err;
 
-		nr_cpu_ids = scx_bpf_nr_cpu_ids();
+	nr_cpu_ids = scx_bpf_nr_cpu_ids();
 
-		/*
-		 * Create the per-CPU deadline-ordered queues.
-		 */
-		bpf_for(cpu, 0, nr_cpu_ids) {
-			err = scx_bpf_create_dsq(cpu2dsq(cpu), -1);
-			if (err) {
-				scx_bpf_error("failed to create DSQ %llu: %d",
-					      cpu2dsq(cpu), err);
-				return err;
-			}
+	/*
+	 * Create the per-node deadline-ordered queues.
+	 */
+	bpf_for(node, 0, __COMPAT_scx_bpf_nr_node_ids()) {
+		err = scx_bpf_create_dsq(node, node);
+		if (err) {
+			scx_bpf_error("failed to create DSQ %d: %d", node, err);
+			return err;
 		}
-
-		/* Initialize the CPU frequency performance level. */
-		init_cpuperf_target();
-
-		return 0;
 	}
+
+	/* Initialize the CPU frequency performance level. */
+	init_cpuperf_target();
+
+	return 0;
+}
 
 void BPF_STRUCT_OPS(baby_exit, struct scx_exit_info *ei)
 {
@@ -1642,11 +1164,11 @@ SCX_OPS_DEFINE(baby_ops,
 	       .tick			= (void *)baby_tick,
 	       .running			= (void *)baby_running,
 	       .runnable		= (void *)baby_runnable,
-	       .stopping		= (void *)baby_stopping,
+		       .stopping		= (void *)baby_stopping,
 		       .yield			= (void *)baby_yield,
 		       .cpu_release		= (void *)baby_cpu_release,
 		       .init_task		= (void *)baby_init_task,
-	       .init			= (void *)baby_init,
+		       .init			= (void *)baby_init,
 	       .exit			= (void *)baby_exit,
 	       .timeout_ms		= 5000,
 	       .name			= "baby");

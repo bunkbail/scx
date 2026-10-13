@@ -245,15 +245,13 @@ impl<'a> Scheduler<'a> {
 
         // Cores far below the little tier - the L3-less low-power
         // islands on hybrid laptop parts - stay out of the little set:
-        // that set is the homing pool the wake path stacks on and
-        // round-robins over, and a worker homed on an LP core runs at
-        // a fraction of the little cores' speed with no last-level
-        // cache, which stretches every batch of a batch-parallel
-        // workload to its slowest worker. They are not lost to
-        // scheduling: the kernel's own placement and prev-CPU homing
-        // still run work there when nothing else fits, and an idle LP
-        // core still steals from the deepest queue in ops.dispatch().
-        // Only deliberate homing stops targeting them.
+        // that set is the tier the queue work waits in, and a worker
+        // pulled onto an LP core runs at a fraction of the little
+        // cores' speed with no last-level cache, which stretches every
+        // batch of a batch-parallel workload to its slowest worker.
+        // They are not lost to scheduling: the kernel's placement and
+        // the direct-dispatch scan still run work there when nothing
+        // else fits. Only the tier assignment skips them.
         let little_cap = rest.iter().filter_map(|c| capacity(*c)).max();
         let mut little = Vec::new();
         let mut lp = Vec::new();
@@ -310,8 +308,7 @@ impl<'a> Scheduler<'a> {
             nr_shared_dispatches: bss_data.nr_shared_dispatches,
             nr_preemptions: bss_data.nr_preemptions,
             nr_boosts: bss_data.nr_boosts,
-            nr_claims: bss_data.nr_claims,
-            nr_claim_misses: bss_data.nr_claim_misses,
+            nr_sticky: bss_data.nr_sticky,
         }
     }
 
