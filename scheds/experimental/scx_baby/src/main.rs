@@ -12,6 +12,7 @@ pub mod bpf_intf;
 pub use bpf_intf::*;
 
 mod stats;
+use stats::Ranks;
 use std::mem::MaybeUninit;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
@@ -159,6 +160,36 @@ impl<'a> Scheduler<'a> {
         let rodata = skel.maps.rodata_data.as_mut().unwrap();
         rodata.debug = opts.debug;
         rodata.deadline_ns = opts.deadline_us * 1000;
+
+        // Publish the cache-topology distance tables. The BPF side
+        // compares ids for equality, and 0 means "unfilled" there, so
+        // every id is stored offset by one: an id of 0 becomes 1, and
+        // an entry the userspace never filled can never compare equal
+        // to a filled one.
+        for (idx, cpu) in topo.all_cpus.values().enumerate() {
+            if idx >= rodata.topo_node.len() {
+                break;
+            }
+            rodata.topo_node[idx] = cpu.node_id as u32 + 1;
+            rodata.topo_llc[idx] = cpu.llc_id as u32 + 1;
+            rodata.topo_l2[idx] = cpu.l2_id as u32 + 1;
+            rodata.topo_core[idx] = cpu.core_id as u32 + 1;
+        }
+        info!(
+            "distance ladder: smt={} l2s={} llcs={} nodes={}",
+            topo.smt_enabled,
+            topo.all_cpus
+                .values()
+                .map(|c| c.l2_id)
+                .collect::<std::collections::BTreeSet<_>>()
+                .len(),
+            topo.all_cpus
+                .values()
+                .map(|c| c.llc_id)
+                .collect::<std::collections::BTreeSet<_>>()
+                .len(),
+            topo.nodes.len(),
+        );
 
         // Set the CPU frequency performance level (-1 = automatic).
         info!(
@@ -311,6 +342,11 @@ impl<'a> Scheduler<'a> {
             nr_sticky: bss_data.nr_sticky,
             nr_warmseats: bss_data.nr_warmseats,
             nr_coldspreads: bss_data.nr_coldspreads,
+            nr_land: Ranks::of(&bss_data.nr_land),
+            nr_wake_land: Ranks::of(&bss_data.nr_wake_land),
+            nr_seat_self: bss_data.nr_seat_self,
+            nr_seat_move: Ranks::of(&bss_data.nr_seat_move),
+            nr_pull_land: Ranks::of(&bss_data.nr_pull_land),
         }
     }
 

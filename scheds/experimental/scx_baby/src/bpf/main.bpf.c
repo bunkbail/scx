@@ -81,6 +81,76 @@ volatile u64 nr_preemptions, nr_boosts, nr_sticky, nr_warmseats;
 volatile u64 nr_coldspreads;
 
 /*
+ * Cache-topology distance, as published by userspace from the sysfs
+ * cache hierarchy: the physical core id groups SMT siblings, the L2
+ * and LLC ids group the shared-cache tiers, the node id the socket.
+ * Every table holds a nonzero id per CPU, so an unfilled entry never
+ * compares equal to a filled one.
+ *
+ * The rank of a pair is the deepest cache level the two CPUs share:
+ * same lane < SMT sibling < same L2 < same LLC < same node < beyond.
+ * It is an order, not a price - the placement decisions below only
+ * ever compare two candidates' ranks against each other.
+ */
+#define BABY_MAX_CPUS		128
+
+#define BABY_DIST_SELF		0
+#define BABY_DIST_SIBLING	1
+#define BABY_DIST_L2		2
+#define BABY_DIST_LLC		3
+#define BABY_DIST_NODE		4
+#define BABY_DIST_BEYOND	5
+#define BABY_DIST_NR		8
+
+const volatile u32 topo_node[BABY_MAX_CPUS];
+const volatile u32 topo_llc[BABY_MAX_CPUS];
+const volatile u32 topo_l2[BABY_MAX_CPUS];
+const volatile u32 topo_core[BABY_MAX_CPUS];
+
+/*
+ * A single cached comparison per queue in the warm-seat scan keeps the
+ * verifier's state space flat: cpu_dist(prev, i) recomputed on both
+ * arms of a three-way compare would branch the scan's exploration and
+ * blow past the jump-complexity limit (observed 8193-jump blowup).
+ */
+static u32 cpu_dist(s32 a, s32 b)
+{
+	u32 ia, ib;
+
+	if (a < 0 || b < 0 || (u32)a >= nr_cpu_ids || (u32)b >= nr_cpu_ids)
+		return BABY_DIST_BEYOND;
+
+	if (a == b)
+		return BABY_DIST_SELF;
+
+	ia = (u32)a & (BABY_MAX_CPUS - 1);
+	ib = (u32)b & (BABY_MAX_CPUS - 1);
+
+	if (topo_core[ia] && topo_core[ia] == topo_core[ib])
+		return BABY_DIST_SIBLING;
+	if (topo_l2[ia] && topo_l2[ia] == topo_l2[ib])
+		return BABY_DIST_L2;
+	if (topo_llc[ia] && topo_llc[ia] == topo_llc[ib])
+		return BABY_DIST_LLC;
+	if (topo_node[ia] == topo_node[ib])
+		return BABY_DIST_NODE;
+
+	return BABY_DIST_BEYOND;
+}
+
+/*
+ * Where placements land, by distance rank. The counters tell the warm
+ * paths apart: the run-start histogram covers every path's outcome at
+ * the point of truth, the wake-pick one covers ops.select_cpu(), and
+ * the seat-move one covers the warm-seat rebalance.
+ */
+volatile u64 nr_land[BABY_DIST_NR];
+volatile u64 nr_wake_land[BABY_DIST_NR];
+volatile u64 nr_seat_self;
+volatile u64 nr_seat_move[BABY_DIST_NR];
+volatile u64 nr_pull_land[BABY_DIST_NR];
+
+/*
  * Exit information.
  */
 UEI_DEFINE(uei);
@@ -529,6 +599,7 @@ s32 BPF_STRUCT_OPS(baby_select_cpu, struct task_struct *p,
 	if (is_idle) {
 		struct task_ctx *tctx = try_lookup_task_ctx(p);
 
+		__sync_fetch_and_add(&nr_wake_land[cpu_dist(prev_cpu, cpu)], 1);
 		scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL,
 				   tctx ? task_slice(tctx) : deadline_ns, 0);
 		__sync_fetch_and_add(&nr_direct_dispatches, 1);
@@ -573,6 +644,7 @@ static bool try_direct_dispatch(struct task_struct *p, struct task_ctx *tctx,
 			return false;
 	}
 
+	__sync_fetch_and_add(&nr_land[cpu_dist(prev_cpu, cpu)], 1);
 	scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL_ON | cpu, task_slice(tctx), 0);
 	__sync_fetch_and_add(&nr_direct_dispatches, 1);
 
@@ -709,58 +781,78 @@ void BPF_STRUCT_OPS(baby_enqueue, struct task_struct *p, u64 enq_flags)
 	 * One lane of margin keeps the wall's transient two-deep queue
 	 * from flipping the mode back.
 	 */
-	if (bpf_cpumask_test_cpu(prev_cpu, p->cpus_ptr)) {
-		s32 target = prev_cpu;
-		u64 target_nr = scx_bpf_dsq_nr_queued(cpu2dsq(target));
-		u64 warm_total = 0, best_nr = target_nr, i;
-		s32 best = target;
+		if (bpf_cpumask_test_cpu(prev_cpu, p->cpus_ptr)) {
+			s32 target = prev_cpu;
+			u64 target_nr = scx_bpf_dsq_nr_queued(cpu2dsq(target));
+			u64 warm_total = 0, best_nr = target_nr, i;
+			u32 best_rank = BABY_DIST_SELF, rank;
+			s32 best = target;
 
-		bpf_for(i, 0, nr_cpu_ids) {
-			u64 nr = scx_bpf_dsq_nr_queued(cpu2dsq(i));
+			bpf_for(i, 0, nr_cpu_ids) {
+				u64 nr = scx_bpf_dsq_nr_queued(cpu2dsq(i));
 
-			warm_total += nr;
+				warm_total += nr;
 
-			/*
-			 * The warm-seat balance: a wake whose previous CPU
-			 * already holds two more waiting tasks than the
-			 * shallowest warm queue seats the shallowest one
-			 * instead, the way the old saturation rebalance
-			 * evened the home queues out. Without it the seats
-			 * drift into a skew that no idle CPU can heal,
-			 * since a warm queue is invisible to the other
-			 * CPUs; the shared queue only sees what spills
-			 * into it.
-			 */
-			if (!(enq_flags & SCX_ENQ_WAKEUP) ||
-			    !bpf_cpumask_test_cpu((s32)i, p->cpus_ptr))
-				continue;
+				/*
+				 * The warm-seat balance: a wake whose previous CPU
+				 * already holds two more waiting tasks than the
+				 * shallowest warm queue seats the shallowest one
+				 * instead, the way the old saturation rebalance
+				 * evened the home queues out. Without it the seats
+				 * drift into a skew that no idle CPU can heal,
+				 * since a warm queue is invisible to the other
+				 * CPUs; the shared queue only sees what spills
+				 * into it.
+				 *
+				 * Depth dominates, distance breaks ties: among
+				 * queues at the same depth, the one nearest the
+				 * task's previous CPU - SMT sibling before a
+				 * farther core - keeps the refill cost down
+				 * without giving up any of the balance. The
+				 * distance is computed once per queue into a
+				 * variable (see the note on cpu_dist): two
+				 * inlined evaluations in the comparison below
+				 * explode the verifier's state space.
+				 */
+				if (!(enq_flags & SCX_ENQ_WAKEUP) ||
+				    !bpf_cpumask_test_cpu((s32)i, p->cpus_ptr))
+					continue;
 
-			if (nr < best_nr) {
-				best = (s32)i;
-				best_nr = nr;
+				rank = cpu_dist(prev_cpu, i);
+				if (nr < best_nr ||
+				    (nr == best_nr && rank < best_rank)) {
+					best = (s32)i;
+					best_nr = nr;
+					best_rank = rank;
+				}
 			}
-		}
 
-		if (nr_running + backlog + warm_total > nr_cpu_ids + 1) {
-			/*
-			 * On a deep backlog - shared or local - the task
-			 * will rotate anyway and every extra rotation
-			 * costs a full switch, so grant twice the slice.
-			 */
-			slice = (backlog_deep(backlog) || target_nr >= 2) ?
-				2 * deadline_ns : task_slice(tctx);
+			if (nr_running + backlog + warm_total > nr_cpu_ids + 1) {
+				/*
+				 * On a deep backlog - shared or local - the task
+				 * will rotate anyway and every extra rotation
+				 * costs a full switch, so grant twice the slice.
+				 */
+				slice = (backlog_deep(backlog) || target_nr >= 2) ?
+					2 * deadline_ns : task_slice(tctx);
 
-			if (best != target && best_nr + 2 <= target_nr) {
-				target = best;
-				target_nr = best_nr;
+				if (best != target && best_nr + 2 <= target_nr) {
+					target = best;
+					target_nr = best_nr;
+					__sync_fetch_and_add(
+						&nr_seat_move[cpu_dist(prev_cpu,
+								       target)],
+						1);
+				} else {
+					__sync_fetch_and_add(&nr_seat_self, 1);
+				}
+
+				scx_bpf_dsq_insert_vtime(p, cpu2dsq(target), slice,
+							 tctx->deadline, 0);
+				__sync_fetch_and_add(&nr_warmseats, 1);
+				scx_bpf_kick_cpu(target, SCX_KICK_IDLE);
+				return;
 			}
-
-			scx_bpf_dsq_insert_vtime(p, cpu2dsq(target), slice,
-						 tctx->deadline, 0);
-			__sync_fetch_and_add(&nr_warmseats, 1);
-			scx_bpf_kick_cpu(target, SCX_KICK_IDLE);
-			return;
-		}
 
 		/*
 		 * Not oversubscribed: leave the seat open and let the
@@ -854,7 +946,19 @@ void BPF_STRUCT_OPS(baby_dispatch, s32 cpu, struct task_struct *prev)
 		u64 g_dl = q ? q->scx.dsq_vtime : ULLONG_MAX;
 
 		if (g_dl < wq_dl) {
-			if (scx_bpf_dsq_move_to_local(node, 0) ||
+			/*
+			 * The pulled task is the node head; attribute the
+			 * pull from where it last ran. The head is never
+			 * NULL here: g_dl is finite only when q exists.
+			 */
+			s32 from = q ? scx_bpf_task_cpu(q) : -1;
+			bool pulled = scx_bpf_dsq_move_to_local(node, 0);
+
+			if (pulled)
+				__sync_fetch_and_add(
+					&nr_pull_land[cpu_dist(cpu, from)],
+					1);
+			if (pulled ||
 			    scx_bpf_dsq_move_to_local(cpu2dsq(cpu), 0))
 				return;
 		} else {
