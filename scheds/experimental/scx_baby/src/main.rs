@@ -309,6 +309,8 @@ impl<'a> Scheduler<'a> {
             nr_preemptions: bss_data.nr_preemptions,
             nr_boosts: bss_data.nr_boosts,
             nr_sticky: bss_data.nr_sticky,
+            nr_warmseats: bss_data.nr_warmseats,
+            nr_coldspreads: bss_data.nr_coldspreads,
         }
     }
 

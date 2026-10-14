@@ -25,11 +25,24 @@ char _license[] SEC("license") = "GPL";
 /*
  * The tasks wait in one deadline-ordered queue per NUMA node, mirroring
  * the original global run list. The DSQ id is the node id; on a
- * single-node machine there is exactly one queue. There is no per-CPU
- * queue and nothing to steal: an idle CPU pulls the earliest-deadline
- * task, so the queue order IS the placement.
+ * single-node machine there is exactly one queue. There is nothing to
+ * steal: an idle CPU pulls the earliest-deadline task, so the queue
+ * order IS the placement.
+ *
+ * Each CPU also owns a small warm queue, deadline-ordered like the
+ * node one, that holds tasks continuing on that CPU (see the warm
+ * seat in ops.enqueue). The warm queues are bounded - a deeper
+ * backlog overflows into the node queue, where every idle CPU can
+ * reach it - so they carry cache locality without becoming homes.
  */
+#define BABY_CPU_DSQ_BASE	100ULL
+
 static u64 nr_cpu_ids;
+
+static u64 cpu2dsq(s32 cpu)
+{
+	return BABY_CPU_DSQ_BASE + cpu;
+}
 
 /*
  * Scheduling constants, carried over from the original bs.c.
@@ -64,7 +77,8 @@ const volatile bool debug;
  * Scheduling statistics.
  */
 volatile u64 nr_running, nr_direct_dispatches, nr_shared_dispatches;
-volatile u64 nr_preemptions, nr_boosts, nr_sticky;
+volatile u64 nr_preemptions, nr_boosts, nr_sticky, nr_warmseats;
+volatile u64 nr_coldspreads;
 
 /*
  * Exit information.
@@ -639,14 +653,17 @@ void BPF_STRUCT_OPS(baby_enqueue, struct task_struct *p, u64 enq_flags)
 	 * check_preempt_wakeup(): preempt the task running on the
 	 * previous CPU if the waker has an earlier deadline and does not
 	 * have a lower priority, unless the running task is protecting
-	 * its CPU burst. Once every logical CPU is busy the wall is up:
-	 * a preemption then only trades places between rotation peers,
-	 * and the queue order already runs the one with the earlier
-	 * deadline next - preempting there turns the run into a swap
-	 * storm. Interactive and foreground tasks only: a task that
-	 * never wakes has no latency to protect.
+	 * its CPU burst or the CPU already holds a warm backlog - with
+	 * one waiting, the preempted victim would trade places with a
+	 * queue that is about to run anyway, and under deep
+	 * oversubscription the preemptions alone are churn. The
+	 * preempted victim warm-seats behind its own successor further
+	 * down, so a preemption is a same-CPU alternation, not a cold
+	 * displacement. Interactive and foreground tasks only: a task
+	 * that never wakes has no latency to protect.
 	 */
-	if ((enq_flags & SCX_ENQ_WAKEUP) && nr_running < nr_cpu_ids &&
+	if ((enq_flags & SCX_ENQ_WAKEUP) &&
+	    !scx_bpf_dsq_nr_queued(cpu2dsq(prev_cpu)) &&
 	    (is_interactive(tctx) || is_foreground(tctx))) {
 		struct task_struct *curr = __COMPAT_scx_bpf_cpu_curr(prev_cpu);
 
@@ -665,6 +682,93 @@ void BPF_STRUCT_OPS(baby_enqueue, struct task_struct *p, u64 enq_flags)
 				return;
 			}
 		}
+	}
+
+	/*
+	 * Warm seat, gated on oversubscription. On a machine with more
+	 * runnable work than CPUs, a task that has nowhere to run right
+	 * now waits on the CPU it last ran on, right behind whatever
+	 * runs there: its cache and TLB are still warm, and the CPU
+	 * serves it at its next slice end. The shared queue would pull
+	 * it to whichever CPU expires first, which is how a machine at
+	 * oversubscription turns every rotation into a cold migration -
+	 * the medium rig loses 11% to that and pure flash, with no warm
+	 * path at all, loses 14%.
+	 *
+	 * At the wall the seat is poison: with every lane holding one
+	 * task, the seat freezes whatever lane skew exists - overloaded
+	 * lanes rotate internally while the lanes whose task blocked
+	 * starve, and the instrumentation shows the argon2 run then
+	 * burns its wall clock at 68% utilization where the cold path
+	 * holds 97%. The discriminator is the machine's outstanding
+	 * runnable work - running lanes plus everything queued, shared
+	 * or warm. It is conserved across the running-to-queued
+	 * transitions that race a bare nr_running gate (the E5 lesson:
+	 * workers block between chunks and the counter dips), and it
+	 * reads 12-13 at the wall against 14+ under oversubscription.
+	 * One lane of margin keeps the wall's transient two-deep queue
+	 * from flipping the mode back.
+	 */
+	if (bpf_cpumask_test_cpu(prev_cpu, p->cpus_ptr)) {
+		s32 target = prev_cpu;
+		u64 target_nr = scx_bpf_dsq_nr_queued(cpu2dsq(target));
+		u64 warm_total = 0, best_nr = target_nr, i;
+		s32 best = target;
+
+		bpf_for(i, 0, nr_cpu_ids) {
+			u64 nr = scx_bpf_dsq_nr_queued(cpu2dsq(i));
+
+			warm_total += nr;
+
+			/*
+			 * The warm-seat balance: a wake whose previous CPU
+			 * already holds two more waiting tasks than the
+			 * shallowest warm queue seats the shallowest one
+			 * instead, the way the old saturation rebalance
+			 * evened the home queues out. Without it the seats
+			 * drift into a skew that no idle CPU can heal,
+			 * since a warm queue is invisible to the other
+			 * CPUs; the shared queue only sees what spills
+			 * into it.
+			 */
+			if (!(enq_flags & SCX_ENQ_WAKEUP) ||
+			    !bpf_cpumask_test_cpu((s32)i, p->cpus_ptr))
+				continue;
+
+			if (nr < best_nr) {
+				best = (s32)i;
+				best_nr = nr;
+			}
+		}
+
+		if (nr_running + backlog + warm_total > nr_cpu_ids + 1) {
+			/*
+			 * On a deep backlog - shared or local - the task
+			 * will rotate anyway and every extra rotation
+			 * costs a full switch, so grant twice the slice.
+			 */
+			slice = (backlog_deep(backlog) || target_nr >= 2) ?
+				2 * deadline_ns : task_slice(tctx);
+
+			if (best != target && best_nr + 2 <= target_nr) {
+				target = best;
+				target_nr = best_nr;
+			}
+
+			scx_bpf_dsq_insert_vtime(p, cpu2dsq(target), slice,
+						 tctx->deadline, 0);
+			__sync_fetch_and_add(&nr_warmseats, 1);
+			scx_bpf_kick_cpu(target, SCX_KICK_IDLE);
+			return;
+		}
+
+		/*
+		 * Not oversubscribed: leave the seat open and let the
+		 * cold path run - a requeue re-scans for an idle lane
+		 * before joining the shared queue, which is what keeps
+		 * the wall's load distribution flowing.
+		 */
+		__sync_fetch_and_add(&nr_coldspreads, 1);
 	}
 
 	/*
@@ -708,28 +812,57 @@ void BPF_STRUCT_OPS(baby_dispatch, s32 cpu, struct task_struct *prev)
 	if (need_running && tctx) {
 		/*
 		 * pick_next_entity() keeps the current task only while
-		 * its deadline still beats the head of the queue; ties
-		 * go to the waiter. ops.stopping() has already renewed
-		 * the deadline once it was reached, so the task
-		 * competes with the same deadline it would carry into
-		 * the queue - a sticky run in absolute deadlines. No
-		 * continuous-runtime cap is needed: a task that keeps
-		 * running renews its deadline every slice, and any
-		 * waiting task's deadline is older the longer it has
-		 * waited, so a hog yields the moment something waits.
+		 * its deadline still beats the earliest head of both
+		 * queues; ties go to the waiter. ops.stopping() has
+		 * already renewed the deadline once it was reached, so
+		 * the task competes with the same deadline it would
+		 * carry into the queue - a sticky run in absolute
+		 * deadlines. No continuous-runtime cap is needed: a task
+		 * that keeps running renews its deadline every slice,
+		 * and any waiting task's deadline is older the longer it
+		 * has waited, so a hog yields the moment something
+		 * waits.
 		 */
+		struct task_struct *wq = __COMPAT_scx_bpf_dsq_peek(cpu2dsq(cpu));
 		struct task_struct *q = __COMPAT_scx_bpf_dsq_peek(node);
-		u64 q_dl = q ? q->scx.dsq_vtime : ULLONG_MAX;
+		u64 best_dl = ULLONG_MAX;
 
-		if ((s64)(tctx->deadline - q_dl) < 0) {
+		if (wq && wq->scx.dsq_vtime < best_dl)
+			best_dl = wq->scx.dsq_vtime;
+		if (q && q->scx.dsq_vtime < best_dl)
+			best_dl = q->scx.dsq_vtime;
+
+		if ((s64)(tctx->deadline - best_dl) < 0) {
 			scx_bpf_task_set_slice(prev, task_slice(tctx));
 			__sync_fetch_and_add(&nr_sticky, 1);
 			return;
 		}
 	}
 
-	if (scx_bpf_dsq_move_to_local(node, 0))
-		return;
+	/*
+	 * Serve the earliest-deadline head of the two queues, with the
+	 * warm queue winning ties: its tasks continue the work this CPU
+	 * already paid the cache for. The arbitration is what keeps the
+	 * warm queues honest - a self-sustaining warm queue must not
+	 * starve the overflow, so the shared queue wins whenever its
+	 * head is strictly earlier.
+	 */
+	{
+		struct task_struct *wq = __COMPAT_scx_bpf_dsq_peek(cpu2dsq(cpu));
+		struct task_struct *q = __COMPAT_scx_bpf_dsq_peek(node);
+		u64 wq_dl = wq ? wq->scx.dsq_vtime : ULLONG_MAX;
+		u64 g_dl = q ? q->scx.dsq_vtime : ULLONG_MAX;
+
+		if (g_dl < wq_dl) {
+			if (scx_bpf_dsq_move_to_local(node, 0) ||
+			    scx_bpf_dsq_move_to_local(cpu2dsq(cpu), 0))
+				return;
+		} else {
+			if (scx_bpf_dsq_move_to_local(cpu2dsq(cpu), 0) ||
+			    scx_bpf_dsq_move_to_local(node, 0))
+				return;
+		}
+	}
 
 	if (need_running) {
 		/*
@@ -1059,7 +1192,8 @@ bool BPF_STRUCT_OPS(baby_yield, struct task_struct *p)
 	if (!tctx)
 		return false;
 
-	if (!scx_bpf_dsq_nr_queued(__COMPAT_scx_bpf_cpu_node(
+	if (!scx_bpf_dsq_nr_queued(cpu2dsq(scx_bpf_task_cpu(p))) &&
+	    !scx_bpf_dsq_nr_queued(__COMPAT_scx_bpf_cpu_node(
 					   scx_bpf_task_cpu(p))))
 		return false;
 
@@ -1107,21 +1241,100 @@ s32 BPF_STRUCT_OPS(baby_init_task, struct task_struct *p,
 	return 0;
 }
 
+/*
+ * A warm queue that no CPU can serve - an RT lease outlived it, or
+ * affinity moved under it - strands its tasks where the rest of the
+ * machine cannot see them. A head that has waited this long is overdue
+ * by far more than any warm wait can be; hand its queue back to the
+ * shared one. The kernel watchdog force-unloads the whole scheduler
+ * five seconds after a queued task stops being consumable, so this
+ * has to fire well before that.
+ */
+#define STARVE_RESCUE_NS	1000000000ull
+
+struct rescue_timer {
+	struct bpf_timer timer;
+};
+
+struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__uint(max_entries, 1);
+	__type(key, u32);
+	__type(value, struct rescue_timer);
+} rescue_timer SEC(".maps");
+
+static int rescue_timerfn(void *map, int *key, struct bpf_timer *timer)
+{
+	u64 now = bpf_ktime_get_ns();
+	s32 cpu;
+	int err;
+
+	if (__COMPAT_has_generic_reenq()) {
+		bpf_for(cpu, 0, nr_cpu_ids) {
+			struct task_struct *head;
+			struct task_ctx *hctx;
+			u64 dsq = cpu2dsq(cpu);
+
+			if (!scx_bpf_dsq_nr_queued(dsq))
+				continue;
+
+			head = __COMPAT_scx_bpf_dsq_peek(dsq);
+			if (!head)
+				continue;
+
+			hctx = try_lookup_task_ctx(head);
+			if (hctx && now - hctx->last_acc_at > STARVE_RESCUE_NS)
+				scx_bpf_dsq_reenq___compat(dsq, 0);
+		}
+	}
+
+	err = bpf_timer_start(timer, STARVE_RESCUE_NS, 0);
+	if (err)
+		scx_bpf_error("failed to re-arm the rescue timer");
+
+	return 0;
+}
+
 s32 BPF_STRUCT_OPS_SLEEPABLE(baby_init)
 {
-	s32 node, err;
+	struct bpf_timer *timer;
+	u32 key = 0;
+	s32 node, cpu, err;
 
 	nr_cpu_ids = scx_bpf_nr_cpu_ids();
 
 	/*
-	 * Create the per-node deadline-ordered queues.
+	 * Create the warm queues and the per-node deadline-ordered
+	 * queues.
 	 */
+	bpf_for(cpu, 0, nr_cpu_ids) {
+		err = scx_bpf_create_dsq(cpu2dsq(cpu), -1);
+		if (err) {
+			scx_bpf_error("failed to create DSQ %llu: %d",
+				      cpu2dsq(cpu), err);
+			return err;
+		}
+	}
+
 	bpf_for(node, 0, __COMPAT_scx_bpf_nr_node_ids()) {
 		err = scx_bpf_create_dsq(node, node);
 		if (err) {
 			scx_bpf_error("failed to create DSQ %d: %d", node, err);
 			return err;
 		}
+	}
+
+	timer = bpf_map_lookup_elem(&rescue_timer, &key);
+	if (!timer) {
+		scx_bpf_error("failed to lookup rescue timer");
+		return -ESRCH;
+	}
+	bpf_timer_init(timer, &rescue_timer, CLOCK_MONOTONIC);
+	bpf_timer_set_callback(timer, rescue_timerfn);
+	err = bpf_timer_start(timer, STARVE_RESCUE_NS, 0);
+	if (err) {
+		scx_bpf_error("failed to arm the rescue timer");
+		return err;
 	}
 
 	/* Initialize the CPU frequency performance level. */

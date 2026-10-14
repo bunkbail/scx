@@ -27,13 +27,17 @@ pub struct Metrics {
     pub nr_boosts: u64,
     #[stat(desc = "Number of slice-end continuations of the deadline winner")]
     pub nr_sticky: u64,
+    #[stat(desc = "Number of tasks parked on their previous CPU's warm seat")]
+    pub nr_warmseats: u64,
+    #[stat(desc = "Number of enqueues the oversubscription gate sent to the shared queue")]
+    pub nr_coldspreads: u64,
 }
 
 impl Metrics {
     fn format<W: Write>(&self, w: &mut W) -> Result<()> {
         writeln!(
             w,
-            "[{}] tasks -> r: {:>2} | dispatch -> d: {:<5} s: {:<5} | preempt: {:<5} | boost: {:<5} | sticky: {:<5}",
+            "[{}] tasks -> r: {:>2} | dispatch -> d: {:<5} s: {:<5} | preempt: {:<5} | boost: {:<5} | sticky: {:<5} | warm: {:<5} | cold: {:<5}",
             crate::SCHEDULER_NAME,
             self.nr_running,
             self.nr_direct_dispatches,
@@ -41,6 +45,8 @@ impl Metrics {
             self.nr_preemptions,
             self.nr_boosts,
             self.nr_sticky,
+            self.nr_warmseats,
+            self.nr_coldspreads,
         )?;
         Ok(())
     }
@@ -52,6 +58,8 @@ impl Metrics {
             nr_preemptions: self.nr_preemptions - rhs.nr_preemptions,
             nr_boosts: self.nr_boosts - rhs.nr_boosts,
             nr_sticky: self.nr_sticky - rhs.nr_sticky,
+            nr_warmseats: self.nr_warmseats - rhs.nr_warmseats,
+            nr_coldspreads: self.nr_coldspreads - rhs.nr_coldspreads,
             ..self.clone()
         }
     }
