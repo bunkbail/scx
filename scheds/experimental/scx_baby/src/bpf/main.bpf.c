@@ -151,6 +151,24 @@ volatile u64 nr_seat_move[BABY_DIST_NR];
 volatile u64 nr_pull_land[BABY_DIST_NR];
 
 /*
+ * Wait-at-depth instrument. When an enqueue parks a task in a warm
+ * seat or the shared queue, it stamps the arrival time and the depth
+ * the task will wait behind (0, 1, 2, 3+). ops.running() charges the
+ * realized wait to that bucket. The overcommit tail can then be
+ * attributed to the depth it waited at: waits behind nothing (depth
+ * 0) point at consumption, waits at depth point at rotation cost.
+ */
+#define BABY_WDEPTH_NR	4
+
+volatile u64 nr_wait_n[BABY_WDEPTH_NR];
+volatile u64 nr_wait_ns[BABY_WDEPTH_NR];
+volatile u64 nr_wait_max[BABY_WDEPTH_NR];
+volatile u64 nr_wait_slow[BABY_WDEPTH_NR];
+volatile u64 nr_arr_seat, nr_arr_shared;
+
+#define BABY_WAIT_SLOW_NS	(5ULL * NSEC_PER_MSEC)
+
+/*
  * Exit information.
  */
 UEI_DEFINE(uei);
@@ -300,6 +318,16 @@ struct task_ctx {
 	 * in the current round, like the original YIELD_MARK.
 	 */
 	bool yield_pending;
+
+	/*
+	 * Wait accounting: set when an enqueue parks the task in a warm
+	 * seat or the shared queue, consumed by ops.running(). A stamp
+	 * overwritten by a re-enqueue under-reports (a task bounced
+	 * through an RT lease waits twice but is charged once).
+	 */
+	u64 wait_stamp;
+	u8 wait_depth;
+	bool wait_shared;
 };
 
 struct {
@@ -329,6 +357,18 @@ static bool is_queued(const struct task_struct *p)
 static bool is_pcpu_task(const struct task_struct *p)
 {
 	return p->nr_cpus_allowed == 1 || is_migration_disabled(p);
+}
+
+/*
+ * Stamp a waiting arrival for the wait-at-depth instrument. The depth
+ * is clamped here by assignment through the u8 field and masked again
+ * at the charging site, so the verifier can prove the bucket index.
+ */
+static void stamp_wait(struct task_ctx *tctx, u64 now, u64 depth, bool shared)
+{
+	tctx->wait_stamp = now;
+	tctx->wait_depth = (u8)MIN(depth, BABY_WDEPTH_NR - 1);
+	tctx->wait_shared = shared;
 }
 
 /*
@@ -849,6 +889,8 @@ void BPF_STRUCT_OPS(baby_enqueue, struct task_struct *p, u64 enq_flags)
 
 				scx_bpf_dsq_insert_vtime(p, cpu2dsq(target), slice,
 							 tctx->deadline, 0);
+				stamp_wait(tctx, now, target_nr, false);
+				__sync_fetch_and_add(&nr_arr_seat, 1);
 				__sync_fetch_and_add(&nr_warmseats, 1);
 				scx_bpf_kick_cpu(target, SCX_KICK_IDLE);
 				return;
@@ -882,6 +924,8 @@ void BPF_STRUCT_OPS(baby_enqueue, struct task_struct *p, u64 enq_flags)
 
 	scx_bpf_dsq_insert_vtime(p, __COMPAT_scx_bpf_cpu_node(prev_cpu),
 				 slice, tctx->deadline, enq_flags);
+	stamp_wait(tctx, now, backlog, true);
+	__sync_fetch_and_add(&nr_arr_shared, 1);
 	__sync_fetch_and_add(&nr_shared_dispatches, 1);
 
 	/*
@@ -1258,6 +1302,26 @@ void BPF_STRUCT_OPS(baby_running, struct task_struct *p)
 		return;
 
 	tctx->last_acc_at = now;
+
+	/*
+	 * Charge the wait the task actually served to the depth bucket
+	 * its arrival was stamped with. The index is masked because a
+	 * reloaded u8 proves nothing to the verifier; the stored value
+	 * is already clamped, so the mask only ever matters for a
+	 * corrupted stamp.
+	 */
+	if (tctx->wait_stamp) {
+		u64 wait = now - tctx->wait_stamp;
+		u32 b = tctx->wait_depth & (BABY_WDEPTH_NR - 1);
+
+		tctx->wait_stamp = 0;
+		__sync_fetch_and_add(&nr_wait_n[b], 1);
+		__sync_fetch_and_add(&nr_wait_ns[b], wait);
+		if (wait > nr_wait_max[b])
+			nr_wait_max[b] = wait;
+		if (wait > BABY_WAIT_SLOW_NS)
+			__sync_fetch_and_add(&nr_wait_slow[b], 1);
+	}
 
 	/*
 	 * Adjust the target CPU frequency before the task starts to run.

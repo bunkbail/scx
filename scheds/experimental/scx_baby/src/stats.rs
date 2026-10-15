@@ -80,6 +80,43 @@ impl Ranks {
     }
 }
 
+/// Wait-at-depth buckets: the BPF side clamps queue depth into
+/// buckets 0, 1, 2 and 3+; a bucket value is the number (or total ns,
+/// or max ns) of waits served at that depth.
+#[stat_doc]
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, Stats)]
+#[stat(top)]
+pub struct WaitB {
+    #[stat(desc = "waits at depth 0 (nothing queued ahead)")]
+    pub b0: u64,
+    #[stat(desc = "waits at depth 1")]
+    pub b1: u64,
+    #[stat(desc = "waits at depth 2")]
+    pub b2: u64,
+    #[stat(desc = "waits at depth 3 or deeper")]
+    pub b3: u64,
+}
+
+impl WaitB {
+    pub fn of(a: &[u64; 4]) -> Self {
+        WaitB {
+            b0: a[0],
+            b1: a[1],
+            b2: a[2],
+            b3: a[3],
+        }
+    }
+
+    fn sub(&self, rhs: &Self) -> Self {
+        WaitB {
+            b0: self.b0.saturating_sub(rhs.b0),
+            b1: self.b1.saturating_sub(rhs.b1),
+            b2: self.b2.saturating_sub(rhs.b2),
+            b3: self.b3.saturating_sub(rhs.b3),
+        }
+    }
+}
+
 #[stat_doc]
 #[derive(Clone, Debug, Default, Serialize, Deserialize, Stats)]
 #[stat(top)]
@@ -110,6 +147,18 @@ pub struct Metrics {
     pub nr_seat_move: Ranks,
     #[stat(desc = "Shared-queue pulls by distance")]
     pub nr_pull_land: Ranks,
+    #[stat(desc = "Waiting arrivals parked in a warm seat")]
+    pub nr_arr_seat: u64,
+    #[stat(desc = "Waiting arrivals parked in the shared queue")]
+    pub nr_arr_shared: u64,
+    #[stat(desc = "Wait counts by depth bucket")]
+    pub wait_n: WaitB,
+    #[stat(desc = "Wait totals (ns) by depth bucket")]
+    pub wait_ns: WaitB,
+    #[stat(desc = "Wait maxima (ns) by depth bucket")]
+    pub wait_max: WaitB,
+    #[stat(desc = "Waits over 5ms by depth bucket")]
+    pub wait_slow: WaitB,
 }
 
 impl Metrics {
@@ -137,6 +186,36 @@ impl Metrics {
         write!(w, " | pull: ")?;
         self.nr_pull_land.format(w)?;
         writeln!(w)?;
+        let mean = |ns: u64, n: u64| -> String {
+            if n > 0 {
+                format!("{:.0}", ns as f64 / n as f64 / 1000.0)
+            } else {
+                "-".into()
+            }
+        };
+        let (wn, wns, wmax, wsl) = (&self.wait_n, &self.wait_ns, &self.wait_max, &self.wait_slow);
+        writeln!(
+            w,
+            "  wait n[{} {} {} {}] mean[{} {} {} {}] max[{} {} {} {}] slow5ms[{} {} {} {}] arr(seat {} shared {})",
+            wn.b0,
+            wn.b1,
+            wn.b2,
+            wn.b3,
+            mean(wns.b0, wn.b0),
+            mean(wns.b1, wn.b1),
+            mean(wns.b2, wn.b2),
+            mean(wns.b3, wn.b3),
+            wmax.b0,
+            wmax.b1,
+            wmax.b2,
+            wmax.b3,
+            wsl.b0,
+            wsl.b1,
+            wsl.b2,
+            wsl.b3,
+            self.nr_arr_seat,
+            self.nr_arr_shared,
+        )?;
         Ok(())
     }
 
@@ -155,6 +234,17 @@ impl Metrics {
             nr_seat_self: self.nr_seat_self.saturating_sub(rhs.nr_seat_self),
             nr_seat_move: self.nr_seat_move.sub(&rhs.nr_seat_move),
             nr_pull_land: self.nr_pull_land.sub(&rhs.nr_pull_land),
+            nr_arr_seat: self.nr_arr_seat.saturating_sub(rhs.nr_arr_seat),
+            nr_arr_shared: self.nr_arr_shared.saturating_sub(rhs.nr_arr_shared),
+            wait_n: self.wait_n.sub(&rhs.wait_n),
+            wait_ns: self.wait_ns.sub(&rhs.wait_ns),
+            wait_max: WaitB {
+                b0: self.wait_max.b0.max(rhs.wait_max.b0),
+                b1: self.wait_max.b1.max(rhs.wait_max.b1),
+                b2: self.wait_max.b2.max(rhs.wait_max.b2),
+                b3: self.wait_max.b3.max(rhs.wait_max.b3),
+            },
+            wait_slow: self.wait_slow.sub(&rhs.wait_slow),
         }
     }
 }

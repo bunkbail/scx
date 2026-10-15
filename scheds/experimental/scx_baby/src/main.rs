@@ -13,6 +13,7 @@ pub use bpf_intf::*;
 
 mod stats;
 use stats::Ranks;
+use stats::WaitB;
 use std::mem::MaybeUninit;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
@@ -347,6 +348,12 @@ impl<'a> Scheduler<'a> {
             nr_seat_self: bss_data.nr_seat_self,
             nr_seat_move: Ranks::of(&bss_data.nr_seat_move),
             nr_pull_land: Ranks::of(&bss_data.nr_pull_land),
+            nr_arr_seat: bss_data.nr_arr_seat,
+            nr_arr_shared: bss_data.nr_arr_shared,
+            wait_n: WaitB::of(&bss_data.nr_wait_n),
+            wait_ns: WaitB::of(&bss_data.nr_wait_ns),
+            wait_max: WaitB::of(&bss_data.nr_wait_max),
+            wait_slow: WaitB::of(&bss_data.nr_wait_slow),
         }
     }
 
