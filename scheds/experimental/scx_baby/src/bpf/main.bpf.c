@@ -935,12 +935,16 @@ void BPF_STRUCT_OPS(baby_enqueue, struct task_struct *p, u64 enq_flags)
 
 			if (nr_running + backlog + warm_total > nr_cpu_ids + 1) {
 				/*
-				 * On a deep backlog - shared or local - the task
-				 * will rotate anyway and every extra rotation
-				 * costs a full switch, so grant twice the slice.
+				 * On a deep backlog - shared or local - the
+				 * task will rotate anyway and every extra
+				 * rotation costs a full switch, so grant four
+				 * times the slice: the upward rung of the
+				 * E11 ladder, untried there, run here as the
+				 * negative control on the rotation-rhythm
+				 * reading.
 				 */
 				slice = (backlog_deep(backlog) || target_nr >= 2) ?
-					2 * deadline_ns : task_slice(tctx);
+					4 * deadline_ns : task_slice(tctx);
 
 				if (best != target && best_nr + 2 <= target_nr) {
 					target = best;
@@ -986,7 +990,7 @@ void BPF_STRUCT_OPS(baby_enqueue, struct task_struct *p, u64 enq_flags)
 	 * the task will rotate anyway and every extra rotation costs a
 	 * full switch.
 	 */
-	slice = backlog_deep(backlog) ? 2 * deadline_ns : task_slice(tctx);
+	slice = backlog_deep(backlog) ? 4 * deadline_ns : task_slice(tctx);
 
 	scx_bpf_dsq_insert_vtime(p, __COMPAT_scx_bpf_cpu_node(prev_cpu),
 				 slice, tctx->deadline, enq_flags);
