@@ -257,6 +257,209 @@ impl WaitCls {
     }
 }
 
+/// The wait-at-depth charge split by arrival type (8 entries, type-major:
+/// type * 4 + depth). `wk` is a wake handoff: the arrival became runnable
+/// with SCX_ENQ_WAKEUP. `rot` is the rotation: slice-expiry and
+/// preemption requeues, which re-enter without a runnable transition.
+/// In the oc2way rig the wake side is the schbench probe path and the
+/// rotation side the stress-ng spinners.
+#[stat_doc]
+#[derive(Clone, Debug, Default, Serialize, Deserialize, Stats)]
+#[stat(top)]
+pub struct WaitType {
+    #[stat(desc = "wake handoffs at depth 0")]
+    pub wk_b0: u64,
+    #[stat(desc = "wake handoffs at depth 1")]
+    pub wk_b1: u64,
+    #[stat(desc = "wake handoffs at depth 2")]
+    pub wk_b2: u64,
+    #[stat(desc = "wake handoffs at depth 3 or deeper")]
+    pub wk_b3: u64,
+    #[stat(desc = "wake handoff wait totals (ns) at depth 0")]
+    pub wk_ns_b0: u64,
+    #[stat(desc = "wake handoff wait totals (ns) at depth 1")]
+    pub wk_ns_b1: u64,
+    #[stat(desc = "wake handoff wait totals (ns) at depth 2")]
+    pub wk_ns_b2: u64,
+    #[stat(desc = "wake handoff wait totals (ns) at depth 3 or deeper")]
+    pub wk_ns_b3: u64,
+    #[stat(desc = "wake handoff wait maxima (ns) at depth 0")]
+    pub wk_max_b0: u64,
+    #[stat(desc = "wake handoff wait maxima (ns) at depth 1")]
+    pub wk_max_b1: u64,
+    #[stat(desc = "wake handoff wait maxima (ns) at depth 2")]
+    pub wk_max_b2: u64,
+    #[stat(desc = "wake handoff wait maxima (ns) at depth 3 or deeper")]
+    pub wk_max_b3: u64,
+    #[stat(desc = "wake handoffs over 5ms, by depth bucket")]
+    pub wk_slow: Vec<u64>,
+    #[stat(desc = "rotation requeues at depth 0")]
+    pub rot_b0: u64,
+    #[stat(desc = "rotation requeues at depth 1")]
+    pub rot_b1: u64,
+    #[stat(desc = "rotation requeues at depth 2")]
+    pub rot_b2: u64,
+    #[stat(desc = "rotation requeues at depth 3 or deeper")]
+    pub rot_b3: u64,
+    #[stat(desc = "rotation wait totals (ns) at depth 0")]
+    pub rot_ns_b0: u64,
+    #[stat(desc = "rotation wait totals (ns) at depth 1")]
+    pub rot_ns_b1: u64,
+    #[stat(desc = "rotation wait totals (ns) at depth 2")]
+    pub rot_ns_b2: u64,
+    #[stat(desc = "rotation wait totals (ns) at depth 3 or deeper")]
+    pub rot_ns_b3: u64,
+    #[stat(desc = "rotation wait maxima (ns) at depth 0")]
+    pub rot_max_b0: u64,
+    #[stat(desc = "rotation wait maxima (ns) at depth 1")]
+    pub rot_max_b1: u64,
+    #[stat(desc = "rotation wait maxima (ns) at depth 2")]
+    pub rot_max_b2: u64,
+    #[stat(desc = "rotation wait maxima (ns) at depth 3 or deeper")]
+    pub rot_max_b3: u64,
+    #[stat(desc = "rotation requeues over 5ms, by depth bucket")]
+    pub rot_slow: Vec<u64>,
+}
+
+impl WaitType {
+    pub fn of(a_n: &[u64; 8], a_ns: &[u64; 8], a_max: &[u64; 8], a_slow: &[u64; 8]) -> Self {
+        let mut wk_slow = Vec::with_capacity(4);
+        let mut rot_slow = Vec::with_capacity(4);
+        for b in 0..4 {
+            wk_slow.push(a_slow[4 + b]);
+            rot_slow.push(a_slow[b]);
+        }
+        WaitType {
+            wk_b0: a_n[4],
+            wk_b1: a_n[5],
+            wk_b2: a_n[6],
+            wk_b3: a_n[7],
+            wk_ns_b0: a_ns[4],
+            wk_ns_b1: a_ns[5],
+            wk_ns_b2: a_ns[6],
+            wk_ns_b3: a_ns[7],
+            wk_max_b0: a_max[4],
+            wk_max_b1: a_max[5],
+            wk_max_b2: a_max[6],
+            wk_max_b3: a_max[7],
+            wk_slow,
+            rot_b0: a_n[0],
+            rot_b1: a_n[1],
+            rot_b2: a_n[2],
+            rot_b3: a_n[3],
+            rot_ns_b0: a_ns[0],
+            rot_ns_b1: a_ns[1],
+            rot_ns_b2: a_ns[2],
+            rot_ns_b3: a_ns[3],
+            rot_max_b0: a_max[0],
+            rot_max_b1: a_max[1],
+            rot_max_b2: a_max[2],
+            rot_max_b3: a_max[3],
+            rot_slow,
+        }
+    }
+
+    fn sub(&self, rhs: &Self) -> Self {
+        let vsub = |a: &Vec<u64>, b: &Vec<u64>| -> Vec<u64> {
+            a.iter()
+                .zip(b.iter())
+                .map(|(x, y)| x.saturating_sub(*y))
+                .collect()
+        };
+        WaitType {
+            wk_b0: self.wk_b0.saturating_sub(rhs.wk_b0),
+            wk_b1: self.wk_b1.saturating_sub(rhs.wk_b1),
+            wk_b2: self.wk_b2.saturating_sub(rhs.wk_b2),
+            wk_b3: self.wk_b3.saturating_sub(rhs.wk_b3),
+            wk_ns_b0: self.wk_ns_b0.saturating_sub(rhs.wk_ns_b0),
+            wk_ns_b1: self.wk_ns_b1.saturating_sub(rhs.wk_ns_b1),
+            wk_ns_b2: self.wk_ns_b2.saturating_sub(rhs.wk_ns_b2),
+            wk_ns_b3: self.wk_ns_b3.saturating_sub(rhs.wk_ns_b3),
+            wk_max_b0: self.wk_max_b0.max(rhs.wk_max_b0),
+            wk_max_b1: self.wk_max_b1.max(rhs.wk_max_b1),
+            wk_max_b2: self.wk_max_b2.max(rhs.wk_max_b2),
+            wk_max_b3: self.wk_max_b3.max(rhs.wk_max_b3),
+            wk_slow: vsub(&self.wk_slow, &rhs.wk_slow),
+            rot_b0: self.rot_b0.saturating_sub(rhs.rot_b0),
+            rot_b1: self.rot_b1.saturating_sub(rhs.rot_b1),
+            rot_b2: self.rot_b2.saturating_sub(rhs.rot_b2),
+            rot_b3: self.rot_b3.saturating_sub(rhs.rot_b3),
+            rot_ns_b0: self.rot_ns_b0.saturating_sub(rhs.rot_ns_b0),
+            rot_ns_b1: self.rot_ns_b1.saturating_sub(rhs.rot_ns_b1),
+            rot_ns_b2: self.rot_ns_b2.saturating_sub(rhs.rot_ns_b2),
+            rot_ns_b3: self.rot_ns_b3.saturating_sub(rhs.rot_ns_b3),
+            rot_max_b0: self.rot_max_b0.max(rhs.rot_max_b0),
+            rot_max_b1: self.rot_max_b1.max(rhs.rot_max_b1),
+            rot_max_b2: self.rot_max_b2.max(rhs.rot_max_b2),
+            rot_max_b3: self.rot_max_b3.max(rhs.rot_max_b3),
+            rot_slow: vsub(&self.rot_slow, &rhs.rot_slow),
+        }
+    }
+}
+
+/// Where the queues stood when a lane came to pick work, sampled in
+/// ops.dispatch(): the seat depth is what its warm queue holds at the
+/// pick, the shared backlog the rotation it turns against. Eight
+/// buckets, the last one 7 or deeper.
+#[stat_doc]
+#[derive(Clone, Debug, Default, Serialize, Deserialize, Stats)]
+#[stat(top)]
+pub struct Census {
+    #[stat(desc = "warm-seat depth buckets at dispatch, 0..=6 then 7+")]
+    pub seat: Vec<u64>,
+    #[stat(desc = "shared-queue backlog buckets at dispatch, 0..=6 then 7+")]
+    pub shared: Vec<u64>,
+}
+
+impl Census {
+    pub fn of(seat: &[u64; 8], shared: &[u64; 8]) -> Self {
+        Census {
+            seat: seat.to_vec(),
+            shared: shared.to_vec(),
+        }
+    }
+
+    fn sub(&self, rhs: &Self) -> Self {
+        let vsub = |a: &Vec<u64>, b: &Vec<u64>| -> Vec<u64> {
+            a.iter()
+                .zip(b.iter())
+                .map(|(x, y)| x.saturating_sub(*y))
+                .collect()
+        };
+        Census {
+            seat: vsub(&self.seat, &rhs.seat),
+            shared: vsub(&self.shared, &rhs.shared),
+        }
+    }
+
+    fn format<W: Write>(&self, w: &mut W) -> Result<()> {
+        let pct = |v: &Vec<u64>, i: usize| -> String {
+            let t: u64 = v.iter().sum();
+            if t > 0 {
+                format!("{:.1}%", v[i] as f64 * 100.0 / t as f64)
+            } else {
+                "-".into()
+            }
+        };
+        write!(w, "seat[")?;
+        for i in 0..8 {
+            if i > 0 {
+                write!(w, " ")?;
+            }
+            write!(w, "{}", pct(&self.seat, i))?;
+        }
+        write!(w, "] shared[")?;
+        for i in 0..8 {
+            if i > 0 {
+                write!(w, " ")?;
+            }
+            write!(w, "{}", pct(&self.shared, i))?;
+        }
+        writeln!(w, "]")?;
+        Ok(())
+    }
+}
+
 #[stat_doc]
 #[derive(Clone, Debug, Default, Serialize, Deserialize, Stats)]
 #[stat(top)]
@@ -301,6 +504,18 @@ pub struct Metrics {
     pub wait_slow: WaitB,
     #[stat(desc = "The same waits split by class (foreground vs other)")]
     pub wait_cls: WaitCls,
+    #[stat(desc = "The same waits split by arrival type (wake handoff vs rotation)")]
+    pub wait_type: WaitType,
+    #[stat(desc = "Wake arrivals parked in a warm seat")]
+    pub nr_arr_wake_seat: u64,
+    #[stat(desc = "Wake arrivals parked in the shared queue")]
+    pub nr_arr_wake_shared: u64,
+    #[stat(desc = "Rotation arrivals parked in a warm seat")]
+    pub nr_arr_rot_seat: u64,
+    #[stat(desc = "Rotation arrivals parked in the shared queue")]
+    pub nr_arr_rot_shared: u64,
+    #[stat(desc = "Queue depths seen at dispatch, by bucket")]
+    pub census: Census,
 }
 
 impl Metrics {
@@ -406,6 +621,53 @@ impl Metrics {
             wc.other_slow[2],
             wc.other_slow[3],
         )?;
+        let wt = &self.wait_type;
+        writeln!(
+            w,
+            "  waitwk n[{} {} {} {}] mean[{} {} {} {}] max[{} {} {} {}] slow5ms[{} {} {} {}] arr(seat {} shared {})",
+            wt.wk_b0,
+            wt.wk_b1,
+            wt.wk_b2,
+            wt.wk_b3,
+            fmean(wt.wk_ns_b0, wt.wk_b0),
+            fmean(wt.wk_ns_b1, wt.wk_b1),
+            fmean(wt.wk_ns_b2, wt.wk_b2),
+            fmean(wt.wk_ns_b3, wt.wk_b3),
+            wt.wk_max_b0,
+            wt.wk_max_b1,
+            wt.wk_max_b2,
+            wt.wk_max_b3,
+            wt.wk_slow[0],
+            wt.wk_slow[1],
+            wt.wk_slow[2],
+            wt.wk_slow[3],
+            self.nr_arr_wake_seat,
+            self.nr_arr_wake_shared,
+        )?;
+        writeln!(
+            w,
+            "  waitrot n[{} {} {} {}] mean[{} {} {} {}] max[{} {} {} {}] slow5ms[{} {} {} {}] arr(seat {} shared {})",
+            wt.rot_b0,
+            wt.rot_b1,
+            wt.rot_b2,
+            wt.rot_b3,
+            fmean(wt.rot_ns_b0, wt.rot_b0),
+            fmean(wt.rot_ns_b1, wt.rot_b1),
+            fmean(wt.rot_ns_b2, wt.rot_b2),
+            fmean(wt.rot_ns_b3, wt.rot_b3),
+            wt.rot_max_b0,
+            wt.rot_max_b1,
+            wt.rot_max_b2,
+            wt.rot_max_b3,
+            wt.rot_slow[0],
+            wt.rot_slow[1],
+            wt.rot_slow[2],
+            wt.rot_slow[3],
+            self.nr_arr_rot_seat,
+            self.nr_arr_rot_shared,
+        )?;
+        write!(w, "  census: ")?;
+        self.census.format(w)?;
         Ok(())
     }
 
@@ -436,6 +698,14 @@ impl Metrics {
             },
             wait_slow: self.wait_slow.sub(&rhs.wait_slow),
             wait_cls: self.wait_cls.sub(&rhs.wait_cls),
+            wait_type: self.wait_type.sub(&rhs.wait_type),
+            nr_arr_wake_seat: self.nr_arr_wake_seat.saturating_sub(rhs.nr_arr_wake_seat),
+            nr_arr_wake_shared: self
+                .nr_arr_wake_shared
+                .saturating_sub(rhs.nr_arr_wake_shared),
+            nr_arr_rot_seat: self.nr_arr_rot_seat.saturating_sub(rhs.nr_arr_rot_seat),
+            nr_arr_rot_shared: self.nr_arr_rot_shared.saturating_sub(rhs.nr_arr_rot_shared),
+            census: self.census.sub(&rhs.census),
         }
     }
 }

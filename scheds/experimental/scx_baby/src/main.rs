@@ -12,9 +12,11 @@ pub mod bpf_intf;
 pub use bpf_intf::*;
 
 mod stats;
+use stats::Census;
 use stats::Ranks;
 use stats::WaitB;
 use stats::WaitCls;
+use stats::WaitType;
 use std::mem::MaybeUninit;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
@@ -361,6 +363,17 @@ impl<'a> Scheduler<'a> {
                 &bss_data.nr_wait_cls_max,
                 &bss_data.nr_wait_cls_slow,
             ),
+            wait_type: WaitType::of(
+                &bss_data.nr_wait_type_n,
+                &bss_data.nr_wait_type_ns,
+                &bss_data.nr_wait_type_max,
+                &bss_data.nr_wait_type_slow,
+            ),
+            nr_arr_wake_seat: bss_data.nr_arr_type[2],
+            nr_arr_wake_shared: bss_data.nr_arr_type[3],
+            nr_arr_rot_seat: bss_data.nr_arr_type[0],
+            nr_arr_rot_shared: bss_data.nr_arr_type[1],
+            census: Census::of(&bss_data.nr_census_seat, &bss_data.nr_census_shared),
         }
     }
 

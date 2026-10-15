@@ -185,6 +185,41 @@ volatile u64 nr_wait_cls_max[BABY_WDEPTH_NR * BABY_WCLS_NR];
 volatile u64 nr_wait_cls_slow[BABY_WDEPTH_NR * BABY_WCLS_NR];
 
 /*
+ * The same charge, split by arrival type. Type 1 is a wake handoff:
+ * the arrival became runnable with SCX_ENQ_WAKEUP (ops.runnable()
+ * stamps the bit, ops.stopping() clears it). The complement is the
+ * rotation - slice-expiry and preemption requeues, which re-enter
+ * without a runnable transition. The split prices the handoff the
+ * overcommit tail is blamed on separately from the rotation that
+ * dominates the charge counts. Type-major: type * BABY_WDEPTH_NR +
+ * depth.
+ */
+#define BABY_WTYPE_NR	2
+
+volatile u64 nr_wait_type_n[BABY_WDEPTH_NR * BABY_WTYPE_NR];
+volatile u64 nr_wait_type_ns[BABY_WDEPTH_NR * BABY_WTYPE_NR];
+volatile u64 nr_wait_type_max[BABY_WDEPTH_NR * BABY_WTYPE_NR];
+volatile u64 nr_wait_type_slow[BABY_WDEPTH_NR * BABY_WTYPE_NR];
+
+/*
+ * Where each arrival type landed: wake or rotation, warm seat or
+ * shared queue. Indexed type * 2 + shared.
+ */
+volatile u64 nr_arr_type[2 * 2];
+
+/*
+ * Consumption census: sampled in ops.dispatch(), the queue state a
+ * lane sees when it comes to pick work - the depth left in its warm
+ * seat and the shared backlog the rotation turns on. Eight buckets,
+ * the last one 7 or deeper; clamped by assignment and masked at use,
+ * like the wait depth.
+ */
+#define BABY_CENSUS_NR	8
+
+volatile u64 nr_census_seat[BABY_CENSUS_NR];
+volatile u64 nr_census_shared[BABY_CENSUS_NR];
+
+/*
  * Exit information.
  */
 UEI_DEFINE(uei);
@@ -345,6 +380,14 @@ struct task_ctx {
 	u8 wait_depth;
 	u8 wait_cls;
 	bool wait_shared;
+
+	/*
+	 * Set by ops.runnable() when the transition to runnable carried
+	 * SCX_ENQ_WAKEUP, cleared by ops.stopping(). The wait instrument
+	 * files each stamped arrival under it: a wake handoff charges
+	 * the wake-type arrays, a requeue the rotation side.
+	 */
+	u8 arrival_is_wake;
 };
 
 struct {
@@ -383,9 +426,15 @@ static bool is_pcpu_task(const struct task_struct *p)
  */
 static void stamp_wait(struct task_ctx *tctx, u64 now, u64 depth, bool shared)
 {
+	u8 type = tctx->arrival_is_wake & 1;
+
 	tctx->wait_stamp = now;
 	tctx->wait_depth = (u8)MIN(depth, BABY_WDEPTH_NR - 1);
 	tctx->wait_shared = shared;
+	if (shared)
+		__sync_fetch_and_add(&nr_arr_type[type * 2 + 1], 1);
+	else
+		__sync_fetch_and_add(&nr_arr_type[type * 2], 1);
 }
 
 /*
@@ -962,6 +1011,23 @@ void BPF_STRUCT_OPS(baby_dispatch, s32 cpu, struct task_struct *prev)
 	bool need_running = prev && is_queued(prev);
 	s32 node = __COMPAT_scx_bpf_cpu_node(cpu);
 
+	/*
+	 * Consumption census: the queue state this lane came to pick
+	 * work from - the depth left in its warm seat and the shared
+	 * backlog the rotation turns on. Sampled at every dispatch, so
+	 * the distribution carries the consumption-rate weighting the
+	 * arrival-time wait stamp lacks.
+	 */
+	{
+		u64 seat = scx_bpf_dsq_nr_queued(cpu2dsq(cpu));
+		u64 backlog = scx_bpf_dsq_nr_queued(node);
+		u8 s = (u8)MIN(seat, BABY_CENSUS_NR - 1);
+		u8 g = (u8)MIN(backlog, BABY_CENSUS_NR - 1);
+
+		__sync_fetch_and_add(&nr_census_seat[s & (BABY_CENSUS_NR - 1)], 1);
+		__sync_fetch_and_add(&nr_census_shared[g & (BABY_CENSUS_NR - 1)], 1);
+	}
+
 	if (need_running && tctx) {
 		/*
 		 * pick_next_entity() keeps the current task only while
@@ -1135,6 +1201,16 @@ void BPF_STRUCT_OPS(baby_stopping, struct task_struct *p, bool runnable)
 		return;
 
 	now = bpf_ktime_get_ns();
+
+	/*
+	 * Whatever enqueues this task next is a re-entry of a task that
+	 * has run - slice expiry, preemption, an RT-lease reenqueue -
+	 * not the wake that started the burst: drop the wake bit so the
+	 * wait instrument files the requeues as rotation. A task going
+	 * to sleep re-sets the bit in ops.runnable() on its wake.
+	 */
+	tctx->arrival_is_wake = 0;
+
 	update_bursts(tctx, now);
 
 	/*
@@ -1292,6 +1368,14 @@ void BPF_STRUCT_OPS(baby_runnable, struct task_struct *p, u64 enq_flags)
 	tctx->wait_cls = (is_interactive(tctx) ? 1 : 0) |
 			 (is_foreground(tctx) ? 2 : 0);
 
+	/*
+	 * The arrival-type bit the wait instrument files waits under:
+	 * SCX_ENQ_WAKEUP marks the handoff arrivals. Cleared in
+	 * ops.stopping(), so a re-entry of a task that has run - slice
+	 * expiry, preemption, an RT-lease reenqueue - files as rotation.
+	 */
+	tctx->arrival_is_wake = (enq_flags & SCX_ENQ_WAKEUP) ? 1 : 0;
+
 	if (!delta)
 		return;
 	tctx->last_woke_at = now;
@@ -1356,6 +1440,16 @@ void BPF_STRUCT_OPS(baby_running, struct task_struct *p)
 			nr_wait_cls_max[i] = wait;
 		if (wait > BABY_WAIT_SLOW_NS)
 			__sync_fetch_and_add(&nr_wait_cls_slow[i], 1);
+
+		u32 t = tctx->arrival_is_wake & 1;
+		u32 ti = t * BABY_WDEPTH_NR + b;
+
+		__sync_fetch_and_add(&nr_wait_type_n[ti], 1);
+		__sync_fetch_and_add(&nr_wait_type_ns[ti], wait);
+		if (wait > nr_wait_type_max[ti])
+			nr_wait_type_max[ti] = wait;
+		if (wait > BABY_WAIT_SLOW_NS)
+			__sync_fetch_and_add(&nr_wait_type_slow[ti], 1);
 	}
 
 	/*
