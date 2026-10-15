@@ -169,6 +169,22 @@ volatile u64 nr_arr_seat, nr_arr_shared;
 #define BABY_WAIT_SLOW_NS	(5ULL * NSEC_PER_MSEC)
 
 /*
+ * The same charge, split by class. Each stamped task carries two
+ * class bits, derived in ops.runnable() where the burst and
+ * wake-frequency EWMAs they read are fresh: bit 0 interactive, bit 1
+ * foreground. ops.running() files the wait into class-major 4x4
+ * arrays, entry class * BABY_WDEPTH_NR + depth, so the overcommit
+ * wait can be attributed to the classes a deadline-ordering change
+ * would prioritize.
+ */
+#define BABY_WCLS_NR	4
+
+volatile u64 nr_wait_cls_n[BABY_WDEPTH_NR * BABY_WCLS_NR];
+volatile u64 nr_wait_cls_ns[BABY_WDEPTH_NR * BABY_WCLS_NR];
+volatile u64 nr_wait_cls_max[BABY_WDEPTH_NR * BABY_WCLS_NR];
+volatile u64 nr_wait_cls_slow[BABY_WDEPTH_NR * BABY_WCLS_NR];
+
+/*
  * Exit information.
  */
 UEI_DEFINE(uei);
@@ -327,6 +343,7 @@ struct task_ctx {
 	 */
 	u64 wait_stamp;
 	u8 wait_depth;
+	u8 wait_cls;
 	bool wait_shared;
 };
 
@@ -1265,6 +1282,16 @@ void BPF_STRUCT_OPS(baby_runnable, struct task_struct *p, u64 enq_flags)
 
 	now = bpf_ktime_get_ns();
 	delta = now - tctx->last_woke_at;
+
+	/*
+	 * The class bits the wait instrument files waits under. Stamped
+	 * here, where the wake-path enqueue that follows sees this
+	 * call's fresh EWMAs; a slice-expiry requeue reuses the verdict
+	 * of the last runnable, which is one cycle old at worst.
+	 */
+	tctx->wait_cls = (is_interactive(tctx) ? 1 : 0) |
+			 (is_foreground(tctx) ? 2 : 0);
+
 	if (!delta)
 		return;
 	tctx->last_woke_at = now;
@@ -1313,6 +1340,8 @@ void BPF_STRUCT_OPS(baby_running, struct task_struct *p)
 	if (tctx->wait_stamp) {
 		u64 wait = now - tctx->wait_stamp;
 		u32 b = tctx->wait_depth & (BABY_WDEPTH_NR - 1);
+		u32 c = tctx->wait_cls & (BABY_WCLS_NR - 1);
+		u32 i = c * BABY_WDEPTH_NR + b;
 
 		tctx->wait_stamp = 0;
 		__sync_fetch_and_add(&nr_wait_n[b], 1);
@@ -1321,6 +1350,12 @@ void BPF_STRUCT_OPS(baby_running, struct task_struct *p)
 			nr_wait_max[b] = wait;
 		if (wait > BABY_WAIT_SLOW_NS)
 			__sync_fetch_and_add(&nr_wait_slow[b], 1);
+		__sync_fetch_and_add(&nr_wait_cls_n[i], 1);
+		__sync_fetch_and_add(&nr_wait_cls_ns[i], wait);
+		if (wait > nr_wait_cls_max[i])
+			nr_wait_cls_max[i] = wait;
+		if (wait > BABY_WAIT_SLOW_NS)
+			__sync_fetch_and_add(&nr_wait_cls_slow[i], 1);
 	}
 
 	/*

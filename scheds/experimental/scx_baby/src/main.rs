@@ -14,6 +14,7 @@ pub use bpf_intf::*;
 mod stats;
 use stats::Ranks;
 use stats::WaitB;
+use stats::WaitCls;
 use std::mem::MaybeUninit;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
@@ -354,6 +355,12 @@ impl<'a> Scheduler<'a> {
             wait_ns: WaitB::of(&bss_data.nr_wait_ns),
             wait_max: WaitB::of(&bss_data.nr_wait_max),
             wait_slow: WaitB::of(&bss_data.nr_wait_slow),
+            wait_cls: WaitCls::of(
+                &bss_data.nr_wait_cls_n,
+                &bss_data.nr_wait_cls_ns,
+                &bss_data.nr_wait_cls_max,
+                &bss_data.nr_wait_cls_slow,
+            ),
         }
     }
 

@@ -117,6 +117,146 @@ impl WaitB {
     }
 }
 
+/// The wait-at-depth charge split by class (16 entries, class-major:
+/// class * 4 + depth). Class 0 is neither interactive nor foreground,
+/// 1 is interactive-only, 2 is foreground-only, 3 is both. `other`
+/// sums classes 0 and 1; `urgent` sums classes 2 and 3 - the
+/// foreground side, the classes a deadline-ordering change would
+/// prioritize.
+#[stat_doc]
+#[derive(Clone, Debug, Default, Serialize, Deserialize, Stats)]
+#[stat(top)]
+pub struct WaitCls {
+    #[stat(desc = "foreground (cls 2+3) waits at depth 0")]
+    pub fg_b0: u64,
+    #[stat(desc = "foreground waits at depth 1")]
+    pub fg_b1: u64,
+    #[stat(desc = "foreground waits at depth 2")]
+    pub fg_b2: u64,
+    #[stat(desc = "foreground waits at depth 3 or deeper")]
+    pub fg_b3: u64,
+    #[stat(desc = "foreground wait totals (ns) at depth 0")]
+    pub fg_ns_b0: u64,
+    #[stat(desc = "foreground wait totals (ns) at depth 1")]
+    pub fg_ns_b1: u64,
+    #[stat(desc = "foreground wait totals (ns) at depth 2")]
+    pub fg_ns_b2: u64,
+    #[stat(desc = "foreground wait totals (ns) at depth 3 or deeper")]
+    pub fg_ns_b3: u64,
+    #[stat(desc = "foreground wait maxima (ns) at depth 0")]
+    pub fg_max_b0: u64,
+    #[stat(desc = "foreground wait maxima (ns) at depth 1")]
+    pub fg_max_b1: u64,
+    #[stat(desc = "foreground wait maxima (ns) at depth 2")]
+    pub fg_max_b2: u64,
+    #[stat(desc = "foreground wait maxima (ns) at depth 3 or deeper")]
+    pub fg_max_b3: u64,
+    #[stat(desc = "foreground waits over 5ms, by depth bucket")]
+    pub fg_slow: Vec<u64>,
+    #[stat(desc = "other (cls 0+1) waits at depth 0")]
+    pub other_b0: u64,
+    #[stat(desc = "other waits at depth 1")]
+    pub other_b1: u64,
+    #[stat(desc = "other waits at depth 2")]
+    pub other_b2: u64,
+    #[stat(desc = "other waits at depth 3 or deeper")]
+    pub other_b3: u64,
+    #[stat(desc = "other wait totals (ns) at depth 0")]
+    pub other_ns_b0: u64,
+    #[stat(desc = "other wait totals (ns) at depth 1")]
+    pub other_ns_b1: u64,
+    #[stat(desc = "other wait totals (ns) at depth 2")]
+    pub other_ns_b2: u64,
+    #[stat(desc = "other wait totals (ns) at depth 3 or deeper")]
+    pub other_ns_b3: u64,
+    #[stat(desc = "other wait maxima (ns) at depth 0")]
+    pub other_max_b0: u64,
+    #[stat(desc = "other wait maxima (ns) at depth 1")]
+    pub other_max_b1: u64,
+    #[stat(desc = "other wait maxima (ns) at depth 2")]
+    pub other_max_b2: u64,
+    #[stat(desc = "other wait maxima (ns) at depth 3 or deeper")]
+    pub other_max_b3: u64,
+    #[stat(desc = "other waits over 5ms, by depth bucket")]
+    pub other_slow: Vec<u64>,
+}
+
+impl WaitCls {
+    pub fn of(a_n: &[u64; 16], a_ns: &[u64; 16], a_max: &[u64; 16], a_slow: &[u64; 16]) -> Self {
+        let mut fg_slow = Vec::with_capacity(4);
+        let mut other_slow = Vec::with_capacity(4);
+        for b in 0..4 {
+            fg_slow.push(a_slow[2 * 4 + b] + a_slow[3 * 4 + b]);
+            other_slow.push(a_slow[0 * 4 + b] + a_slow[1 * 4 + b]);
+        }
+        WaitCls {
+            fg_b0: a_n[2 * 4] + a_n[3 * 4],
+            fg_b1: a_n[2 * 4 + 1] + a_n[3 * 4 + 1],
+            fg_b2: a_n[2 * 4 + 2] + a_n[3 * 4 + 2],
+            fg_b3: a_n[2 * 4 + 3] + a_n[3 * 4 + 3],
+            fg_ns_b0: a_ns[2 * 4] + a_ns[3 * 4],
+            fg_ns_b1: a_ns[2 * 4 + 1] + a_ns[3 * 4 + 1],
+            fg_ns_b2: a_ns[2 * 4 + 2] + a_ns[3 * 4 + 2],
+            fg_ns_b3: a_ns[2 * 4 + 3] + a_ns[3 * 4 + 3],
+            fg_max_b0: a_max[2 * 4].max(a_max[3 * 4]),
+            fg_max_b1: a_max[2 * 4 + 1].max(a_max[3 * 4 + 1]),
+            fg_max_b2: a_max[2 * 4 + 2].max(a_max[3 * 4 + 2]),
+            fg_max_b3: a_max[2 * 4 + 3].max(a_max[3 * 4 + 3]),
+            fg_slow,
+            other_b0: a_n[0] + a_n[4],
+            other_b1: a_n[1] + a_n[5],
+            other_b2: a_n[2] + a_n[6],
+            other_b3: a_n[3] + a_n[7],
+            other_ns_b0: a_ns[0] + a_ns[4],
+            other_ns_b1: a_ns[1] + a_ns[5],
+            other_ns_b2: a_ns[2] + a_ns[6],
+            other_ns_b3: a_ns[3] + a_ns[7],
+            other_max_b0: a_max[0].max(a_max[4]),
+            other_max_b1: a_max[1].max(a_max[5]),
+            other_max_b2: a_max[2].max(a_max[6]),
+            other_max_b3: a_max[3].max(a_max[7]),
+            other_slow,
+        }
+    }
+
+    fn sub(&self, rhs: &Self) -> Self {
+        let vsub = |a: &Vec<u64>, b: &Vec<u64>| -> Vec<u64> {
+            a.iter()
+                .zip(b.iter())
+                .map(|(x, y)| x.saturating_sub(*y))
+                .collect()
+        };
+        WaitCls {
+            fg_b0: self.fg_b0.saturating_sub(rhs.fg_b0),
+            fg_b1: self.fg_b1.saturating_sub(rhs.fg_b1),
+            fg_b2: self.fg_b2.saturating_sub(rhs.fg_b2),
+            fg_b3: self.fg_b3.saturating_sub(rhs.fg_b3),
+            fg_ns_b0: self.fg_ns_b0.saturating_sub(rhs.fg_ns_b0),
+            fg_ns_b1: self.fg_ns_b1.saturating_sub(rhs.fg_ns_b1),
+            fg_ns_b2: self.fg_ns_b2.saturating_sub(rhs.fg_ns_b2),
+            fg_ns_b3: self.fg_ns_b3.saturating_sub(rhs.fg_ns_b3),
+            fg_max_b0: self.fg_max_b0.max(rhs.fg_max_b0),
+            fg_max_b1: self.fg_max_b1.max(rhs.fg_max_b1),
+            fg_max_b2: self.fg_max_b2.max(rhs.fg_max_b2),
+            fg_max_b3: self.fg_max_b3.max(rhs.fg_max_b3),
+            fg_slow: vsub(&self.fg_slow, &rhs.fg_slow),
+            other_b0: self.other_b0.saturating_sub(rhs.other_b0),
+            other_b1: self.other_b1.saturating_sub(rhs.other_b1),
+            other_b2: self.other_b2.saturating_sub(rhs.other_b2),
+            other_b3: self.other_b3.saturating_sub(rhs.other_b3),
+            other_ns_b0: self.other_ns_b0.saturating_sub(rhs.other_ns_b0),
+            other_ns_b1: self.other_ns_b1.saturating_sub(rhs.other_ns_b1),
+            other_ns_b2: self.other_ns_b2.saturating_sub(rhs.other_ns_b2),
+            other_ns_b3: self.other_ns_b3.saturating_sub(rhs.other_ns_b3),
+            other_max_b0: self.other_max_b0.max(rhs.other_max_b0),
+            other_max_b1: self.other_max_b1.max(rhs.other_max_b1),
+            other_max_b2: self.other_max_b2.max(rhs.other_max_b2),
+            other_max_b3: self.other_max_b3.max(rhs.other_max_b3),
+            other_slow: vsub(&self.other_slow, &rhs.other_slow),
+        }
+    }
+}
+
 #[stat_doc]
 #[derive(Clone, Debug, Default, Serialize, Deserialize, Stats)]
 #[stat(top)]
@@ -159,6 +299,8 @@ pub struct Metrics {
     pub wait_max: WaitB,
     #[stat(desc = "Waits over 5ms by depth bucket")]
     pub wait_slow: WaitB,
+    #[stat(desc = "The same waits split by class (foreground vs other)")]
+    pub wait_cls: WaitCls,
 }
 
 impl Metrics {
@@ -216,6 +358,54 @@ impl Metrics {
             self.nr_arr_seat,
             self.nr_arr_shared,
         )?;
+        let wc = &self.wait_cls;
+        let fmean = |ns: u64, n: u64| -> String {
+            if n > 0 {
+                format!("{:.0}", ns as f64 / n as f64 / 1000.0)
+            } else {
+                "-".into()
+            }
+        };
+        writeln!(
+            w,
+            "  waitfg n[{} {} {} {}] mean[{} {} {} {}] max[{} {} {} {}] slow5ms[{} {} {} {}]",
+            wc.fg_b0,
+            wc.fg_b1,
+            wc.fg_b2,
+            wc.fg_b3,
+            fmean(wc.fg_ns_b0, wc.fg_b0),
+            fmean(wc.fg_ns_b1, wc.fg_b1),
+            fmean(wc.fg_ns_b2, wc.fg_b2),
+            fmean(wc.fg_ns_b3, wc.fg_b3),
+            wc.fg_max_b0,
+            wc.fg_max_b1,
+            wc.fg_max_b2,
+            wc.fg_max_b3,
+            wc.fg_slow[0],
+            wc.fg_slow[1],
+            wc.fg_slow[2],
+            wc.fg_slow[3],
+        )?;
+        writeln!(
+            w,
+            "  waitot n[{} {} {} {}] mean[{} {} {} {}] max[{} {} {} {}] slow5ms[{} {} {} {}]",
+            wc.other_b0,
+            wc.other_b1,
+            wc.other_b2,
+            wc.other_b3,
+            fmean(wc.other_ns_b0, wc.other_b0),
+            fmean(wc.other_ns_b1, wc.other_b1),
+            fmean(wc.other_ns_b2, wc.other_b2),
+            fmean(wc.other_ns_b3, wc.other_b3),
+            wc.other_max_b0,
+            wc.other_max_b1,
+            wc.other_max_b2,
+            wc.other_max_b3,
+            wc.other_slow[0],
+            wc.other_slow[1],
+            wc.other_slow[2],
+            wc.other_slow[3],
+        )?;
         Ok(())
     }
 
@@ -245,6 +435,7 @@ impl Metrics {
                 b3: self.wait_max.b3.max(rhs.wait_max.b3),
             },
             wait_slow: self.wait_slow.sub(&rhs.wait_slow),
+            wait_cls: self.wait_cls.sub(&rhs.wait_cls),
         }
     }
 }
