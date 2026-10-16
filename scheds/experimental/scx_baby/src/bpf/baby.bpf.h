@@ -158,6 +158,14 @@ extern volatile u64 nr_wait_lcri_slow[BABY_WDEPTH_NR * 2];
 extern volatile u64 nr_tick_preempts, nr_tick_preempts_warm;
 
 /*
+ * Depth-1 out-of-turn pulls (the consumption-side wall round): the
+ * latency-critical waiters ops.dispatch() served past a non-lat-cri
+ * queue head, split by which queue held them - the shared deadline
+ * queue or the CPU's own warm seat.
+ */
+extern volatile u64 nr_depth1_pulls, nr_depth1_pulls_seat;
+
+/*
  * Where each arrival type landed: wake or rotation, warm seat or
  * shared queue. Indexed type * 2 + shared.
  */
@@ -373,5 +381,13 @@ __hidden void cpuperf_on_idle(s32 cpu);
  */
 __hidden bool balance_try_warm_seat(struct task_struct *p, struct task_ctx *tctx,
 			   u64 enq_flags, u64 backlog, u64 now);
+
+/*
+ * main.bpf.c: the depth-1 out-of-turn pull - serve a latency-critical
+ * task waiting one deep behind a non-lat-cri head before the head
+ * itself, bounded to one bypass per head (the starvation bound).
+ */
+__hidden bool depth1_pull_node(u64 dsq_id, s32 cpu);
+__hidden bool depth1_pull_seat(u64 dsq_id, s32 cpu);
 
 #endif /* __BABY_H */

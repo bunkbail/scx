@@ -25,6 +25,14 @@ volatile u64 nr_coldspreads;
 volatile u64 nr_tick_preempts, nr_tick_preempts_warm;
 
 /*
+ * Depth-1 out-of-turn pulls: latency-critical waiters served past a
+ * non-lat-cri queue head at ops.dispatch(), split by which queue held
+ * them - the node deadline queue or the CPU's own warm seat (where the
+ * wake arrivals park).
+ */
+volatile u64 nr_depth1_pulls, nr_depth1_pulls_seat;
+
+/*
  * Where placements land, by distance rank. The counters tell the warm
  * paths apart: the run-start histogram covers every path's outcome at
  * the point of truth, the wake-pick one covers ops.select_cpu(), and

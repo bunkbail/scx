@@ -93,6 +93,22 @@ static u64 cpu_running_at[BABY_MAX_CPUS];
 static u64 node_preempt_at;
 
 /*
+ * Depth-1 out-of-turn pull (the consumption-side wall round). The wlcri
+ * instrument showed the lat-cri wakees at 2x waiting one deep - behind
+ * a queue head that is not itself lat-cri: in a warm seat, where wakes
+ * park (99.9%) but the tick gate peeks only the head, or in the node
+ * queue, whose head at saturation is an overdue batch requeue. The wait
+ * is two serialized pull cadences (~833us each); serving the waiter at
+ * the head's own expiry removes one of them without adding a switch.
+ *
+ * The starvation bound is one bypass per head: when a pull succeeds, the
+ * skipped head's pid is recorded per queue, and the next dispatch that
+ * finds the same head consumes it. Under a lat-cri flood every other
+ * batch dispatch goes to the head - no e13a-style starvation.
+ */
+static u32 node_skip_pid, seat_skip_pid[BABY_MAX_CPUS];
+
+/*
  * Allocate/re-allocate a new cpumask.
  */
 static int calloc_cpumask(struct bpf_cpumask **p_cpumask)
@@ -171,6 +187,122 @@ s32 BPF_STRUCT_OPS(baby_select_cpu, struct task_struct *p,
 static u64 node_backlog(s32 cpu)
 {
 	return scx_bpf_dsq_nr_queued(__COMPAT_scx_bpf_cpu_node(cpu));
+}
+
+/*
+ * The depth-1 pull proper: the first two entries of @dsq_id in deadline
+ * order. Straight-line, no loop - two iterator steps only, so the
+ * verifier sees a DAG. Returns true when the depth-1 task was moved to
+ * this CPU's local queue; false leaves the head in place for the
+ * caller's normal consumption.
+ *
+ * Always inlined, RCU scope owned here: a noinline callee's
+ * bpf_rcu_read_unlock() demotes the caller's already-peeked task
+ * pointers to untrusted (probe-verified on the 7.2.9 kernel), while a
+ * same-frame lock/unlock pair leaves pointers peeked outside it
+ * alone - the flow_drain_own() shape.
+ *
+ * A successful scx_bpf_dsq_move() is a shared-queue consumption: the
+ * caller does the preempt-claim handback exactly as a move_to_local
+ * would. The cpus_ptr read goes through bpf_task_from_pid() - the raw
+ * iterated pointer does not verify for member access (the tickless
+ * note); the pid read does, which is what the re-acquire is keyed on.
+ */
+static __always_inline bool depth1_pull(u64 dsq_id, s32 cpu,
+					u32 *skip_pid,
+					volatile u64 *counter)
+{
+	struct bpf_iter_scx_dsq it;
+	struct task_struct *h, *w, *wp;
+	struct task_ctx *hctx, *wctx;
+	u32 h_pid;
+	bool moved = false;
+
+	/*
+	 * Guard outside the RCU section: scx_bpf_dsq_nr_queued() does
+	 * not verify inside one (the node_backlog note). One deep means
+	 * only the head - nothing to serve past it, and no bypass was
+	 * decided, so a stale skip record can be dropped here: the
+	 * caller consumes the head and its next incarnation starts
+	 * with a clean bound.
+	 */
+	if (scx_bpf_dsq_nr_queued(dsq_id) < 2) {
+		*skip_pid = 0;
+		return false;
+	}
+
+	bpf_rcu_read_lock();
+	h = NULL;
+	w = NULL;
+	if (!bpf_iter_scx_dsq_new(&it, dsq_id, 0)) {
+		h = bpf_iter_scx_dsq_next(&it);
+		w = bpf_iter_scx_dsq_next(&it);
+	}
+
+	/*
+	 * The head must not be the waiter we are serving for: a lat-cri
+	 * head is either the tick gate's business or gets consumed
+	 * first by deadline order anyway.
+	 */
+	hctx = h ? try_lookup_task_ctx(h) : NULL;
+	if (!h || !w || (hctx && is_lat_cri(hctx))) {
+		*skip_pid = 0;
+	} else {
+		h_pid = (u32)h->pid;
+
+		/*
+		 * The bound: this exact head was bypassed once already.
+		 * Consume it now - the caller's move_to_local takes it -
+		 * and clear the record so its next incarnation can be
+		 * bypassed again.
+		 */
+		if (*skip_pid == h_pid) {
+			*skip_pid = 0;
+		} else {
+			/*
+			 * The waiter must be lat-cri and able to run here.
+			 * The cpus_ptr read goes through the re-acquired
+			 * pointer; the move re-locks the DSQ itself.
+			 */
+			wctx = try_lookup_task_ctx(w);
+			wp = bpf_task_from_pid(w->pid);
+			if (wctx && is_lat_cri(wctx) && wp &&
+			    bpf_cpumask_test_cpu((u32)cpu & (BABY_MAX_CPUS - 1),
+						 wp->cpus_ptr)) {
+				moved = scx_bpf_dsq_move(&it, w, SCX_DSQ_LOCAL, 0);
+				if (moved) {
+					*skip_pid = h_pid;
+					__sync_fetch_and_add(counter, 1);
+				} else {
+					*skip_pid = 0;
+				}
+			} else {
+				*skip_pid = 0;
+			}
+			if (wp)
+				bpf_task_release(wp);
+		}
+	}
+
+	/*
+	 * Destroy unconditionally, on the failed-new path too - the
+	 * compat peek's proven shape; the verifier holds the iterator
+	 * reference until the destroy regardless of the new outcome.
+	 */
+	bpf_iter_scx_dsq_destroy(&it);
+	bpf_rcu_read_unlock();
+	return moved;
+}
+
+__hidden bool depth1_pull_node(u64 dsq_id, s32 cpu)
+{
+	return depth1_pull(dsq_id, cpu, &node_skip_pid, &nr_depth1_pulls);
+}
+
+__hidden bool depth1_pull_seat(u64 dsq_id, s32 cpu)
+{
+	return depth1_pull(dsq_id, cpu, &seat_skip_pid[(u32)cpu & (BABY_MAX_CPUS - 1)],
+			   &nr_depth1_pulls_seat);
 }
 
 /*
@@ -350,12 +482,21 @@ void BPF_STRUCT_OPS(baby_dispatch, s32 cpu, struct task_struct *prev)
 
 		if (g_dl < wq_dl) {
 			/*
-			 * The pulled task is the node head; attribute the
-			 * pull from where it last ran. The head is never
-			 * NULL here: g_dl is finite only when q exists.
+			 * The node head's origin, read while q is fresh: the
+			 * pull below may enter an RCU scope, and pointers
+			 * peeked before it keep their marks only as long as
+			 * nothing re-reads them after the unlock.
 			 */
 			s32 from = q ? scx_bpf_task_cpu(q) : -1;
-			bool pulled = scx_bpf_dsq_move_to_local(node, 0);
+			/*
+			 * Serve a lat-cri waiter one deep behind the node
+			 * head first: the overdue-batch head cannot be
+			 * re-ordered past by any deadline offset (the lcomp
+			 * verdict), so the inversion is resolved here, at
+			 * consumption. Bounded: this head is bypassed once.
+			 */
+			bool d1 = depth1_pull_node(node, cpu);
+			bool pulled = d1 || scx_bpf_dsq_move_to_local(node, 0);
 
 			if (pulled) {
 				/*
@@ -364,17 +505,30 @@ void BPF_STRUCT_OPS(baby_dispatch, s32 cpu, struct task_struct *prev)
 				 * - either way the next staggered tick may
 				 * claim again). Plain store: a racing tick
 				 * CAS against the cleared stamp just fails
-				 * and retries next tick.
+				 * and retries next tick. The depth-1 pull is
+				 * counted in nr_depth1_pulls; nr_pull_land
+				 * stays for the in-turn pulls it attributes.
 				 */
 				node_preempt_at = 0;
-				__sync_fetch_and_add(
-					&nr_pull_land[cpu_dist(cpu, from)],
-					1);
+				if (!d1)
+					__sync_fetch_and_add(
+						&nr_pull_land[cpu_dist(cpu,
+									       from)],
+						1);
 			}
+
 			if (pulled ||
 			    scx_bpf_dsq_move_to_local(cpu2dsq(cpu), 0))
 				return;
 		} else {
+			/*
+			 * Same depth-1 service for the warm queue: wakes
+			 * park in seats (99.9%), so this is where a wake
+			 * sits behind a non-lat-cri head. One skip per
+			 * head, per seat.
+			 */
+			if (depth1_pull_seat(cpu2dsq(cpu), cpu))
+				return;
 			if (scx_bpf_dsq_move_to_local(cpu2dsq(cpu), 0))
 				return;
 			if (scx_bpf_dsq_move_to_local(node, 0)) {
