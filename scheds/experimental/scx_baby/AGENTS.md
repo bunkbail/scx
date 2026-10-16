@@ -40,10 +40,15 @@ module includes only "baby.bpf.h", the shared interface.
 - One definition per map and global. A SEC(".maps") definition cannot be
   extern-declared, so a map is reached from another module only through
   functions defined in the module that owns it.
-- Cross-module calls are plain global functions with prototypes in
-  baby.bpf.h. The BPF calling convention passes arguments in R1-R5, so a
-  cross-module call takes at most 5 arguments; pack wider state into a
-  context struct instead.
+- Cross-module functions are __hidden globals with prototypes in
+  baby.bpf.h. The hidden visibility makes clang emit their BTF FUNC
+  entries as static, so the verifier inlines them at load. A plain
+  global function instead faces the kernel's global-function ABI
+  checks, which reject pointer returns and mis-verify trusted
+  task_struct arguments (observed on the 5600X's 7.2.9 kernel).
+  Defense in depth on top: the BPF calling convention passes arguments
+  in R1-R5, so a cross-module call still takes at most 5 arguments;
+  pack wider state into a context struct instead.
 - The ops callbacks stay in main.bpf.c and delegate to the modules; a
   module never defines a BPF_STRUCT_OPS callback.
 - intf.h is the bindgen-facing header (src/bpf_intf.rs is generated from

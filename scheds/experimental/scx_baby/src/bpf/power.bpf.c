@@ -162,7 +162,7 @@ static void init_cpuperf_target(void)
 	scx_bpf_put_cpumask(online_cpumask);
 }
 
-void cpuperf_init(void)
+__hidden void cpuperf_init(void)
 {
 	/* Initialize the CPU frequency performance level. */
 	init_cpuperf_target();
@@ -178,7 +178,7 @@ void cpuperf_init(void)
  * and the ledger stays consistent with ops.stopping(), which charges
  * the time since the last advance.
  */
-void cpuperf_on_tick(struct task_struct *p, u64 now, bool max_floor)
+__hidden void cpuperf_on_tick(struct task_struct *p, u64 now, bool max_floor)
 {
 	if (cpuperf_lvl < 0) {
 		struct cpu_ctx *cctx;
@@ -199,7 +199,7 @@ void cpuperf_on_tick(struct task_struct *p, u64 now, bool max_floor)
  * as it runs, so give it the boost clock at once instead of
  * re-climbing the smoothing after every sleep (@max_floor).
  */
-void cpuperf_on_running(s32 cpu, bool max_floor)
+__hidden void cpuperf_on_running(s32 cpu, bool max_floor)
 {
 	if (cpuperf_lvl < 0) {
 		struct cpu_ctx *cctx;
@@ -214,7 +214,7 @@ void cpuperf_on_running(s32 cpu, bool max_floor)
  * Charge the runtime the task just accumulated to the CPU ledger, so
  * the next window evaluates it, in every mode the module is active in.
  */
-void cpuperf_on_stopping(s32 cpu, u64 now)
+__hidden void cpuperf_on_stopping(s32 cpu, u64 now)
 {
 	if (!cpuperf_offline()) {
 		struct cpu_ctx *cctx;
@@ -231,7 +231,7 @@ void cpuperf_on_stopping(s32 cpu, u64 now)
  * level actually changes - see the comment on perf_req for why the
  * idle path must not churn the request either.
  */
-void cpuperf_on_idle(s32 cpu)
+__hidden void cpuperf_on_idle(s32 cpu)
 {
 	if (cpuperf_lvl < 0) {
 		struct cpu_ctx *cctx = try_lookup_cpu_ctx(cpu);

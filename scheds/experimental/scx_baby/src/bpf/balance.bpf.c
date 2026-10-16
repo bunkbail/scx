@@ -37,7 +37,7 @@
  * Returns true when the task was seated on a warm queue; false
  * leaves the enqueue to the direct dispatch and the shared queue.
  */
-bool balance_try_warm_seat(struct task_struct *p, struct task_ctx *tctx,
+__hidden bool balance_try_warm_seat(struct task_struct *p, struct task_ctx *tctx,
 			   u64 enq_flags, u64 backlog, u64 now)
 {
 	s32 prev_cpu = scx_bpf_task_cpu(p);

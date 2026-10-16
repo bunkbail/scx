@@ -28,7 +28,7 @@ const volatile u32 topo_core[BABY_MAX_CPUS];
  * arms of a three-way compare would branch the scan's exploration and
  * blow past the jump-complexity limit (observed 8193-jump blowup).
  */
-u32 cpu_dist(s32 a, s32 b)
+__hidden u32 cpu_dist(s32 a, s32 b)
 {
 	u32 ia, ib;
 
@@ -60,7 +60,14 @@ struct {
 	__type(value, struct task_ctx);
 } task_ctx_stor SEC(".maps");
 
-struct task_ctx *try_lookup_task_ctx(const struct task_struct *p)
+/*
+ * Cross-module functions are __hidden: the visibility makes clang emit
+ * their BTF FUNC entries as static, so the verifier inlines them at load
+ * instead of applying the kernel's global-function ABI checks (which on
+ * 6.12-era kernels reject pointer returns and mis-walk trusted
+ * task_struct arguments).
+ */
+__hidden struct task_ctx *try_lookup_task_ctx(const struct task_struct *p)
 {
 	return bpf_task_storage_get(&task_ctx_stor,
 					(struct task_struct *)p, 0, 0);
@@ -69,7 +76,7 @@ struct task_ctx *try_lookup_task_ctx(const struct task_struct *p)
 /*
  * Create the task context of @p, or return the one it already holds.
  */
-struct task_ctx *init_task_ctx(struct task_struct *p)
+__hidden struct task_ctx *init_task_ctx(struct task_struct *p)
 {
 	return bpf_task_storage_get(&task_ctx_stor, p, 0,
 				    BPF_LOCAL_STORAGE_GET_F_CREATE);

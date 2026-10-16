@@ -292,56 +292,56 @@ static __always_inline u64 calc_avg(u64 old_val, u64 new_val)
 /*
  * util.bpf.c: per-task context and the topology distance.
  */
-struct task_ctx *try_lookup_task_ctx(const struct task_struct *p);
-struct task_ctx *init_task_ctx(struct task_struct *p);
-u32 cpu_dist(s32 a, s32 b);
+__hidden struct task_ctx *try_lookup_task_ctx(const struct task_struct *p);
+__hidden struct task_ctx *init_task_ctx(struct task_struct *p);
+__hidden u32 cpu_dist(s32 a, s32 b);
 
 /*
  * stats.bpf.c: the wait-at-depth instrument and the consumption census.
  */
-void stamp_wait(struct task_ctx *tctx, u64 now, u64 depth, bool shared);
-void charge_wait(struct task_ctx *tctx, u64 now);
-void census_sample(s32 cpu);
+__hidden void stamp_wait(struct task_ctx *tctx, u64 now, u64 depth, bool shared);
+__hidden void charge_wait(struct task_ctx *tctx, u64 now);
+__hidden void census_sample(s32 cpu);
 
 /*
  * class.bpf.c: bursts, wake frequency, class predicates and deadline math.
  */
-void update_bursts(struct task_ctx *tctx, u64 now);
-bool can_resched(const struct task_ctx *tctx);
-bool is_interactive(const struct task_ctx *tctx);
-bool is_heavy_proven(const struct task_ctx *tctx);
-bool is_foreground(const struct task_ctx *tctx);
-u64 task_slice(const struct task_ctx *tctx);
-s64 task_prio_factor(const struct task_struct *p,
+__hidden void update_bursts(struct task_ctx *tctx, u64 now);
+__hidden bool can_resched(const struct task_ctx *tctx);
+__hidden bool is_interactive(const struct task_ctx *tctx);
+__hidden bool is_heavy_proven(const struct task_ctx *tctx);
+__hidden bool is_foreground(const struct task_ctx *tctx);
+__hidden u64 task_slice(const struct task_ctx *tctx);
+__hidden s64 task_prio_factor(const struct task_struct *p,
 		     const struct task_ctx *tctx);
-u64 calc_deadline(const struct task_struct *p, struct task_ctx *tctx,
+__hidden u64 calc_deadline(const struct task_struct *p, struct task_ctx *tctx,
 		  u64 now);
-void class_on_runnable(struct task_ctx *tctx, u64 enq_flags, u64 now);
-void class_boost_on_sleep(struct task_struct *p, struct task_ctx *tctx,
+__hidden void class_on_runnable(struct task_ctx *tctx, u64 enq_flags, u64 now);
+__hidden void class_boost_on_sleep(struct task_struct *p, struct task_ctx *tctx,
 			  bool runnable, u64 now);
-void class_init_task(struct task_ctx *tctx, struct task_struct *p, u64 now);
+__hidden void class_init_task(struct task_ctx *tctx, struct task_struct *p, u64 now);
 
 /*
  * idle.bpf.c: idle-CPU acquisition and direct dispatch.
  */
-s32 pick_idle_cpu(struct task_struct *p, s32 prev_cpu, u64 wake_flags,
+__hidden s32 pick_idle_cpu(struct task_struct *p, s32 prev_cpu, u64 wake_flags,
 		  bool *is_idle);
-bool try_direct_dispatch(struct task_struct *p, struct task_ctx *tctx,
+__hidden bool try_direct_dispatch(struct task_struct *p, struct task_ctx *tctx,
 			 s32 prev_cpu, u64 enq_flags, bool is_running);
 
 /*
  * power.bpf.c: CPU performance scaling.
  */
-void cpuperf_init(void);
-void cpuperf_on_tick(struct task_struct *p, u64 now, bool max_floor);
-void cpuperf_on_running(s32 cpu, bool max_floor);
-void cpuperf_on_stopping(s32 cpu, u64 now);
-void cpuperf_on_idle(s32 cpu);
+__hidden void cpuperf_init(void);
+__hidden void cpuperf_on_tick(struct task_struct *p, u64 now, bool max_floor);
+__hidden void cpuperf_on_running(s32 cpu, bool max_floor);
+__hidden void cpuperf_on_stopping(s32 cpu, u64 now);
+__hidden void cpuperf_on_idle(s32 cpu);
 
 /*
  * balance.bpf.c: the warm-seat balance under oversubscription.
  */
-bool balance_try_warm_seat(struct task_struct *p, struct task_ctx *tctx,
+__hidden bool balance_try_warm_seat(struct task_struct *p, struct task_ctx *tctx,
 			   u64 enq_flags, u64 backlog, u64 now);
 
 #endif /* __BABY_H */

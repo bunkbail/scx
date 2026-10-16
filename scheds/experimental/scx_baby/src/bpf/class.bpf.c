@@ -57,7 +57,7 @@ static s32 task_nice(const struct task_struct *p, const struct task_ctx *tctx)
 /*
  * Return the deadline offset applied by the task's nice level.
  */
-s64 task_prio_factor(const struct task_struct *p,
+__hidden s64 task_prio_factor(const struct task_struct *p,
 		     const struct task_ctx *tctx)
 {
 	s32 idx = (task_nice(p, tctx) + 20) & (PRIO_FACTOR_NR - 1);
@@ -68,7 +68,7 @@ s64 task_prio_factor(const struct task_struct *p,
 /*
  * Return a fresh deadline for the task.
  */
-u64
+__hidden u64
 calc_deadline(const struct task_struct *p, struct task_ctx *tctx, u64 now)
 {
 	return now + deadline_ns + task_prio_factor(p, tctx);
@@ -93,7 +93,7 @@ static void account_bursts(struct task_ctx *tctx, u64 delta, u64 now)
  * Account the runtime accumulated since the last call (original
  * update_curr() bookkeeping part).
  */
-void update_bursts(struct task_ctx *tctx, u64 now)
+__hidden void update_bursts(struct task_ctx *tctx, u64 now)
 {
 	u64 delta = now - tctx->last_acc_at;
 
@@ -111,7 +111,7 @@ void update_bursts(struct task_ctx *tctx, u64 now)
  * the next one until either the window is nearly over, the task's own
  * bursts caught up, or the task is close to completing its previous burst.
  */
-bool can_resched(const struct task_ctx *tctx)
+__hidden bool can_resched(const struct task_ctx *tctx)
 {
 	u64 bursts = tctx->prev_bursts;
 	u64 curr_bursts = tctx->bursts;
@@ -141,7 +141,7 @@ bool can_resched(const struct task_ctx *tctx)
  * boost, so it is useless for telling latency-sensitive tasks apart
  * from hogs.
  */
-bool is_interactive(const struct task_ctx *tctx)
+__hidden bool is_interactive(const struct task_ctx *tctx)
 {
 	return tctx->prev_bursts < TIME_PERIOD / 4 &&
 	       tctx->prev_bursts + tctx->bursts > 0;
@@ -157,7 +157,7 @@ bool is_interactive(const struct task_ctx *tctx)
  * core finishes the work sooner and returns to sleep (race to idle),
  * while a blip with no history stays stacked on the little cores.
  */
-bool is_heavy_proven(const struct task_ctx *tctx)
+__hidden bool is_heavy_proven(const struct task_ctx *tctx)
 {
 	return tctx->prev_bursts + tctx->bursts > TIME_PERIOD / 4;
 }
@@ -172,7 +172,7 @@ bool is_heavy_proven(const struct task_ctx *tctx)
  */
 #define FOREGROUND_WAKE_FREQ	10
 
-bool is_foreground(const struct task_ctx *tctx)
+__hidden bool is_foreground(const struct task_ctx *tctx)
 {
 	return tctx->wake_samples >= 4 &&
 	       tctx->peak_freq >= FOREGROUND_WAKE_FREQ &&
@@ -184,7 +184,7 @@ bool is_foreground(const struct task_ctx *tctx)
  * and interleaving them with hog slices on a busy core multiplies the
  * wall time of each request.
  */
-u64 task_slice(const struct task_ctx *tctx)
+__hidden u64 task_slice(const struct task_ctx *tctx)
 {
 	return is_foreground(tctx) ? 4 * deadline_ns : deadline_ns;
 }
@@ -195,7 +195,7 @@ u64 task_slice(const struct task_ctx *tctx)
  * how often the task wakes. Frequent wakers with real work to do are
  * foreground tasks.
  */
-void class_on_runnable(struct task_ctx *tctx, u64 enq_flags, u64 now)
+__hidden void class_on_runnable(struct task_ctx *tctx, u64 enq_flags, u64 now)
 {
 	u64 delta = now - tctx->last_woke_at;
 
@@ -244,7 +244,7 @@ void class_on_runnable(struct task_ctx *tctx, u64 enq_flags, u64 now)
  * consuming its deadline is treated as interactive and earns one
  * priority boost step.
  */
-void class_boost_on_sleep(struct task_struct *p, struct task_ctx *tctx,
+__hidden void class_boost_on_sleep(struct task_struct *p, struct task_ctx *tctx,
 			  bool runnable, u64 now)
 {
 	if (!runnable && !reached_deadline(tctx, now) &&
@@ -264,7 +264,7 @@ void class_boost_on_sleep(struct task_struct *p, struct task_ctx *tctx,
  * keep the compaction. This also covers the tasks that exist at
  * attach: their parents have no context yet and seed nothing.
  */
-void class_init_task(struct task_ctx *tctx, struct task_struct *p, u64 now)
+__hidden void class_init_task(struct task_ctx *tctx, struct task_struct *p, u64 now)
 {
 	tctx->deadline = calc_deadline(p, tctx, now);
 	tctx->start_time = now;

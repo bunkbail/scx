@@ -14,7 +14,7 @@
  * the SMT topology and spreads wakeups across the LLCs. Returns the
  * CPU, with @is_idle set when it was picked idle.
  */
-s32 pick_idle_cpu(struct task_struct *p, s32 prev_cpu,
+__hidden s32 pick_idle_cpu(struct task_struct *p, s32 prev_cpu,
 		  u64 wake_flags, bool *is_idle)
 {
 	s32 cpu;
@@ -44,7 +44,7 @@ s32 pick_idle_cpu(struct task_struct *p, s32 prev_cpu,
  *
  * Return true if the task is dispatched, false otherwise.
  */
-bool try_direct_dispatch(struct task_struct *p, struct task_ctx *tctx,
+__hidden bool try_direct_dispatch(struct task_struct *p, struct task_ctx *tctx,
 			 s32 prev_cpu, u64 enq_flags, bool is_running)
 {
 	bool is_idle = false;

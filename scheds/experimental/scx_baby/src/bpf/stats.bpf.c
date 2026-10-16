@@ -94,7 +94,7 @@ volatile u64 nr_census_shared[BABY_CENSUS_NR];
  * is clamped here by assignment through the u8 field and masked again
  * at the charging site, so the verifier can prove the bucket index.
  */
-void stamp_wait(struct task_ctx *tctx, u64 now, u64 depth, bool shared)
+__hidden void stamp_wait(struct task_ctx *tctx, u64 now, u64 depth, bool shared)
 {
 	u8 type = tctx->arrival_is_wake & 1;
 
@@ -113,7 +113,7 @@ void stamp_wait(struct task_ctx *tctx, u64 now, u64 depth, bool shared)
  * proves nothing to the verifier; the stored value is already clamped,
  * so the mask only ever matters for a corrupted stamp.
  */
-void charge_wait(struct task_ctx *tctx, u64 now)
+__hidden void charge_wait(struct task_ctx *tctx, u64 now)
 {
 	if (tctx->wait_stamp) {
 		u64 wait = now - tctx->wait_stamp;
@@ -153,7 +153,7 @@ void charge_wait(struct task_ctx *tctx, u64 now)
  * turns on. Sampled at every dispatch, so the distribution carries the
  * consumption-rate weighting the arrival-time wait stamp lacks.
  */
-void census_sample(s32 cpu)
+__hidden void census_sample(s32 cpu)
 {
 	s32 node = __COMPAT_scx_bpf_cpu_node(cpu);
 	u64 seat = scx_bpf_dsq_nr_queued(cpu2dsq(cpu));

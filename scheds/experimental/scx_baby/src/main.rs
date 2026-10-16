@@ -404,6 +404,7 @@ impl Drop for Scheduler<'_> {
 }
 
 fn main() -> Result<()> {
+    scx_utils::init_libbpf_logging(None);
     let opts = Opts::parse();
 
     if opts.version {
