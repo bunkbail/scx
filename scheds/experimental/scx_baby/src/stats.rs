@@ -397,6 +397,75 @@ impl WaitType {
     }
 }
 
+/// The wait-at-depth charge split by wake-rate latency-criticality
+/// (8 entries, lcri-major: lcri * 4 + depth). `lat` is a task the
+/// is_lat_cri() predicate (wake samples + peak frequency) holds at
+/// charge time; `other` is everything else. This is the schbench-2x
+/// question: whether the wakees the tick gate serves actually wait,
+/// at what depth, and for how long.
+#[stat_doc]
+#[derive(Clone, Debug, Default, Serialize, Deserialize, Stats)]
+#[stat(top)]
+pub struct WaitLCRI {
+    #[stat(desc = "latency-critical waits, by depth bucket")]
+    pub lat_n: Vec<u64>,
+    #[stat(desc = "latency-critical wait totals (ns), by depth bucket")]
+    pub lat_ns: Vec<u64>,
+    #[stat(desc = "latency-critical wait maxima (ns), by depth bucket")]
+    pub lat_max: Vec<u64>,
+    #[stat(desc = "latency-critical waits over 5ms, by depth bucket")]
+    pub lat_slow: Vec<u64>,
+    #[stat(desc = "non-latency-critical waits, by depth bucket")]
+    pub other_n: Vec<u64>,
+    #[stat(desc = "non-latency-critical wait totals (ns), by depth bucket")]
+    pub other_ns: Vec<u64>,
+    #[stat(desc = "non-latency-critical wait maxima (ns), by depth bucket")]
+    pub other_max: Vec<u64>,
+    #[stat(desc = "non-latency-critical waits over 5ms, by depth bucket")]
+    pub other_slow: Vec<u64>,
+}
+
+impl WaitLCRI {
+    pub fn of(a_n: &[u64; 8], a_ns: &[u64; 8], a_max: &[u64; 8], a_slow: &[u64; 8]) -> Self {
+        let (other_n, lat_n) = a_n.split_at(4);
+        let (other_ns, lat_ns) = a_ns.split_at(4);
+        let (other_max, lat_max) = a_max.split_at(4);
+        let (other_slow, lat_slow) = a_slow.split_at(4);
+        WaitLCRI {
+            lat_n: lat_n.to_vec(),
+            lat_ns: lat_ns.to_vec(),
+            lat_max: lat_max.to_vec(),
+            lat_slow: lat_slow.to_vec(),
+            other_n: other_n.to_vec(),
+            other_ns: other_ns.to_vec(),
+            other_max: other_max.to_vec(),
+            other_slow: other_slow.to_vec(),
+        }
+    }
+
+    fn sub(&self, rhs: &Self) -> Self {
+        let vsub = |a: &Vec<u64>, b: &Vec<u64>| -> Vec<u64> {
+            a.iter()
+                .zip(b.iter())
+                .map(|(x, y)| x.saturating_sub(*y))
+                .collect()
+        };
+        let vmax = |a: &Vec<u64>, b: &Vec<u64>| -> Vec<u64> {
+            a.iter().zip(b.iter()).map(|(x, y)| (*x).max(*y)).collect()
+        };
+        WaitLCRI {
+            lat_n: vsub(&self.lat_n, &rhs.lat_n),
+            lat_ns: vsub(&self.lat_ns, &rhs.lat_ns),
+            lat_max: vmax(&self.lat_max, &rhs.lat_max),
+            lat_slow: vsub(&self.lat_slow, &rhs.lat_slow),
+            other_n: vsub(&self.other_n, &rhs.other_n),
+            other_ns: vsub(&self.other_ns, &rhs.other_ns),
+            other_max: vmax(&self.other_max, &rhs.other_max),
+            other_slow: vsub(&self.other_slow, &rhs.other_slow),
+        }
+    }
+}
+
 /// Where the queues stood when a lane came to pick work, sampled in
 /// ops.dispatch(): the seat depth is what its warm queue holds at the
 /// pick, the shared backlog the rotation it turns against. Eight
@@ -510,6 +579,8 @@ pub struct Metrics {
     pub wait_cls: WaitCls,
     #[stat(desc = "The same waits split by arrival type (wake handoff vs rotation)")]
     pub wait_type: WaitType,
+    #[stat(desc = "The same waits split by wake-rate latency-criticality")]
+    pub wait_lcri: WaitLCRI,
     #[stat(desc = "Wake arrivals parked in a warm seat")]
     pub nr_arr_wake_seat: u64,
     #[stat(desc = "Wake arrivals parked in the shared queue")]
@@ -672,6 +743,35 @@ impl Metrics {
             self.nr_arr_rot_seat,
             self.nr_arr_rot_shared,
         )?;
+        let wl = &self.wait_lcri;
+        let vmean = |ns: &[u64], n: &[u64]| -> Vec<String> {
+            ns.iter()
+                .zip(n.iter())
+                .map(|(ns, n)| {
+                    if *n > 0 {
+                        (ns / n / 1000).to_string()
+                    } else {
+                        "-".to_string()
+                    }
+                })
+                .collect()
+        };
+        writeln!(
+            w,
+            "  wlcri lat n[{:?}] mean[{:?}] max[{:?}] slow5ms[{:?}]",
+            wl.lat_n,
+            vmean(&wl.lat_ns, &wl.lat_n),
+            wl.lat_max,
+            wl.lat_slow,
+        )?;
+        writeln!(
+            w,
+            "  wlcri other n[{:?}] mean[{:?}] max[{:?}] slow5ms[{:?}]",
+            wl.other_n,
+            vmean(&wl.other_ns, &wl.other_n),
+            wl.other_max,
+            wl.other_slow,
+        )?;
         write!(w, "  census: ")?;
         self.census.format(w)?;
         Ok(())
@@ -707,6 +807,7 @@ impl Metrics {
             wait_slow: self.wait_slow.sub(&rhs.wait_slow),
             wait_cls: self.wait_cls.sub(&rhs.wait_cls),
             wait_type: self.wait_type.sub(&rhs.wait_type),
+            wait_lcri: self.wait_lcri.sub(&rhs.wait_lcri),
             nr_arr_wake_seat: self.nr_arr_wake_seat.saturating_sub(rhs.nr_arr_wake_seat),
             nr_arr_wake_shared: self
                 .nr_arr_wake_shared

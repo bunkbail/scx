@@ -88,6 +88,16 @@ volatile u64 nr_wait_type_slow[BABY_WDEPTH_NR * BABY_WTYPE_NR];
 volatile u64 nr_arr_type[2 * 2];
 
 /*
+ * The same charge, split by wake-rate latency-criticality (lcri-major,
+ * lcri * 4 + depth; is_lat_cri() evaluated at charge time in
+ * ops.running(), where the EWMA is current).
+ */
+volatile u64 nr_wait_lcri_n[BABY_WDEPTH_NR * 2];
+volatile u64 nr_wait_lcri_ns[BABY_WDEPTH_NR * 2];
+volatile u64 nr_wait_lcri_max[BABY_WDEPTH_NR * 2];
+volatile u64 nr_wait_lcri_slow[BABY_WDEPTH_NR * 2];
+
+/*
  * Consumption census: sampled in ops.dispatch(), the queue state a
  * lane sees when it comes to pick work - the depth left in its warm
  * seat and the shared backlog the rotation turns on. Eight buckets,
@@ -152,6 +162,16 @@ __hidden void charge_wait(struct task_ctx *tctx, u64 now)
 			nr_wait_type_max[ti] = wait;
 		if (wait > BABY_WAIT_SLOW_NS)
 			__sync_fetch_and_add(&nr_wait_type_slow[ti], 1);
+
+		u32 l = is_lat_cri(tctx) ? 1 : 0;
+		u32 li = l * BABY_WDEPTH_NR + b;
+
+		__sync_fetch_and_add(&nr_wait_lcri_n[li], 1);
+		__sync_fetch_and_add(&nr_wait_lcri_ns[li], wait);
+		if (wait > nr_wait_lcri_max[li])
+			nr_wait_lcri_max[li] = wait;
+		if (wait > BABY_WAIT_SLOW_NS)
+			__sync_fetch_and_add(&nr_wait_lcri_slow[li], 1);
 	}
 }
 

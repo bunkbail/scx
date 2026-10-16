@@ -138,6 +138,18 @@ extern volatile u64 nr_wait_type_max[BABY_WDEPTH_NR * BABY_WTYPE_NR];
 extern volatile u64 nr_wait_type_slow[BABY_WDEPTH_NR * BABY_WTYPE_NR];
 
 /*
+ * The same charge, split by wake-rate latency-criticality (2 * 4
+ * entries, lcri-major: lcri * BABY_WDEPTH_NR + depth). Latency-critical
+ * waits are the schbench-2x question: whether the wakees the tick gate
+ * serves actually wait, at what depth, and how long - or whether they
+ * are served at depth 0 and the gap lives elsewhere.
+ */
+extern volatile u64 nr_wait_lcri_n[BABY_WDEPTH_NR * 2];
+extern volatile u64 nr_wait_lcri_ns[BABY_WDEPTH_NR * 2];
+extern volatile u64 nr_wait_lcri_max[BABY_WDEPTH_NR * 2];
+extern volatile u64 nr_wait_lcri_slow[BABY_WDEPTH_NR * 2];
+
+/*
  * Saturation deferred-preemption instrument: the victims ops.tick() cut
  * short because a latency-critical task waited at a queue head, split
  * by where the waiter sat - the shared deadline queue or the CPU's own
