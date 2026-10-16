@@ -557,6 +557,8 @@ pub struct Metrics {
     pub nr_depth1_pulls: u64,
     #[stat(desc = "Lat-cri waiters served past a non-lat-cri warm-seat head")]
     pub nr_depth1_pulls_seat: u64,
+    #[stat(desc = "Lat-cri wakees preempting a running non-lat-cri victim at wake")]
+    pub nr_wake_preempts: u64,
     #[stat(desc = "Landings by distance at the point of truth (dispatch)")]
     pub nr_land: Ranks,
     #[stat(desc = "ops.select_cpu() idle picks by distance")]
@@ -601,7 +603,7 @@ impl Metrics {
     fn format<W: Write>(&self, w: &mut W) -> Result<()> {
         writeln!(
             w,
-            "[{}] tasks -> r: {:>2} | dispatch -> d: {:<5} s: {:<5} | preempt: {:<5} tick: {:<4}+{:<4} | d1pull: {:<4}+{:<4} | boost: {:<5} | sticky: {:<5} | warm: {:<5} | cold: {:<5}",
+            "[{}] tasks -> r: {:>2} | dispatch -> d: {:<5} s: {:<5} | preempt: {:<5} tick: {:<4}+{:<4} | d1pull: {:<4}+{:<4} | wkpre: {:<5} | boost: {:<4} | sticky: {:<5} | warm: {:<5} | cold: {:<5}",
             crate::SCHEDULER_NAME,
             self.nr_running,
             self.nr_direct_dispatches,
@@ -611,6 +613,7 @@ impl Metrics {
             self.nr_tick_preempts_warm,
             self.nr_depth1_pulls,
             self.nr_depth1_pulls_seat,
+            self.nr_wake_preempts,
             self.nr_boosts,
             self.nr_sticky,
             self.nr_warmseats,
@@ -797,6 +800,7 @@ impl Metrics {
             nr_tick_preempts_warm: self.nr_tick_preempts_warm - rhs.nr_tick_preempts_warm,
             nr_depth1_pulls: self.nr_depth1_pulls - rhs.nr_depth1_pulls,
             nr_depth1_pulls_seat: self.nr_depth1_pulls_seat - rhs.nr_depth1_pulls_seat,
+            nr_wake_preempts: self.nr_wake_preempts - rhs.nr_wake_preempts,
             nr_land: self.nr_land.sub(&rhs.nr_land),
             nr_wake_land: self.nr_wake_land.sub(&rhs.nr_wake_land),
             nr_seat_self: self.nr_seat_self.saturating_sub(rhs.nr_seat_self),

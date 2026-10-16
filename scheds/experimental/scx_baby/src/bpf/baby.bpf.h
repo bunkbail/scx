@@ -166,6 +166,14 @@ extern volatile u64 nr_tick_preempts, nr_tick_preempts_warm;
 extern volatile u64 nr_depth1_pulls, nr_depth1_pulls_seat;
 
 /*
+ * Depth-0 wake-path preempts (the IPI-fast twin of the tick gate): the
+ * lat-cri wakees ops.select_cpu() handed a busy CPU to - preempting the
+ * running non-lat-cri victim at wake time instead of waiting for the
+ * tick gate's next cut window.
+ */
+extern volatile u64 nr_wake_preempts;
+
+/*
  * Where each arrival type landed: wake or rotation, warm seat or
  * shared queue. Indexed type * 2 + shared.
  */

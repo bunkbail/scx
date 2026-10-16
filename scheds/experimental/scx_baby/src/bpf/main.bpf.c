@@ -174,6 +174,79 @@ s32 BPF_STRUCT_OPS(baby_select_cpu, struct task_struct *p,
 		scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL,
 				   tctx ? task_slice(tctx) : deadline_ns, 0);
 		__sync_fetch_and_add(&nr_direct_dispatches, 1);
+	} else if (wake_flags & (SCX_WAKE_TTWU | SCX_WAKE_FORK)) {
+		/*
+		 * No idle CPU: the depth-0 wake-path preempt (the tick
+		 * gate's IPI-fast twin). The tick gate serves a lat-cri
+		 * SEAT head by cutting the victim at the first tick with
+		 * 200us residency - mean ~700us of quantization wait on
+		 * a 1000Hz kernel, which is the depth-0 lat wait the
+		 * wlcri instrument read at 2x. This path serves the same
+		 * pair the moment the wake happens: when the wakee is
+		 * latency-critical, the victim is not, the wakee can
+		 * only run here, both queues are empty and the victim
+		 * has held the CPU for the same 200us floor, hand it
+		 * the CPU now instead of waiting for a tick.
+		 *
+		 * The deadline-beat check of the enqueue-side gate is
+		 * deliberately absent: the running victim renews its
+		 * deadline forward while it runs (calc_deadline at the
+		 * renewal points), so the beat binds only for victims
+		 * deep into an un-renewed stretch - the A/B counters
+		 * showed the old gate already fires ~1200/5s at 2x and
+		 * the beat-drop recovers almost nothing. can_resched is
+		 * likewise dropped: the tick gate cuts the same victims
+		 * without it (its condition is !is_lat_cri + residency
+		 * + head), and the pair gate plus the 200us residency
+		 * floor bound the churn instead. What remains is the
+		 * class pair (lat-cri wakee, non-lat-cri victim), the
+		 * prio order and the residency floor.
+		 *
+		 * Kernel semantics (v6.12 ext.c, source-verified):
+		 * SCX_ENQ_PREEMPT lands the wakee at the HEAD of the
+		 * local DSQ, zeroes rq->curr's slice (the victim) and
+		 * rescheds; the victim with remaining slice is kept by
+		 * put_prev_task_scx at the local DSQ head via
+		 * SCX_ENQ_HEAD - ops.enqueue() is NOT called for it, so
+		 * the 4x deep-backlog rung (which ops.enqueue hands
+		 * out) is not in play and no tick_preempted-style mark
+		 * is needed. The victim resumes after the wakee's
+		 * slice with its remainder intact.
+		 */
+		struct task_ctx *tctx = try_lookup_task_ctx(p);
+		struct task_struct *curr;
+		struct task_ctx *cctx;
+		u64 ran_at;
+
+		if (!tctx || !is_lat_cri(tctx))
+			return cpu;
+		if (!bpf_cpumask_test_cpu((u32)prev_cpu & (BABY_MAX_CPUS - 1),
+					  p->cpus_ptr))
+			return cpu;
+		if (scx_bpf_dsq_nr_queued(cpu2dsq(prev_cpu)) ||
+		    scx_bpf_dsq_nr_queued(SCX_DSQ_LOCAL_ON | prev_cpu))
+			return cpu;
+
+		curr = __COMPAT_scx_bpf_cpu_curr(prev_cpu);
+		if (!curr || curr == p || (curr->flags & PF_IDLE))
+			return cpu;
+		cctx = try_lookup_task_ctx(curr);
+		if (!cctx || is_lat_cri(cctx) ||
+		    p->static_prio > curr->static_prio)
+			return cpu;
+
+		ran_at = cpu_running_at[(u32)prev_cpu & (BABY_MAX_CPUS - 1)];
+		if (!ran_at || bpf_ktime_get_ns() - ran_at <
+				       BABY_TICK_PREEMPT_PROTECT_NS)
+			return cpu;
+
+		scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL_ON | prev_cpu,
+				   task_slice(tctx), SCX_ENQ_PREEMPT);
+		__sync_fetch_and_add(&nr_wake_preempts, 1);
+		__sync_fetch_and_add(&nr_wake_land[cpu_dist(prev_cpu, prev_cpu)],
+				     1);
+
+		return prev_cpu;
 	}
 
 	return cpu;

@@ -350,6 +350,7 @@ impl<'a> Scheduler<'a> {
             nr_tick_preempts_warm: bss_data.nr_tick_preempts_warm,
             nr_depth1_pulls: bss_data.nr_depth1_pulls,
             nr_depth1_pulls_seat: bss_data.nr_depth1_pulls_seat,
+            nr_wake_preempts: bss_data.nr_wake_preempts,
             nr_land: Ranks::of(&bss_data.nr_land),
             nr_wake_land: Ranks::of(&bss_data.nr_wake_land),
             nr_seat_self: bss_data.nr_seat_self,

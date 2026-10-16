@@ -33,6 +33,12 @@ volatile u64 nr_tick_preempts, nr_tick_preempts_warm;
 volatile u64 nr_depth1_pulls, nr_depth1_pulls_seat;
 
 /*
+ * Depth-0 wake-path preempts: lat-cri wakees handed a busy CPU at
+ * ops.select_cpu() - the IPI-fast twin of the tick gate.
+ */
+volatile u64 nr_wake_preempts;
+
+/*
  * Where placements land, by distance rank. The counters tell the warm
  * paths apart: the run-start histogram covers every path's outcome at
  * the point of truth, the wake-pick one covers ops.select_cpu(), and
