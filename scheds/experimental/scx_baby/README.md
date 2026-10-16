@@ -15,18 +15,32 @@ it can reach:
 - All tasks wait in one deadline-ordered queue per NUMA node (a BPF DSQ
   priority queue keyed by the deadline), mirroring the original global run
   list. The queue order IS the placement: an idle CPU pulls the
-  earliest-deadline task from wherever it waits, and nothing is ever
-  stolen from a busy core or pushed onto one.
+  earliest-deadline task from wherever it waits. Each CPU also owns a
+  small warm queue for tasks continuing on it (below), bounded so a
+  deeper backlog overflows into the node queue.
 - Waking tasks are placed by the kernel's own idle-CPU selection
   (SMT-aware, previous-CPU biased, LLC-spread); a hit dispatches straight
   onto the CPU, skipping the queue. A task that stops on a fully loaded
   core scans again on its way back into the queue, which is how work
   spreads onto cores that went idle since.
-- A running task keeps its CPU across a slice boundary only while its
-  deadline still beats the head of the queue; ties go to the waiter.
-  Once every logical CPU is busy, wakeup preemption backs off - trading
-  places between rotation peers is a swap storm the queue order already
-  serves.
+- Once the machine is oversubscribed - the running lanes plus everything
+  queued, shared or warm, exceed the CPU count - an arrival parks in the
+  warm seat on the CPU it last ran on, right behind whatever runs there:
+  its cache and TLB are still warm, and the CPU serves it at its next
+  slice end. The seat balance seats the shallowest queue, with cache
+  distance breaking ties, and arrivals queued under the gate grant a
+  fourfold slice, since they will rotate anyway and every extra rotation
+  costs a full switch. Below the threshold the seat stays open and the
+  cold path runs, which is what keeps the wall's load distribution
+  flowing.
+- Dispatch serves the earliest deadline across the warm queue and the
+  node queue, the warm side winning ties: it continues work this CPU has
+  already paid the cache for. A running task keeps its CPU across a slice
+  boundary only while its deadline still beats both heads; ties go to the
+  waiter. Wakeup preemption fires only when the target CPU's warm queue
+  is empty, and only for interactive or foreground wakers with an earlier
+  deadline - trading places between rotation peers is a swap storm the
+  queue order already serves.
 - A task's deadline is `now + deadline_ns + prio_factor[nice]`, with
   `deadline_ns` at 1.18ms and `prio_factor[]` shifting the deadline between
   -1.08ms (nice -20) and +1.26ms (nice +19), exactly as in the original.
@@ -90,7 +104,20 @@ unthrottled). Tasks already moved to the leased CPU's local queue would
 wait out the lease where no other CPU can see them; `ops.cpu_release()`
 pushes them back through enqueue the moment the lease ends, so they land
 on an idle core or in the deadline order, where the machine can reach
-them.
+them. A warm queue that outlived its CPU - stranded behind the lease, or
+starved for over a second while affinity moved under it - is handed back
+to the shared queue by the rescue timer, well before the kernel's
+five-second watchdog could force-unload the scheduler.
+
+### Measurement instruments
+
+The `--stats` report decomposes the oversubscription wait: every arrival
+is stamped with the depth it waits at and charged when it runs, split by
+arrival type (wake handoff vs rotation requeue) and by class, plus a
+census of the seat depth and shared backlog each lane sees at dispatch.
+These counters are the readout the overcommit program reasons over; the
+decision records under `target/design/adr/` hold the verdicts they
+produced.
 
 ## Mapping to sched_ext
 
@@ -98,12 +125,13 @@ them.
 | --- | --- |
 | per-rq linked list, O(n) earliest-deadline scan (`pick_next_entity`) | one per-node DSQ priority queue ordered by deadline |
 | `update_curr()` burst accounting and deadline renewal | `ops.stopping()` / `ops.tick()` |
-| `hrtick_start_fair()` micro-preemption | slice-end comparison in `ops.dispatch()`: the running task continues only while its deadline beats the queue head |
-| `check_preempt_wakeup()` | deadline comparison against the previous CPU's current task while the machine has idle lanes; eligible wakers are placed ahead of the victim on its local queue |
+| `hrtick_start_fair()` micro-preemption | slice-end comparison in `ops.dispatch()`: the running task continues only while its deadline beats the heads of the warm and node queues |
+| `check_preempt_wakeup()` | deadline comparison against the previous CPU's current task, gated to an empty warm queue on that CPU; eligible wakers are placed ahead of the victim on its local queue |
 | `yield_task_fair()` YIELD_MARK | `ops.yield()`: task is pushed behind everything queued in the current round |
 | `select_task_rq_fair()` least-loaded CPU | `ops.select_cpu()`: the kernel's idle-CPU selection with direct dispatch |
 | `newidle_balance()` / `trigger_load_balance()` | idle CPUs pull the queue head; a task that stopped on a loaded core re-scans for a CPU that went idle |
-| RT/DL lease stranding | `ops.cpu_release()`: locals requeued through enqueue when the lease ends |
+| RT/DL lease stranding | `ops.cpu_release()`: locals requeued through enqueue when the lease ends; the rescue timer hands a starved warm queue back to the shared queue |
+| warm-seat oversubscription queueing (absent in the original) | per-CPU warm queues under the oversubscription sum gate, shallowest-first with cache-distance tie-break, fourfold arrival slice |
 | sleep-before-deadline `p->prio--` | per-task `boost` counter shifting the effective nice level, since sched_ext cannot change a task's static priority |
 | wake-frequency interactivity (absent in the original) | wake-frequency EWMA from `ops.runnable`, in the spirit of scx_flash's `wakeup_freq` |
 | 803 HZ / periodic tick / no dynticks kernel hacks | dropped: sched_ext does not need them |

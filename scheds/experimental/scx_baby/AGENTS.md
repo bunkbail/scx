@@ -8,7 +8,9 @@ to this crate.
 ## BPF module map
 
 The BPF program is split across modules linked into one object. Every
-module includes only "baby.bpf.h", the shared interface.
+module includes only "baby.bpf.h", the shared interface. Project
+language and decision records live in target/design/ (GLOSSARY.md,
+adr/); read an ADR when touching the module it is attached to below.
 
 - `baby.bpf.h`: the interface hub. task_ctx, the DSQ layout, constants,
   extern declarations of the shared tunables and counters (the topo
@@ -17,23 +19,27 @@ module includes only "baby.bpf.h", the shared interface.
   calc_avg) and the cross-module prototypes.
 - `main.bpf.c`: the ops callbacks, SCX_OPS_DEFINE, the license, DSQ
   creation, the starve-rescue timer, the big/little cpumasks and the
-  enable_core_class syscall.
+  enable_core_class syscall. Queue-topology or preemption work reads
+  adr/0001 (why homes died) and adr/0003 (the depth-0 gate) first.
 - `util.bpf.c`: task_ctx_stor and its lookups (try_lookup_task_ctx,
   init_task_ctx), the topo tables and cpu_dist(), UEI_DEFINE, nr_cpu_ids.
 - `stats.bpf.c`: every volatile counter, stamp_wait(), charge_wait() and
   census_sample(). The counters are read by userspace through the
   skeleton, so their names and shapes are part of the interface with
-  src/stats.rs.
+  src/stats.rs. adr/0006 defines the arrival-type instrument and the
+  census these counters serve.
 - `class.bpf.c`: bursts, the wake-frequency EWMA, the class predicates
   (is_interactive, is_heavy_proven, is_foreground), task_slice(), the
   deadline math (prio_factor, task_nice, calc_deadline) and the
-  boost-on-sleep award.
+  boost-on-sleep award. adr/0004 and adr/0005 are the measured dead
+  ends here - slice length and wake-rate ordering; do not re-try them.
 - `idle.bpf.c`: pick_idle_cpu() and try_direct_dispatch().
 - `power.bpf.c`: CPU performance scaling. cpu_ctx, its map and
   cpuperf_lvl are private to this module; the ops callbacks only report
   lifecycle points (cpuperf_on_tick/running/stopping/idle/init).
 - `balance.bpf.c`: balance_try_warm_seat(), the warm-seat balance under
-  oversubscription, including the sum gate and the seat scan.
+  oversubscription, including the sum gate and the seat scan. adr/0002
+  binds the scan: depth dominates, distance only breaks ties.
 
 ## BPF module conventions
 
@@ -79,3 +85,7 @@ Preserve them when editing nearby code.
   the verifier on its own.
 - scx_bpf_dsq_nr_queued() fails verification inside an RCU read-side
   section; probe it outside any (see node_backlog() in main.bpf.c).
+- ops.stopping() cannot insert into DSQs (EACCES), and SCX_DSQ_LOCAL is
+  not iterable.
+- SCX_ENQ_LAST is delivered to ops.enqueue on these kernels; an early
+  note claimed the opposite and was wrong.
