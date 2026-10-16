@@ -11,6 +11,12 @@ fn main() {
         .unwrap()
         .enable_intf("src/bpf/intf.h", "bpf_intf.rs")
         .enable_skel("src/bpf/main.bpf.c", "bpf")
-        .build()
+        .add_source("src/bpf/util.bpf.c")
+        .add_source("src/bpf/stats.bpf.c")
+        .add_source("src/bpf/class.bpf.c")
+        .add_source("src/bpf/idle.bpf.c")
+        .add_source("src/bpf/power.bpf.c")
+        .add_source("src/bpf/balance.bpf.c")
+        .compile_link_gen()
         .unwrap();
 }
