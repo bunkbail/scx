@@ -145,6 +145,63 @@ static int init_cpumask(struct bpf_cpumask **cpumask)
 }
 
 /*
+ * The compaction pick (adr/0012): the lowest-numbered idle CPU of the
+ * given tier, so wakeups stack onto the same few cores and the rest
+ * of the tier idles at its boost floor. Claims bits atomically; a
+ * lost race retries the next idle bit of the tier rather than
+ * spilling out of it - two messengers waking simultaneously would
+ * otherwise race the same first bit and one of them would fall
+ * through to the spread-first kernel path.
+ */
+static __always_inline s32 pick_idle_pref(struct task_struct *p,
+					  struct bpf_cpumask *pref)
+{
+	const struct cpumask *idle;
+	s32 cpu = -1;
+	s32 i;
+
+	bpf_rcu_read_lock();
+	idle = scx_bpf_get_idle_cpumask();
+	if (pref && idle) {
+		bpf_for(i, 0, nr_cpu_ids) {
+			if (!bpf_cpumask_test_cpu(i, cast_mask(pref)) ||
+			    !bpf_cpumask_test_cpu(i, idle) ||
+			    !bpf_cpumask_test_cpu(i, p->cpus_ptr))
+				continue;
+			if (scx_bpf_test_and_clear_cpu_idle(i)) {
+				cpu = i;
+				break;
+			}
+		}
+	}
+	scx_bpf_put_cpumask(idle);
+	bpf_rcu_read_unlock();
+	return cpu;
+}
+
+/*
+ * Re-pick off a core outside both tiers - in practice an LP the
+ * kernel selector chose. The preferred tier goes first: a heavy
+ * non-foreground consumer wants a big core, everything else the
+ * little stack. A task pinned to LP cores by affinity finds nothing
+ * in either tier and keeps its pick.
+ */
+static __always_inline s32 pick_idle_tier(struct task_struct *p,
+					  bool big_first)
+{
+	s32 alt;
+
+	if (big_first)
+		alt = pick_idle_pref(p, big_cpumask);
+	else
+		alt = pick_idle_pref(p, little_cpumask);
+	if (alt >= 0)
+		return alt;
+	return big_first ? pick_idle_pref(p, little_cpumask)
+			 : pick_idle_pref(p, big_cpumask);
+}
+
+/*
  * Pick a target CPU for a task which is being woken up, and dispatch it
  * straight to the CPU when the pick found an idle one. Placement is
  * delegated to the kernel's idle-CPU selection: SMT-aware, biased to
@@ -177,7 +234,71 @@ s32 BPF_STRUCT_OPS(baby_select_cpu, struct task_struct *p,
 	 */
 	wake_flags &= ~SCX_WAKE_SYNC;
 
+	/*
+	 * Light-placement compaction (adr/0011; argon round 8). The
+	 * kernel selector below is prev-biased and spreads across LLCs
+	 * by design, so at light load it locks each task onto whatever
+	 * core it first touched - the counters read wake: self ~99% -
+	 * which on a hybrid box parks workers on P cores at half a
+	 * boosted E's clock and scatters the stack the per-CPU queues
+	 * used to keep. Below the saturation line the wake path packs
+	 * lowest-idle-first onto the little tier instead, the class
+	 * order the per-CPU queues used: foreground and interactive
+	 * tasks stack, a heavy consumer with no wake history pins a
+	 * big core, everything else stacks with a big as its fallback.
+	 * The gates are statically false on a single-tier machine (the
+	 * little set is empty there) and disengage well before
+	 * saturation, so neither the homogeneous box's suite nor the
+	 * heavy profiles see them.
+	 */
+	if (tctx && nr_little_cpus && nr_big_cpus &&
+	    nr_running <= nr_little_cpus + 2) {
+		bool big_pin = is_heavy_proven(tctx) && !is_foreground(tctx);
+
+		cpu = big_pin ? pick_idle_pref(p, big_cpumask)
+			      : pick_idle_pref(p, little_cpumask);
+		if (cpu < 0 && !big_pin && is_heavy_proven(tctx))
+			cpu = pick_idle_pref(p, big_cpumask);
+		if (cpu >= 0) {
+			__sync_fetch_and_add(&nr_wake_land[cpu_dist(prev_cpu, cpu)],
+					     1);
+			scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL,
+					   task_slice(tctx), 0);
+			__sync_fetch_and_add(&nr_direct_dispatches, 1);
+			return cpu;
+		}
+	}
+
 	cpu = pick_idle_cpu(p, prev_cpu, wake_flags, &is_idle);
+	if (is_idle && nr_little_cpus && nr_big_cpus) {
+		/*
+		 * LP guard: the kernel pick may return an LP core,
+		 * whose 0.7-1.4GHz no-L3 residency the prev-bias then
+		 * locks in for the task's lifetime. While the hybrid
+		 * gate can engage at all, re-pick inside the tiers -
+		 * the preferred one first - and keep the LP only when
+		 * both are full or affinity allows nothing else.
+		 */
+		struct bpf_cpumask *l, *b;
+		bool on_tier;
+
+		bpf_rcu_read_lock();
+		l = little_cpumask;
+		b = big_cpumask;
+		on_tier = l && b &&
+			  (bpf_cpumask_test_cpu(cpu, cast_mask(l)) ||
+			   bpf_cpumask_test_cpu(cpu, cast_mask(b)));
+		bpf_rcu_read_unlock();
+
+		if (!on_tier) {
+			bool big_first = tctx && is_heavy_proven(tctx) &&
+					 !is_foreground(tctx);
+			s32 alt = pick_idle_tier(p, big_first);
+
+			if (alt >= 0)
+				cpu = alt;
+		}
+	}
 	if (is_idle) {
 		__sync_fetch_and_add(&nr_wake_land[cpu_dist(prev_cpu, cpu)], 1);
 		scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL,
@@ -1008,6 +1129,11 @@ int enable_core_class(struct core_arg *input)
 {
 	struct bpf_cpumask *mask;
 	int err;
+
+	if (input->big)
+		__sync_fetch_and_add(&nr_big_cpus, 1);
+	else
+		__sync_fetch_and_add(&nr_little_cpus, 1);
 
 	err = init_cpumask(&big_cpumask);
 	if (err)

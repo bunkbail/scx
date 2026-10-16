@@ -11,6 +11,14 @@
 u64 nr_cpu_ids;
 
 /*
+ * Tier sizes as published by userspace at init (enable_core_class),
+ * counted locklessly. On a platform without a capacity split the
+ * little set is empty and the hybrid gates below are statically
+ * false: the compaction never engages there.
+ */
+u64 nr_little_cpus, nr_big_cpus;
+
+/*
  * Cache-topology distance tables, as published by userspace from the
  * sysfs cache hierarchy: the physical core id groups SMT siblings, the
  * L2 and LLC ids group the shared-cache tiers, the node id the socket.

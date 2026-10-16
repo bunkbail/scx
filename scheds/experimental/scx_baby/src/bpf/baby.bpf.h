@@ -86,6 +86,7 @@ extern const volatile u32 topo_node[BABY_MAX_CPUS];
 extern const volatile u32 topo_llc[BABY_MAX_CPUS];
 extern const volatile u32 topo_l2[BABY_MAX_CPUS];
 extern const volatile u32 topo_core[BABY_MAX_CPUS];
+extern u64 nr_little_cpus, nr_big_cpus;
 
 /*
  * Scheduling statistics.
