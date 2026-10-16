@@ -41,6 +41,19 @@ it can reach:
   is empty, and only for interactive or foreground wakers with an earlier
   deadline - trading places between rotation peers is a swap storm the
   queue order already serves.
+- When the machine is saturated anyway - a waiter waits in a queue
+  because every lane is busy - the tick cuts the holding task's slice
+  short for a waiting latency-critical head. The victim requeues with
+  its deadline intact, behind the waiter, in the deadline order it
+  already prefers, and requeues on the base slice (it did not exhaust
+  its quantum, so the deep-backlog rung is not its due). Gates: the
+  victim is not itself latency-critical, so homogeneous batch workers
+  never preempt each other; it has held the CPU for at least 200us; and
+  one CPU at a time claims a shared-queue waiter, since the per-CPU
+  ticks would otherwise all preempt for the same single waiter. This is
+  what closed the 2x-overcommit gaming gap: without it, every frame of
+  a game thread at full saturation paid a full slice of wake-to-run
+  wait.
 - A task's deadline is `now + deadline_ns + prio_factor[nice]`, with
   `deadline_ns` at 1.18ms and `prio_factor[]` shifting the deadline between
   -1.08ms (nice -20) and +1.26ms (nice +19), exactly as in the original.
@@ -60,6 +73,15 @@ measured signals - the burst history and, inspired by scx_flash, a
 wake-frequency EWMA (wakes per 100ms, tracked in `ops.runnable`) - never
 by the boost counter, which on a desktop almost every task earns:
 
+- **Latency-critical**: wakes frequently enough to prove it (at least 10
+  wakes per 100ms across at least four samples), whatever its burst
+  size - game render threads, compositors, submission workers; under
+  CPU overcommit a game thread is heavy too, so no burst bound can gate
+  this, and a task that never left runnable state never re-runs the
+  EWMA, so a preempted batch task cannot pass as a waker. No placement
+  and no slice role: this class gates the saturation tick preemption,
+  on both sides - a latency-critical waiter triggers it, a
+  latency-critical victim is shielded from it.
 - **Interactive**: used less than a quarter of a CPU in its last window.
   UI blips and event loops. Eligible to preempt on wakeup.
 - **Foreground**: wakes frequently and does real work. A browser renderer
@@ -114,7 +136,9 @@ five-second watchdog could force-unload the scheduler.
 The `--stats` report decomposes the oversubscription wait: every arrival
 is stamped with the depth it waits at and charged when it runs, split by
 arrival type (wake handoff vs rotation requeue) and by class, plus a
-census of the seat depth and shared backlog each lane sees at dispatch.
+census of the seat depth and shared backlog each lane sees at dispatch,
+and the saturation-preemption counters (victims cut short at the tick,
+split by where the waiter sat).
 These counters are the readout the overcommit program reasons over; the
 decision records under `target/design/adr/` hold the verdicts they
 produced.
@@ -129,9 +153,10 @@ produced.
 | `check_preempt_wakeup()` | deadline comparison against the previous CPU's current task, gated to an empty warm queue on that CPU; eligible wakers are placed ahead of the victim on its local queue |
 | `yield_task_fair()` YIELD_MARK | `ops.yield()`: task is pushed behind everything queued in the current round |
 | `select_task_rq_fair()` least-loaded CPU | `ops.select_cpu()`: the kernel's idle-CPU selection with direct dispatch |
-| `newidle_balance()` / `trigger_load_balance()` | idle CPUs pull the queue head; a task that stopped on a loaded core re-scans for a CPU that went idle |
+| `newidle_balance()` / `trigger_load_balance()` (CPU0 scans all CPUs every tick and migrates one task, by count only) | deleted: idle CPUs pull the queue head; a task that stopped on a loaded core re-scans for a CPU that went idle; the warm-seat scan evens seat depth under the oversubscription gate, depth first with cache distance breaking ties |
 | RT/DL lease stranding | `ops.cpu_release()`: locals requeued through enqueue when the lease ends; the rescue timer hands a starved warm queue back to the shared queue |
 | warm-seat oversubscription queueing (absent in the original) | per-CPU warm queues under the oversubscription sum gate, shallowest-first with cache-distance tie-break, fourfold arrival slice |
+| saturation service for latency-critical wakes (absent in the original) | `ops.tick()` cuts a batch victim's slice short when a wake-rate-classified latency-critical task waits at a queue head this CPU serves; the victim requeues on the base slice, behind the waiter |
 | sleep-before-deadline `p->prio--` | per-task `boost` counter shifting the effective nice level, since sched_ext cannot change a task's static priority |
 | wake-frequency interactivity (absent in the original) | wake-frequency EWMA from `ops.runnable`, in the spirit of scx_flash's `wakeup_freq` |
 | 803 HZ / periodic tick / no dynticks kernel hacks | dropped: sched_ext does not need them |

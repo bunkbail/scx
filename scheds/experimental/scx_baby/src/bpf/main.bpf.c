@@ -76,7 +76,18 @@ private(BABY) struct bpf_cpumask __kptr *little_cpumask;
  * jump-complexity ceiling (adr/0003), and the peek -> lookup -> class
  * pattern is already verifier-proven in the starve-rescue timer.
  */
-#define BABY_TICK_PREEMPT_PROTECT_NS	(400ULL * NSEC_PER_USEC)
+#define BABY_TICK_PREEMPT_PROTECT_NS	(200ULL * NSEC_PER_USEC)
+
+/*
+ * Fallback quiet window for the shared-queue claim, covering only the
+ * tick -> resched -> dispatch flight of the preempting CPU - its
+ * dispatch may be diverted to a warm-seat arrival and never pull the
+ * waiter. The stamp is cleared the moment any CPU pulls the shared
+ * head, so under wake bursts (multiple waiters microseconds apart) the
+ * next staggered tick (>100us later) can serve the next waiter instead
+ * of waiting out a whole slice.
+ */
+#define BABY_TICK_PREEMPT_FALLBACK_NS	(100ULL * NSEC_PER_USEC)
 
 static u64 cpu_running_at[BABY_MAX_CPUS];
 static u64 node_preempt_at;
@@ -346,17 +357,30 @@ void BPF_STRUCT_OPS(baby_dispatch, s32 cpu, struct task_struct *prev)
 			s32 from = q ? scx_bpf_task_cpu(q) : -1;
 			bool pulled = scx_bpf_dsq_move_to_local(node, 0);
 
-			if (pulled)
+			if (pulled) {
+				/*
+				 * The waiter this tick's claim was made for
+				 * is served (or another head took its place
+				 * - either way the next staggered tick may
+				 * claim again). Plain store: a racing tick
+				 * CAS against the cleared stamp just fails
+				 * and retries next tick.
+				 */
+				node_preempt_at = 0;
 				__sync_fetch_and_add(
 					&nr_pull_land[cpu_dist(cpu, from)],
 					1);
+			}
 			if (pulled ||
 			    scx_bpf_dsq_move_to_local(cpu2dsq(cpu), 0))
 				return;
 		} else {
-			if (scx_bpf_dsq_move_to_local(cpu2dsq(cpu), 0) ||
-			    scx_bpf_dsq_move_to_local(node, 0))
+			if (scx_bpf_dsq_move_to_local(cpu2dsq(cpu), 0))
 				return;
+			if (scx_bpf_dsq_move_to_local(node, 0)) {
+				node_preempt_at = 0;
+				return;
+			}
 		}
 	}
 
@@ -452,7 +476,8 @@ void BPF_STRUCT_OPS(baby_tick, struct task_struct *p)
 				if (hctx && is_lat_cri(hctx)) {
 					u64 last = node_preempt_at;
 
-					if (now - last >= deadline_ns &&
+					if (now - last >=
+					    BABY_TICK_PREEMPT_FALLBACK_NS &&
 					    __sync_bool_compare_and_swap(
 						    &node_preempt_at,
 						    last, now))
