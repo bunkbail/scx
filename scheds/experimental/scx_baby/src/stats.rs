@@ -480,6 +480,10 @@ pub struct Metrics {
     pub nr_warmseats: u64,
     #[stat(desc = "Number of enqueues the oversubscription gate sent to the shared queue")]
     pub nr_coldspreads: u64,
+    #[stat(desc = "Victims cut short at ops.tick for a shared-queue waiter")]
+    pub nr_tick_preempts: u64,
+    #[stat(desc = "Victims cut short at ops.tick for a warm-seat waiter")]
+    pub nr_tick_preempts_warm: u64,
     #[stat(desc = "Landings by distance at the point of truth (dispatch)")]
     pub nr_land: Ranks,
     #[stat(desc = "ops.select_cpu() idle picks by distance")]
@@ -522,12 +526,14 @@ impl Metrics {
     fn format<W: Write>(&self, w: &mut W) -> Result<()> {
         writeln!(
             w,
-            "[{}] tasks -> r: {:>2} | dispatch -> d: {:<5} s: {:<5} | preempt: {:<5} | boost: {:<5} | sticky: {:<5} | warm: {:<5} | cold: {:<5}",
+            "[{}] tasks -> r: {:>2} | dispatch -> d: {:<5} s: {:<5} | preempt: {:<5} tick: {:<4}+{:<4} | boost: {:<5} | sticky: {:<5} | warm: {:<5} | cold: {:<5}",
             crate::SCHEDULER_NAME,
             self.nr_running,
             self.nr_direct_dispatches,
             self.nr_shared_dispatches,
             self.nr_preemptions,
+            self.nr_tick_preempts,
+            self.nr_tick_preempts_warm,
             self.nr_boosts,
             self.nr_sticky,
             self.nr_warmseats,
@@ -681,6 +687,8 @@ impl Metrics {
             nr_sticky: self.nr_sticky - rhs.nr_sticky,
             nr_warmseats: self.nr_warmseats - rhs.nr_warmseats,
             nr_coldspreads: self.nr_coldspreads - rhs.nr_coldspreads,
+            nr_tick_preempts: self.nr_tick_preempts - rhs.nr_tick_preempts,
+            nr_tick_preempts_warm: self.nr_tick_preempts_warm - rhs.nr_tick_preempts_warm,
             nr_land: self.nr_land.sub(&rhs.nr_land),
             nr_wake_land: self.nr_wake_land.sub(&rhs.nr_wake_land),
             nr_seat_self: self.nr_seat_self.saturating_sub(rhs.nr_seat_self),

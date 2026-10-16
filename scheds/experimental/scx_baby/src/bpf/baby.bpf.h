@@ -138,6 +138,14 @@ extern volatile u64 nr_wait_type_max[BABY_WDEPTH_NR * BABY_WTYPE_NR];
 extern volatile u64 nr_wait_type_slow[BABY_WDEPTH_NR * BABY_WTYPE_NR];
 
 /*
+ * Saturation deferred-preemption instrument: the victims ops.tick() cut
+ * short because a latency-critical task waited at a queue head, split
+ * by where the waiter sat - the shared deadline queue or the CPU's own
+ * warm seat.
+ */
+extern volatile u64 nr_tick_preempts, nr_tick_preempts_warm;
+
+/*
  * Where each arrival type landed: wake or rotation, warm seat or
  * shared queue. Indexed type * 2 + shared.
  */
@@ -242,6 +250,15 @@ struct task_ctx {
 	 * the wake-type arrays, a requeue the rotation side.
 	 */
 	u8 arrival_is_wake;
+
+	/*
+	 * Set by ops.tick() when it cuts the task's slice short to serve
+	 * a waiting latency-critical task. ops.stopping() leaves it set
+	 * so ops.enqueue() requeues the victim with the base slice (it
+	 * did not exhaust its quantum, so the deep-backlog rung is not
+	 * its due), and ops.running() clears it when the task next runs.
+	 */
+	bool tick_preempted;
 };
 
 /*
@@ -311,6 +328,7 @@ __hidden bool can_resched(const struct task_ctx *tctx);
 __hidden bool is_interactive(const struct task_ctx *tctx);
 __hidden bool is_heavy_proven(const struct task_ctx *tctx);
 __hidden bool is_foreground(const struct task_ctx *tctx);
+__hidden bool is_lat_cri(const struct task_ctx *tctx);
 __hidden u64 task_slice(const struct task_ctx *tctx);
 __hidden s64 task_prio_factor(const struct task_struct *p,
 		     const struct task_ctx *tctx);

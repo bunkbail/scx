@@ -40,6 +40,48 @@ private(BABY) struct bpf_cpumask __kptr *big_cpumask;
 private(BABY) struct bpf_cpumask __kptr *little_cpumask;
 
 /*
+ * Saturation deferred preemption (the game2 oc2 verdict): at full CPU
+ * saturation a latency-critical task that parks in a queue waits a
+ * full slice behind the batch task running here, and at 2x
+ * overcommit that wait is paid by every frame - the game's whole
+ * frame-time distribution shifts right by one slice quantum. The tick
+ * cuts the victim short instead, under these gates:
+ *
+ * - the victim is not itself latency-critical (classified by the
+ *   wake-rate EWMA; homogeneous batch workers never preempt each
+ *   other);
+ * - a latency-critical task waits at a head this CPU serves - its own
+ *   warm seat or the shared deadline queue. With an idle CPU anywhere
+ *   the waiter would have been pulled already, so a waiting head
+ *   encodes saturation on its own;
+ * - the victim has held the CPU longer than the protect window, so a
+ *   task that just got the CPU keeps it;
+ * - for the shared-queue head, one CPU at a time: the synchronized
+ *   per-CPU ticks would otherwise all preempt for the same single
+ *   waiter, and only the first pull serves it. A global stamp with a
+ *   deadline-length quiet window bounds the herd. Warm-seat waiters
+ *   are per-CPU precise and need no stamp: the preempted victim's
+ *   rotation pulls the waiter in the same scheduling cycle, which
+ *   empties the queue head and disarms the gate.
+ *
+ * The kernel reschedules when ops.tick() leaves the slice at zero, and
+ * the preempted victim re-enters through ops.enqueue() with its
+ * deadline intact - behind the waiter that displaced it, which the
+ * deadline order already prefers. The victim carries tick_preempted
+ * so its requeue takes the base slice, not the deep-backlog rung it
+ * did not earn.
+ *
+ * The waiting head is observed by peeking, not by a latch signaled
+ * from ops.enqueue(): the enqueue sits at the verifier's
+ * jump-complexity ceiling (adr/0003), and the peek -> lookup -> class
+ * pattern is already verifier-proven in the starve-rescue timer.
+ */
+#define BABY_TICK_PREEMPT_PROTECT_NS	(400ULL * NSEC_PER_USEC)
+
+static u64 cpu_running_at[BABY_MAX_CPUS];
+static u64 node_preempt_at;
+
+/*
  * Allocate/re-allocate a new cpumask.
  */
 static int calloc_cpumask(struct bpf_cpumask **p_cpumask)
@@ -223,7 +265,8 @@ void BPF_STRUCT_OPS(baby_enqueue, struct task_struct *p, u64 enq_flags)
 	 * the task will rotate anyway and every extra rotation costs a
 	 * full switch.
 	 */
-	slice = backlog_deep(backlog) ? 4 * deadline_ns : task_slice(tctx);
+	slice = backlog_deep(backlog) && !tctx->tick_preempted
+		? 4 * deadline_ns : task_slice(tctx);
 
 	scx_bpf_dsq_insert_vtime(p, __COMPAT_scx_bpf_cpu_node(prev_cpu),
 				 slice, tctx->deadline, enq_flags);
@@ -378,6 +421,57 @@ void BPF_STRUCT_OPS(baby_tick, struct task_struct *p)
 
 	if (reached_deadline(tctx, now))
 		tctx->deadline = calc_deadline(p, tctx, now);
+
+	/*
+	 * The saturation deferred-preemption gate (comment at the top of
+	 * the file). The victim's residency is measured from its
+	 * ops.running() stamp; the waiter is recognized at the head of
+	 * whichever queue this CPU would pull from next.
+	 */
+	if (!is_lat_cri(tctx)) {
+		s32 cpu = scx_bpf_task_cpu(p);
+		u64 ran_at = cpu_running_at[(u32)cpu & (BABY_MAX_CPUS - 1)];
+
+		if (now - ran_at >= BABY_TICK_PREEMPT_PROTECT_NS) {
+			struct task_struct *head;
+			struct task_ctx *hctx;
+			bool cri = false;
+			bool warm = false;
+
+			head = __COMPAT_scx_bpf_dsq_peek(cpu2dsq(cpu));
+			hctx = head ? try_lookup_task_ctx(head) : NULL;
+			if (hctx && is_lat_cri(hctx)) {
+				cri = true;
+				warm = true;
+			}
+
+			if (!cri) {
+				head = __COMPAT_scx_bpf_dsq_peek(
+					__COMPAT_scx_bpf_cpu_node(cpu));
+				hctx = head ? try_lookup_task_ctx(head) : NULL;
+				if (hctx && is_lat_cri(hctx)) {
+					u64 last = node_preempt_at;
+
+					if (now - last >= deadline_ns &&
+					    __sync_bool_compare_and_swap(
+						    &node_preempt_at,
+						    last, now))
+						cri = true;
+				}
+			}
+
+			if (cri) {
+				p->scx.slice = 0;
+				tctx->tick_preempted = true;
+				if (warm)
+					__sync_fetch_and_add(
+						&nr_tick_preempts_warm, 1);
+				else
+					__sync_fetch_and_add(&nr_tick_preempts,
+							     1);
+			}
+		}
+	}
 }
 
 /*
@@ -447,9 +541,17 @@ void BPF_STRUCT_OPS(baby_running, struct task_struct *p)
 
 	__sync_fetch_and_add(&nr_running, 1);
 
+	/*
+	 * The victim-residency stamp for the tick preemption gate, and
+	 * the point where a task that was cut short stops carrying the
+	 * preempted mark: the requeue has happened by now.
+	 */
+	cpu_running_at[scx_bpf_task_cpu(p) & (BABY_MAX_CPUS - 1)] = now;
+
 	if (!tctx)
 		return;
 
+	tctx->tick_preempted = false;
 	tctx->last_acc_at = now;
 
 	charge_wait(tctx, now);

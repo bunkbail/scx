@@ -190,6 +190,25 @@ __hidden u64 task_slice(const struct task_ctx *tctx)
 }
 
 /*
+ * A task is latency-critical when it wakes frequently enough to prove
+ * it, whatever its burst size: game render threads, compositors and
+ * submission workers wake per frame or per request, and under CPU
+ * overcommit a game thread is heavy_proven too, so no burst bound can
+ * gate this. Unlike is_foreground() there is no runtime floor either:
+ * a task that wakes often but consumes almost nothing still has
+ * latency to protect. Wake-rate only, per the wait-class verdict - the
+ * foreground bit owns too small a share of the overcommit wait to gate
+ * anything on, and a task that never leaves runnable state (preempted,
+ * slice-expired) never re-runs this EWMA, so a preempted batch victim
+ * cannot pass as a waker here.
+ */
+__hidden bool is_lat_cri(const struct task_ctx *tctx)
+{
+	return tctx->wake_samples >= 4 &&
+	       tctx->peak_freq >= FOREGROUND_WAKE_FREQ;
+}
+
+/*
  * The task has become runnable: stamp the class bits and the
  * arrival-type bit the wait instrument files waits under, then track
  * how often the task wakes. Frequent wakers with real work to do are

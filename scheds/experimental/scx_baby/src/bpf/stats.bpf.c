@@ -17,6 +17,14 @@ volatile u64 nr_preemptions, nr_boosts, nr_sticky, nr_warmseats;
 volatile u64 nr_coldspreads;
 
 /*
+ * Saturation deferred-preemption instrument: the victims ops.tick() cut
+ * short because a latency-critical task waited at a queue head, split
+ * by where the waiter sat - the shared deadline queue or the CPU's own
+ * warm seat.
+ */
+volatile u64 nr_tick_preempts, nr_tick_preempts_warm;
+
+/*
  * Where placements land, by distance rank. The counters tell the warm
  * paths apart: the run-start histogram covers every path's outcome at
  * the point of truth, the wake-pick one covers ops.select_cpu(), and
