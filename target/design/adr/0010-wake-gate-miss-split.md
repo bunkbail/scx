@@ -104,7 +104,16 @@ is outside the gate's scope (slice-side levers are falsified, E11).
    worker-side leg measured directly for the first time; it matches
    the calibration model's ~11 rps remainder. Its levers are
    falsified territory (E11 ladder, E12 ordering).
-4. The morning game2 oc2 re-verify (both round-5 and this round's
-   gates read the evening band) runs tomorrow on oc2p6 and oc2p7 with
-   stock and lavd anchors under oc2audit.sh; after it, the session
-   frontier moves to the laptop/battery port.
+4. The game2 oc2 re-verify ran the same night (the user released the
+   time gate), and the cell claim is VERIFIED: the full matrix on
+   oc2p7 reads oc2 547.8/549.3 fps vs stock 489.6/458.3 and lavd
+   530.0/527.7 - baby wins the oc2 cell by +3.4-4.1 percent over
+   lavd. The evening band did not reproduce; stock's r2 fell into it
+   instead (458.3), so the band is bistable box state, not clock
+   time - the same two-state cycling the schbench logs show. bg50 and
+   mem hold (baby best both rounds), clean stays in its tie band.
+   The instrumented oc2audit arms read 554.0 (oc2p7) and 554.1
+   (oc2p6) fps - the fast-state msr//proc/counters reference for any
+   future band episode. The ab5600 trio ties oc2p7 vs oc2p6 (light
+   -0.3, med -0.2, sat +0.4 percent), completing the gate suite: the
+   oc2p7 baseline is verified on every rig.
