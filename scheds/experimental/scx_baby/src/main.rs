@@ -16,6 +16,7 @@ use stats::Census;
 use stats::Ranks;
 use stats::WaitB;
 use stats::WaitCls;
+use stats::WaitGateMiss;
 use stats::{WaitLCRI, WaitType};
 use std::mem::MaybeUninit;
 use std::sync::Arc;
@@ -379,6 +380,12 @@ impl<'a> Scheduler<'a> {
                 &bss_data.nr_wait_lcri_ns,
                 &bss_data.nr_wait_lcri_max,
                 &bss_data.nr_wait_lcri_slow,
+            ),
+            wait_wg: WaitGateMiss::of(
+                &bss_data.nr_wait_wg_n,
+                &bss_data.nr_wait_wg_ns,
+                &bss_data.nr_wait_wg_max,
+                &bss_data.nr_wait_wg_slow,
             ),
             nr_arr_wake_seat: bss_data.nr_arr_type[2],
             nr_arr_wake_shared: bss_data.nr_arr_type[3],

@@ -466,8 +466,73 @@ impl WaitLCRI {
     }
 }
 
+/// The latency-critical wait split by the wake-gate miss reason: the
+/// condition in ops.select_cpu() that gated the depth-0 wake preempt
+/// for the task's most recent wake. Depth-major rows of 10 reasons
+/// each (depth * 10 + reason in the BPF array); a rotation requeue
+/// files reason 0. The per-depth reason sums equal the wlcri lat
+/// counts and ns. Reasons: 0 non-wake, 1 no gate contact, 2 wakee not
+/// lat-cri, 3 affinity, 4 seat busy, 5 local busy, 6 victim degenerate,
+/// 7 victim lat-cri, 8 prio loss, 9 under the 200us residency floor.
+#[stat_doc]
+#[derive(Clone, Debug, Default, Serialize, Deserialize, Stats)]
+#[stat(top)]
+pub struct WaitGateMiss {
+    #[stat(desc = "Lat waits by depth x wake-gate miss reason (depth-major 4x10)")]
+    pub n: Vec<u64>,
+    #[stat(desc = "Lat wait totals (ns) by depth x wake-gate miss reason")]
+    pub ns: Vec<u64>,
+    #[stat(desc = "Lat wait maxima (ns) by depth x wake-gate miss reason")]
+    pub max: Vec<u64>,
+    #[stat(desc = "Lat waits over 5ms by depth x wake-gate miss reason")]
+    pub slow: Vec<u64>,
+}
+
+impl WaitGateMiss {
+    pub fn of(a_n: &[u64; 40], a_ns: &[u64; 40], a_max: &[u64; 40], a_slow: &[u64; 40]) -> Self {
+        WaitGateMiss {
+            n: a_n.to_vec(),
+            ns: a_ns.to_vec(),
+            max: a_max.to_vec(),
+            slow: a_slow.to_vec(),
+        }
+    }
+
+    fn sub(&self, rhs: &Self) -> Self {
+        let vsub = |a: &Vec<u64>, b: &Vec<u64>| -> Vec<u64> {
+            a.iter()
+                .zip(b.iter())
+                .map(|(x, y)| x.saturating_sub(*y))
+                .collect()
+        };
+        let vmax = |a: &Vec<u64>, b: &Vec<u64>| -> Vec<u64> {
+            a.iter().zip(b.iter()).map(|(x, y)| (*x).max(*y)).collect()
+        };
+        WaitGateMiss {
+            n: vsub(&self.n, &rhs.n),
+            ns: vsub(&self.ns, &rhs.ns),
+            max: vmax(&self.max, &rhs.max),
+            slow: vsub(&self.slow, &rhs.slow),
+        }
+    }
+
+    /// Per-depth row views into the flat depth-major arrays.
+    fn row(&self, depth: usize) -> (&[u64], &[u64], &[u64], &[u64]) {
+        let lo = depth * 10;
+        let hi = lo + 10;
+        (
+            &self.n[lo..hi],
+            &self.ns[lo..hi],
+            &self.max[lo..hi],
+            &self.slow[lo..hi],
+        )
+    }
+}
+
 /// Where the queues stood when a lane came to pick work, sampled in
 /// ops.dispatch(): the seat depth is what its warm queue holds at the
+/// pick, the shared backlog the rotation it turns against. Eight
+/// buckets, the last one 7 or deeper.
 /// pick, the shared backlog the rotation it turns against. Eight
 /// buckets, the last one 7 or deeper.
 #[stat_doc]
@@ -587,6 +652,8 @@ pub struct Metrics {
     pub wait_type: WaitType,
     #[stat(desc = "The same waits split by wake-rate latency-criticality")]
     pub wait_lcri: WaitLCRI,
+    #[stat(desc = "Lat waits split by wake-gate miss reason (depth-major 4x10)")]
+    pub wait_wg: WaitGateMiss,
     #[stat(desc = "Wake arrivals parked in a warm seat")]
     pub nr_arr_wake_seat: u64,
     #[stat(desc = "Wake arrivals parked in the shared queue")]
@@ -781,6 +848,19 @@ impl Metrics {
             wl.other_max,
             wl.other_slow,
         )?;
+        let wg = &self.wait_wg;
+        for (depth, tag) in [(0usize, "d0"), (1usize, "d1")] {
+            let (n, ns, max, slow) = wg.row(depth);
+            writeln!(
+                w,
+                "  wg {} n[{:?}] mean[{:?}] max[{:?}] slow5ms[{:?}]",
+                tag,
+                n,
+                vmean(ns, n),
+                max,
+                slow,
+            )?;
+        }
         write!(w, "  census: ")?;
         self.census.format(w)?;
         Ok(())
@@ -820,6 +900,7 @@ impl Metrics {
             wait_cls: self.wait_cls.sub(&rhs.wait_cls),
             wait_type: self.wait_type.sub(&rhs.wait_type),
             wait_lcri: self.wait_lcri.sub(&rhs.wait_lcri),
+            wait_wg: self.wait_wg.sub(&rhs.wait_wg),
             nr_arr_wake_seat: self.nr_arr_wake_seat.saturating_sub(rhs.nr_arr_wake_seat),
             nr_arr_wake_shared: self
                 .nr_arr_wake_shared

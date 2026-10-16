@@ -155,8 +155,19 @@ static int init_cpumask(struct bpf_cpumask **cpumask)
 s32 BPF_STRUCT_OPS(baby_select_cpu, struct task_struct *p,
 		   s32 prev_cpu, u64 wake_flags)
 {
+	struct task_ctx *tctx = try_lookup_task_ctx(p);
 	bool is_idle = false;
 	s32 cpu;
+
+	/*
+	 * The wake-gate miss reason always describes the most recent
+	 * wake that reached this function: reset it at entry, before
+	 * anything can return early. charge_wait() files it for the
+	 * wake that actually waits; a wake the old enqueue-side gate
+	 * serves never charges a wait, so no other clear point exists.
+	 */
+	if (tctx)
+		tctx->wake_gate_miss = BABY_WG_NO_GATE;
 
 	/*
 	 * Don't trust userspace about the waker releasing the CPU: a
@@ -168,8 +179,6 @@ s32 BPF_STRUCT_OPS(baby_select_cpu, struct task_struct *p,
 
 	cpu = pick_idle_cpu(p, prev_cpu, wake_flags, &is_idle);
 	if (is_idle) {
-		struct task_ctx *tctx = try_lookup_task_ctx(p);
-
 		__sync_fetch_and_add(&nr_wake_land[cpu_dist(prev_cpu, cpu)], 1);
 		scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL,
 				   tctx ? task_slice(tctx) : deadline_ns, 0);
@@ -213,32 +222,55 @@ s32 BPF_STRUCT_OPS(baby_select_cpu, struct task_struct *p,
 		 * is needed. The victim resumes after the wakee's
 		 * slice with its remainder intact.
 		 */
-		struct task_ctx *tctx = try_lookup_task_ctx(p);
 		struct task_struct *curr;
 		struct task_ctx *cctx;
 		u64 ran_at;
 
-		if (!tctx || !is_lat_cri(tctx))
+		if (!tctx)
 			return cpu;
+		if (!is_lat_cri(tctx)) {
+			tctx->wake_gate_miss = BABY_WG_M1_NOT_LAT;
+			return cpu;
+		}
 		if (!bpf_cpumask_test_cpu((u32)prev_cpu & (BABY_MAX_CPUS - 1),
-					  p->cpus_ptr))
+					  p->cpus_ptr)) {
+			tctx->wake_gate_miss = BABY_WG_M2_AFFINITY;
 			return cpu;
-		if (scx_bpf_dsq_nr_queued(cpu2dsq(prev_cpu)) ||
-		    scx_bpf_dsq_nr_queued(SCX_DSQ_LOCAL_ON | prev_cpu))
+		}
+		if (scx_bpf_dsq_nr_queued(cpu2dsq(prev_cpu))) {
+			tctx->wake_gate_miss = BABY_WG_M3_SEAT_BUSY;
 			return cpu;
+		}
+		if (scx_bpf_dsq_nr_queued(SCX_DSQ_LOCAL_ON | prev_cpu)) {
+			tctx->wake_gate_miss = BABY_WG_M3_LOCAL_BUSY;
+			return cpu;
+		}
 
 		curr = __COMPAT_scx_bpf_cpu_curr(prev_cpu);
-		if (!curr || curr == p || (curr->flags & PF_IDLE))
+		if (!curr || curr == p || (curr->flags & PF_IDLE)) {
+			tctx->wake_gate_miss = BABY_WG_M4_DEGEN;
 			return cpu;
+		}
 		cctx = try_lookup_task_ctx(curr);
-		if (!cctx || is_lat_cri(cctx) ||
-		    p->static_prio > curr->static_prio)
+		if (!cctx) {
+			tctx->wake_gate_miss = BABY_WG_M4_DEGEN;
 			return cpu;
+		}
+		if (is_lat_cri(cctx)) {
+			tctx->wake_gate_miss = BABY_WG_M4_VICTIM_LAT;
+			return cpu;
+		}
+		if (p->static_prio > curr->static_prio) {
+			tctx->wake_gate_miss = BABY_WG_M4_PRIO;
+			return cpu;
+		}
 
 		ran_at = cpu_running_at[(u32)prev_cpu & (BABY_MAX_CPUS - 1)];
 		if (!ran_at || bpf_ktime_get_ns() - ran_at <
-				       BABY_TICK_PREEMPT_PROTECT_NS)
+				       BABY_TICK_PREEMPT_PROTECT_NS) {
+			tctx->wake_gate_miss = BABY_WG_M5_RESIDENCY;
 			return cpu;
+		}
 
 		scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL_ON | prev_cpu,
 				   task_slice(tctx), SCX_ENQ_PREEMPT);

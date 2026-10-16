@@ -150,6 +150,32 @@ extern volatile u64 nr_wait_lcri_max[BABY_WDEPTH_NR * 2];
 extern volatile u64 nr_wait_lcri_slow[BABY_WDEPTH_NR * 2];
 
 /*
+ * The latency-critical charge, split by the wake-gate miss reason: why
+ * the depth-0 wake preempt at ops.select_cpu() did not fire for the
+ * task's most recent wake. Depth-major within each reason row, entry
+ * depth * BABY_WG_NR + reason; a rotation requeue files reason 0. The
+ * classes partition the wlcri lat bucket: per depth, the reason sums
+ * equal the wlcri lat counts and ns.
+ */
+#define BABY_WG_NR	10
+
+#define BABY_WG_NON_WAKE	0	/* rotation requeue, not a wake */
+#define BABY_WG_NO_GATE		1	/* no wake-gate contact this cycle */
+#define BABY_WG_M1_NOT_LAT	2	/* wakee not lat-cri at gate time */
+#define BABY_WG_M2_AFFINITY	3	/* wakee cannot run on prev_cpu */
+#define BABY_WG_M3_SEAT_BUSY	4	/* the wakee's seat holds a head */
+#define BABY_WG_M3_LOCAL_BUSY	5	/* an in-flight wakee holds the local DSQ */
+#define BABY_WG_M4_DEGEN	6	/* victim unusable: null/self/idle/no ctx */
+#define BABY_WG_M4_VICTIM_LAT	7	/* the victim is lat-cri */
+#define BABY_WG_M4_PRIO		8	/* the wakee loses on static_prio */
+#define BABY_WG_M5_RESIDENCY	9	/* the victim is under the 200us floor */
+
+extern volatile u64 nr_wait_wg_n[BABY_WDEPTH_NR * BABY_WG_NR];
+extern volatile u64 nr_wait_wg_ns[BABY_WDEPTH_NR * BABY_WG_NR];
+extern volatile u64 nr_wait_wg_max[BABY_WDEPTH_NR * BABY_WG_NR];
+extern volatile u64 nr_wait_wg_slow[BABY_WDEPTH_NR * BABY_WG_NR];
+
+/*
  * Saturation deferred-preemption instrument: the victims ops.tick() cut
  * short because a latency-critical task waited at a queue head, split
  * by where the waiter sat - the shared deadline queue or the CPU's own
@@ -278,6 +304,14 @@ struct task_ctx {
 	 * the wake-type arrays, a requeue the rotation side.
 	 */
 	u8 arrival_is_wake;
+
+	/*
+	 * Why the depth-0 wake preempt did not fire for the most recent
+	 * wake: stamped at each ops.select_cpu() miss exit, reset at
+	 * select_cpu entry and consumed by charge_wait() in ops.running().
+	 * BABY_WG_* codes; a rotation files 0 (BABY_WG_NON_WAKE).
+	 */
+	u8 wake_gate_miss;
 
 	/*
 	 * Set by ops.tick() when it cuts the task's slice short to serve

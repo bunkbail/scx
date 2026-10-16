@@ -112,6 +112,18 @@ volatile u64 nr_wait_lcri_max[BABY_WDEPTH_NR * 2];
 volatile u64 nr_wait_lcri_slow[BABY_WDEPTH_NR * 2];
 
 /*
+ * The latency-critical charge, split by the wake-gate miss reason (see
+ * baby.bpf.h for the codes). A wake files the reason its most recent
+ * ops.select_cpu() pass recorded; a rotation files 0. The reason is
+ * consumed at charge, so a charge never describes an earlier wake, and
+ * the per-depth reason sums equal the wlcri lat counts and ns.
+ */
+volatile u64 nr_wait_wg_n[BABY_WDEPTH_NR * BABY_WG_NR];
+volatile u64 nr_wait_wg_ns[BABY_WDEPTH_NR * BABY_WG_NR];
+volatile u64 nr_wait_wg_max[BABY_WDEPTH_NR * BABY_WG_NR];
+volatile u64 nr_wait_wg_slow[BABY_WDEPTH_NR * BABY_WG_NR];
+
+/*
  * Consumption census: sampled in ops.dispatch(), the queue state a
  * lane sees when it comes to pick work - the depth left in its warm
  * seat and the shared backlog the rotation turns on. Eight buckets,
@@ -186,6 +198,25 @@ __hidden void charge_wait(struct task_ctx *tctx, u64 now)
 			nr_wait_lcri_max[li] = wait;
 		if (wait > BABY_WAIT_SLOW_NS)
 			__sync_fetch_and_add(&nr_wait_lcri_slow[li], 1);
+
+		if (l) {
+			u32 r = (tctx->arrival_is_wake & 1) ?
+				       (u32)tctx->wake_gate_miss :
+				       (u32)BABY_WG_NON_WAKE;
+
+			tctx->wake_gate_miss = BABY_WG_NO_GATE;
+			if (r >= BABY_WG_NR)
+				r = BABY_WG_NO_GATE;
+
+			u32 wi = b * BABY_WG_NR + r;
+
+			__sync_fetch_and_add(&nr_wait_wg_n[wi], 1);
+			__sync_fetch_and_add(&nr_wait_wg_ns[wi], wait);
+			if (wait > nr_wait_wg_max[wi])
+				nr_wait_wg_max[wi] = wait;
+			if (wait > BABY_WAIT_SLOW_NS)
+				__sync_fetch_and_add(&nr_wait_wg_slow[wi], 1);
+		}
 	}
 }
 
