@@ -82,14 +82,29 @@ is outside the gate's scope (slice-side levers are falsified, E11).
 
 ## Consequences
 
-1. The lever decision is argon round 7's: one bounded lever round
-   against the seat-relocation class (evaluate the wake gate against
-   the empty seat's victim at select_cpu), or the STOP condition
-   fires and the wake-gate frontier closes at 231 vs lavd 248-249.
-2. The rotation share (~515-593us of the depth-0 mean) is the
+1. Argon round 7 (same night) applied the dominance rule to the
+   measured split and the STOP condition FIRES: the schbench-2x
+   wake-gate frontier closes at ~231 rps vs lavd ~249. The rotation
+   class (57-66 percent) is the pre-registered STOP clause's shape -
+   outside the gate's scope, its slice-side levers falsified. The
+   seat class fails both gates: under the 35 percent threshold pooled
+   (~30 percent), and its full-elimination ceiling (+3-4 rps)
+   collapses to ~1-2 rps realistic capture, inside the box's variance
+   band (the paired medians differ by 1.3 rps with an inert
+   instrument). Splitting the seat class into its two sub-mechanisms
+   (relocation vs prev-seat drain) is rejected - neither sub-class
+   could reach the threshold or resolve in rps. The d0 wake-gate
+   frontier is exhausted; no lever round is opened.
+2. The oc2p7 instrument is retained as baseline (d1d0cfe31): neutral
+   throughput and tail, exact partition identity, zero enqueue
+   growth. The ~18 rps gap to lavd stands partitioned and documented:
+   worker slice-expiry rotation (the primary leg, ~515-593us of the
+   depth-0 mean) plus sub-threshold tick-quantized wake wait.
+3. The rotation share (~515-593us of the depth-0 mean) is the
    worker-side leg measured directly for the first time; it matches
    the calibration model's ~11 rps remainder. Its levers are
    falsified territory (E11 ladder, E12 ordering).
-3. The morning game2 oc2 re-verify (both round-5 and this round's
+4. The morning game2 oc2 re-verify (both round-5 and this round's
    gates read the evening band) runs tomorrow on oc2p6 and oc2p7 with
-   stock and lavd anchors under oc2audit.sh.
+   stock and lavd anchors under oc2audit.sh; after it, the session
+   frontier moves to the laptop/battery port.
