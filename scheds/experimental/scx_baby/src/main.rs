@@ -93,16 +93,30 @@ struct Opts {
 
     /// Deadline offset in microseconds: every task is assigned
     /// deadline = now + deadline offset (default 1180us, the original
-    /// DEADLINE_NS). This is also the time slice of each task.
-    #[clap(short = 'd', long, default_value = "1180")]
+    /// DEADLINE_NS). This is also the time slice of each task. The
+    /// scheduler is a deadline machine, so a value near zero collapses
+    /// every slice to nothing; accepted range is 100 to 100000.
+    #[clap(
+        short = 'd',
+        long,
+        default_value = "1180",
+        value_parser = clap::value_parser!(u64).range(100..=100_000)
+    )]
     deadline_us: u64,
 
-    /// CPU frequency performance level (0 = min, 1024 = max).
+    /// CPU frequency performance level (0 = min, 1024 = max). Accepted
+    /// range is -2 to 1024.
     ///
     /// By default (-1, auto) the scheduler scales the performance level
     /// of each CPU in function of its utilization. -2 leaves the
     /// platform's cpufreq setup entirely alone.
-    #[clap(short = 'p', long, allow_hyphen_values = true, default_value = "-1")]
+    #[clap(
+        short = 'p',
+        long,
+        allow_hyphen_values = true,
+        default_value = "-1",
+        value_parser = clap::value_parser!(i64).range(-2..=1024)
+    )]
     perf_lvl: i64,
 
     /// Enable stats monitoring with the specified interval.
@@ -499,6 +513,27 @@ fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn deadline_us_outside_the_range_is_rejected() {
+        assert!(Opts::try_parse_from(["scx_baby", "-d", "50"]).is_err());
+        assert!(Opts::try_parse_from(["scx_baby", "-d", "0"]).is_err());
+        assert!(Opts::try_parse_from(["scx_baby", "-d", "100001"]).is_err());
+
+        let ok = Opts::try_parse_from(["scx_baby", "-d", "500"]).unwrap();
+        assert_eq!(ok.deadline_us, 500);
+    }
+
+    #[test]
+    fn perf_lvl_outside_the_range_is_rejected() {
+        assert!(Opts::try_parse_from(["scx_baby", "-p", "-3"]).is_err());
+        assert!(Opts::try_parse_from(["scx_baby", "-p", "1025"]).is_err());
+
+        let ok = Opts::try_parse_from(["scx_baby", "-p", "-2"]).unwrap();
+        assert_eq!(ok.perf_lvl, -2);
+        let ok = Opts::try_parse_from(["scx_baby", "-p", "1024"]).unwrap();
+        assert_eq!(ok.perf_lvl, 1024);
+    }
 
     // Load only, never attach: the synthetic shapes drive no live
     // scheduler. The BPF loops stay bounded by the host's CPU count -
