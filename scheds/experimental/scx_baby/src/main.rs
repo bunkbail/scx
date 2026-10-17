@@ -12,6 +12,7 @@ pub mod bpf_intf;
 pub use bpf_intf::*;
 
 mod stats;
+mod tiers;
 use stats::Census;
 use stats::Ranks;
 use stats::WaitB;
@@ -35,6 +36,7 @@ use log::info;
 use log::warn;
 use scx_stats::prelude::*;
 use scx_utils::CoreType;
+use scx_utils::NR_CPU_IDS;
 use scx_utils::Topology;
 use scx_utils::UserExitInfo;
 use scx_utils::build_id;
@@ -170,15 +172,21 @@ impl<'a> Scheduler<'a> {
         // compares ids for equality, and 0 means "unfilled" there, so
         // every id is stored offset by one: an id of 0 becomes 1, and
         // an entry the userspace never filled can never compare equal
-        // to a filled one.
-        for (idx, cpu) in topo.all_cpus.values().enumerate() {
-            if idx >= rodata.topo_node.len() {
-                break;
-            }
-            rodata.topo_node[idx] = cpu.node_id as u32 + 1;
-            rodata.topo_llc[idx] = cpu.llc_id as u32 + 1;
-            rodata.topo_l2[idx] = cpu.l2_id as u32 + 1;
-            rodata.topo_core[idx] = cpu.core_id as u32 + 1;
+        // to a filled one. Entries are indexed by CPU id, so an
+        // offline CPU leaves its entry unfilled instead of shifting
+        // the table under the following CPUs.
+        if *NR_CPU_IDS > rodata.topo_node.len() {
+            anyhow::bail!(
+                "scx_baby supports at most {} CPUs, this host has {} CPU IDs",
+                rodata.topo_node.len(),
+                *NR_CPU_IDS
+            );
+        }
+        for cpu in topo.all_cpus.values() {
+            rodata.topo_node[cpu.id] = cpu.node_id as u32 + 1;
+            rodata.topo_llc[cpu.id] = cpu.llc_id as u32 + 1;
+            rodata.topo_l2[cpu.id] = cpu.l2_id as u32 + 1;
+            rodata.topo_core[cpu.id] = cpu.core_id as u32 + 1;
         }
         info!(
             "distance ladder: smt={} l2s={} llcs={} nodes={}",
@@ -240,70 +248,49 @@ impl<'a> Scheduler<'a> {
     }
 
     // Interactive tasks steer to the big cores, the rest to the little
-    // ones. On platforms without a core type split every CPU lands in
-    // the little set and the preference is a no-op.
+    // ones. The decision is pure (tiers.rs); this function gathers the
+    // sysfs inputs and applies the result. On a platform without a
+    // usable tier split every CPU lands in one tier and the hybrid
+    // gates are statically false.
     fn init_core_classes(skel: &mut BpfSkel<'_>, topo: &Topology) -> Result<()> {
-        // The big cores are the highest-capacity class, read from the
-        // kernel's capacity ranking when available and falling back to
-        // the topology core types otherwise. A machine without a
-        // capacity split has no big cores and the preference is a
-        // no-op.
+        // The kernel's own per-CPU capacity, exported by hybrid and
+        // ARM parts.
         let capacity = |id: usize| {
             std::fs::read_to_string(format!("/sys/devices/system/cpu/cpu{id}/cpu_capacity"))
                 .ok()
                 .and_then(|s| s.trim().parse::<u32>().ok())
         };
+        // The core types as scx_utils derived them from its capacity
+        // ladder; the input of the fallback branch.
+        let is_big_core_type = |id: usize| {
+            topo.all_cpus
+                .get(&id)
+                .map(|cpu| matches!(cpu.core_type, CoreType::Big { .. }))
+        };
+        // The hardware maximum frequency: the corroboration input that
+        // keeps a claimed core-type split from being a ranking
+        // artifact (see tiers::classify).
+        let max_freq = |id: usize| {
+            std::fs::read_to_string(format!(
+                "/sys/devices/system/cpu/cpu{id}/cpufreq/cpuinfo_max_freq"
+            ))
+            .ok()
+            .and_then(|s| s.trim().parse::<u32>().ok())
+            .filter(|freq| *freq > 0)
+        };
+
         let ids: Vec<usize> = topo.all_cpus.keys().copied().collect();
-        let capacities: Vec<Option<u32>> = ids.iter().map(|id| capacity(*id)).collect();
-        let caps: Vec<u32> = capacities.iter().flatten().copied().collect();
-        let max_cap = caps.iter().max().copied();
-        let min_cap = caps.iter().min().copied();
-        let capacity_split =
-            matches!((min_cap, max_cap), (Some(lo), Some(hi)) if lo * 100 < hi * 85);
-
-        let mut big: Vec<usize> = Vec::new();
-        if capacity_split {
-            for (idx, id) in ids.iter().enumerate() {
-                if capacities[idx] != max_cap {
-                    continue;
-                }
-                big.push(*id);
-            }
-        } else {
-            for cpu in topo.all_cpus.values() {
-                if matches!(cpu.core_type, CoreType::Big { .. }) {
-                    big.push(cpu.id);
-                }
-            }
-        }
-
-        let rest: Vec<usize> = ids.iter().copied().filter(|c| !big.contains(c)).collect();
-
-        // Cores far below the little tier - the L3-less low-power
-        // islands on hybrid laptop parts - stay out of the little set:
-        // that set is the tier the queue work waits in, and a worker
-        // pulled onto an LP core runs at a fraction of the little
-        // cores' speed with no last-level cache, which stretches every
-        // batch of a batch-parallel workload to its slowest worker.
-        // They are not lost to scheduling: the kernel's placement and
-        // the direct-dispatch scan still run work there when nothing
-        // else fits. Only the tier assignment skips them.
-        let little_cap = rest.iter().filter_map(|c| capacity(*c)).max();
-        let mut little = Vec::new();
-        let mut lp = Vec::new();
-        for c in rest {
-            match (capacity(c), little_cap) {
-                (Some(cap), Some(max)) if cap * 2 < max => lp.push(c),
-                _ => little.push(c),
-            }
-        }
-        info!("core classes: big={big:?} little={little:?} lp={lp:?}");
+        let (classes, source) = tiers::classify(&ids, &capacity, &is_big_core_type, &max_freq);
+        info!(
+            "core classes ({source:?}): big={:?} little={:?} lp={:?}",
+            classes.big, classes.little, classes.lp
+        );
 
         for id in &ids {
-            if !big.contains(id) && lp.contains(id) {
+            if !classes.big.contains(id) && classes.lp.contains(id) {
                 continue;
             }
-            Self::enable_core_class(skel, *id, big.contains(id))?;
+            Self::enable_core_class(skel, *id, classes.big.contains(id))?;
         }
 
         Ok(())
@@ -488,4 +475,49 @@ fn main() -> Result<()> {
     sched.run(shutdown.clone())?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Load only, never attach: the synthetic shapes drive no live
+    // scheduler. The BPF loops stay bounded by the host's CPU count -
+    // what varies here is the rodata the distance tables feed, so this
+    // pins the loader against tier-table and distance regressions
+    // across shapes, not against loop width; a 128-CPU runner is
+    // needed for the latter. The hybrid-gate arms need no synthetic
+    // tier counts to verify: the BSS counters are unknown scalars to
+    // the verifier, so every load proves both sides of every gate.
+    #[test]
+    #[ignore = "requires BPF load capabilities and a sched_ext kernel"]
+    fn verifier_load_synthetic_topologies() -> anyhow::Result<()> {
+        libbpf_rs::set_print(Some((libbpf_rs::PrintLevel::Warn, |_, message| {
+            eprint!("{message}");
+        })));
+
+        let mut failures = Vec::new();
+        for nr_cpus in [1usize, 14, 128] {
+            let mut object = MaybeUninit::uninit();
+            let builder = BpfSkelBuilder::default();
+            let mut skel = scx_ops_open!(builder, &mut object, baby_ops, None)?;
+            let ro = skel.maps.rodata_data.as_mut().unwrap();
+            ro.deadline_ns = 1180 * 1000;
+            for cpu in 0..nr_cpus.min(ro.topo_node.len()) {
+                // Two node-ish halves, eight LLCs, per-pair L2 groups
+                // and SMT pairs - a denser distance ladder than any
+                // real host of this size.
+                ro.topo_node[cpu] = if cpu < nr_cpus / 2 { 1 } else { 2 };
+                ro.topo_llc[cpu] = (cpu % 8) as u32 + 1;
+                ro.topo_l2[cpu] = (cpu / 2) as u32 + 1;
+                ro.topo_core[cpu] = (cpu / 2) as u32 + 1;
+            }
+            match scx_ops_load!(skel, baby_ops, uei) {
+                Ok(loaded) => drop(loaded),
+                Err(error) => failures.push(format!("{nr_cpus} CPUs: {error:#}")),
+            }
+        }
+        anyhow::ensure!(failures.is_empty(), "{}", failures.join("\n"));
+        Ok(())
+    }
 }
