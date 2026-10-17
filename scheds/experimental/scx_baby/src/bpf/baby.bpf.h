@@ -28,8 +28,11 @@
  * seat in ops.enqueue). The warm queues are bounded - a deeper
  * backlog overflows into the node queue, where every idle CPU can
  * reach it - so they carry cache locality without becoming homes.
+ *
+ * The warm queues take the DSQ ids starting at BABY_CPU_DSQ_BASE
+ * (intf.h, shared with userspace, which refuses to load a topology
+ * with more nodes than that).
  */
-#define BABY_CPU_DSQ_BASE	100ULL
 
 extern u64 nr_cpu_ids;
 

@@ -26,6 +26,7 @@ use std::time::Duration;
 
 use anyhow::Context;
 use anyhow::Result;
+use anyhow::ensure;
 use clap::Parser;
 use crossbeam::channel::RecvTimeoutError;
 use libbpf_rs::OpenObject;
@@ -160,6 +161,18 @@ impl<'a> Scheduler<'a> {
 
         // Initialize CPU topology.
         let topo = Topology::new().context("failed to read CPU topology")?;
+
+        // Node DSQs take the ids below BABY_CPU_DSQ_BASE and the
+        // warm seats take the ids from it up; a node count past the
+        // base would put both id spaces on the same numbers. No real
+        // machine under the CPU cap reaches this, but the collision
+        // would be silent, so refuse it here.
+        ensure!(
+            topo.nodes.len() < consts_BABY_CPU_DSQ_BASE as usize,
+            "too many NUMA nodes ({}) for the warm-seat DSQ id base {}",
+            topo.nodes.len(),
+            consts_BABY_CPU_DSQ_BASE
+        );
 
         info!(
             "{} {} {}",
@@ -340,7 +353,9 @@ impl<'a> Scheduler<'a> {
             }),
             ..Default::default()
         };
-        let out = prog.test_run(input).unwrap();
+        let out = prog
+            .test_run(input)
+            .context("enable_core_class test_run failed")?;
         if out.return_value != 0 {
             return Err(anyhow::anyhow!(
                 "enable_core_class failed for CPU {}: {}",

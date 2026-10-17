@@ -19,6 +19,9 @@ enum consts {
 	NSEC_PER_USEC = 1000ULL,
 	NSEC_PER_MSEC = (1000ULL * NSEC_PER_USEC),
 	NSEC_PER_SEC = (1000ULL * NSEC_PER_MSEC),
+
+	/* First warm-seat DSQ id; node DSQs take the ids below it. */
+	BABY_CPU_DSQ_BASE = 100,
 };
 
 #ifndef __VMLINUX_H__
