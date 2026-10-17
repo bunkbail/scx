@@ -486,8 +486,12 @@ fn main() -> Result<()> {
     }
 
     let mut open_object = MaybeUninit::uninit();
-    let mut sched = Scheduler::init(&opts, &mut open_object)?;
-    sched.run(shutdown.clone())?;
+    loop {
+        let mut sched = Scheduler::init(&opts, &mut open_object)?;
+        if !sched.run(shutdown.clone())?.should_restart() {
+            break;
+        }
+    }
 
     Ok(())
 }
