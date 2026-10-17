@@ -916,7 +916,7 @@ void BPF_STRUCT_OPS(baby_tick, struct task_struct *p)
 			if (hctx && is_lat_cri(hctx)) {
 				cri = true;
 				warm = true;
-			} else if (seat_depth1_latcri(cpu)) {
+			} else if (head && seat_depth1_latcri(cpu)) {
 				/*
 				 * A lat-cri waiter one deep behind this
 				 * batch head: the dispatch side's

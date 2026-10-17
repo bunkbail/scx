@@ -160,10 +160,12 @@ __hidden void stamp_wait(struct task_ctx *tctx, u64 now, u64 depth, bool shared)
 	tctx->wait_stamp = now;
 	tctx->wait_depth = (u8)MIN(depth, BABY_WDEPTH_NR - 1);
 	tctx->wait_shared = shared;
-	if (shared)
-		__sync_fetch_and_add(&nr_arr_type[type * 2 + 1], 1);
-	else
-		__sync_fetch_and_add(&nr_arr_type[type * 2], 1);
+	if (stats_enabled) {
+		if (shared)
+			__sync_fetch_and_add(&nr_arr_type[type * 2 + 1], 1);
+		else
+			__sync_fetch_and_add(&nr_arr_type[type * 2], 1);
+	}
 }
 
 /*
@@ -174,16 +176,23 @@ __hidden void stamp_wait(struct task_ctx *tctx, u64 now, u64 depth, bool shared)
  */
 __hidden void charge_wait(struct task_ctx *tctx, u64 now)
 {
-	if (!stats_enabled)
+	u64 stamp = tctx->wait_stamp;
+
+	/*
+	 * The stamp is consumed whether or not the instrument runs:
+	 * a stale stamp must never outlive the run that paid for it.
+	 */
+	tctx->wait_stamp = 0;
+
+	if (!stats_enabled || !stamp)
 		return;
 
-	if (tctx->wait_stamp) {
-		u64 wait = now - tctx->wait_stamp;
+	{
+		u64 wait = now - stamp;
 		u32 b = tctx->wait_depth & (BABY_WDEPTH_NR - 1);
 		u32 c = tctx->wait_cls & (BABY_WCLS_NR - 1);
 		u32 i = c * BABY_WDEPTH_NR + b;
 
-		tctx->wait_stamp = 0;
 		__sync_fetch_and_add(&nr_wait_n[b], 1);
 		__sync_fetch_and_add(&nr_wait_ns[b], wait);
 		if (wait > nr_wait_max[b])
