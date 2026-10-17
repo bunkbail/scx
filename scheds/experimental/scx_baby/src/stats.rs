@@ -891,18 +891,26 @@ impl Metrics {
     fn delta(&self, rhs: &Self) -> Self {
         Self {
             nr_running: self.nr_running,
-            nr_direct_dispatches: self.nr_direct_dispatches - rhs.nr_direct_dispatches,
-            nr_shared_dispatches: self.nr_shared_dispatches - rhs.nr_shared_dispatches,
-            nr_preemptions: self.nr_preemptions - rhs.nr_preemptions,
-            nr_boosts: self.nr_boosts - rhs.nr_boosts,
-            nr_sticky: self.nr_sticky - rhs.nr_sticky,
-            nr_warmseats: self.nr_warmseats - rhs.nr_warmseats,
-            nr_coldspreads: self.nr_coldspreads - rhs.nr_coldspreads,
-            nr_tick_preempts: self.nr_tick_preempts - rhs.nr_tick_preempts,
-            nr_tick_preempts_warm: self.nr_tick_preempts_warm - rhs.nr_tick_preempts_warm,
-            nr_depth1_pulls: self.nr_depth1_pulls - rhs.nr_depth1_pulls,
-            nr_depth1_pulls_seat: self.nr_depth1_pulls_seat - rhs.nr_depth1_pulls_seat,
-            nr_wake_preempts: self.nr_wake_preempts - rhs.nr_wake_preempts,
+            nr_direct_dispatches: self
+                .nr_direct_dispatches
+                .saturating_sub(rhs.nr_direct_dispatches),
+            nr_shared_dispatches: self
+                .nr_shared_dispatches
+                .saturating_sub(rhs.nr_shared_dispatches),
+            nr_preemptions: self.nr_preemptions.saturating_sub(rhs.nr_preemptions),
+            nr_boosts: self.nr_boosts.saturating_sub(rhs.nr_boosts),
+            nr_sticky: self.nr_sticky.saturating_sub(rhs.nr_sticky),
+            nr_warmseats: self.nr_warmseats.saturating_sub(rhs.nr_warmseats),
+            nr_coldspreads: self.nr_coldspreads.saturating_sub(rhs.nr_coldspreads),
+            nr_tick_preempts: self.nr_tick_preempts.saturating_sub(rhs.nr_tick_preempts),
+            nr_tick_preempts_warm: self
+                .nr_tick_preempts_warm
+                .saturating_sub(rhs.nr_tick_preempts_warm),
+            nr_depth1_pulls: self.nr_depth1_pulls.saturating_sub(rhs.nr_depth1_pulls),
+            nr_depth1_pulls_seat: self
+                .nr_depth1_pulls_seat
+                .saturating_sub(rhs.nr_depth1_pulls_seat),
+            nr_wake_preempts: self.nr_wake_preempts.saturating_sub(rhs.nr_wake_preempts),
             nr_land: self.nr_land.sub(&rhs.nr_land),
             nr_wake_land: self.nr_wake_land.sub(&rhs.nr_wake_land),
             nr_seat_self: self.nr_seat_self.saturating_sub(rhs.nr_seat_self),
