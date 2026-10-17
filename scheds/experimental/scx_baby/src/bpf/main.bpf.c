@@ -548,6 +548,55 @@ __hidden bool depth1_pull_seat(u64 dsq_id, s32 cpu)
 }
 
 /*
+ * The tick gate's depth-1 warm-seat peek: true when a latency-critical
+ * task waits one deep behind this seat's non-lat-cri head - the pair
+ * depth1_pull_seat() serves at dispatch, which cannot run until the
+ * holding victim's slice ends. Read-only on the skip bound: a head
+ * already bypassed once has its consumption scheduled at the next
+ * dispatch, so the tick keeps the victim's slice then. Both entries
+ * come off one iterator pass, so the snapshot is atomic.
+ */
+static __attribute__((noinline)) bool seat_depth1_latcri(s32 cpu)
+{
+	struct bpf_iter_scx_dsq it;
+	struct task_struct *h, *w;
+	struct task_ctx *wctx;
+	u32 idx = (u32)cpu & (BABY_MAX_CPUS - 1);
+	u32 skip_pid = seat_skip_pid[idx];
+	bool cri = false;
+
+	/* Guard outside the RCU section (the node_backlog note). One
+	 * deep means only the head - the tick gate's existing business.
+	 */
+	if (scx_bpf_dsq_nr_queued(cpu2dsq(cpu)) < 2)
+		return false;
+
+	bpf_rcu_read_lock();
+	h = NULL;
+	w = NULL;
+	if (!bpf_iter_scx_dsq_new(&it, cpu2dsq(cpu), 0)) {
+		h = bpf_iter_scx_dsq_next(&it);
+		w = bpf_iter_scx_dsq_next(&it);
+	}
+
+	/*
+	 * The head's bypass state decides first: skipped once, it is
+	 * consumed next dispatch. A lat-cri head is the plain gate's
+	 * pair and wins by deadline order anyway.
+	 */
+	if (!h || !w || (u32)h->pid == skip_pid) {
+		cri = false;
+	} else {
+		wctx = try_lookup_task_ctx(w);
+		cri = wctx && is_lat_cri(wctx);
+	}
+
+	bpf_iter_scx_dsq_destroy(&it);
+	bpf_rcu_read_unlock();
+	return cri;
+}
+
+/*
  * Enqueue a task that has no idle CPU to run on.
  *
  * The deadline order is the scheduling decision: tasks are placed in the
@@ -865,6 +914,16 @@ void BPF_STRUCT_OPS(baby_tick, struct task_struct *p)
 			head = __COMPAT_scx_bpf_dsq_peek(cpu2dsq(cpu));
 			hctx = head ? try_lookup_task_ctx(head) : NULL;
 			if (hctx && is_lat_cri(hctx)) {
+				cri = true;
+				warm = true;
+			} else if (seat_depth1_latcri(cpu)) {
+				/*
+				 * A lat-cri waiter one deep behind this
+				 * batch head: the dispatch side's
+				 * depth1_pull_seat() serves it, but only
+				 * after this victim's slice ends. Cut
+				 * the slice now (the depth-1 arm).
+				 */
 				cri = true;
 				warm = true;
 			}
