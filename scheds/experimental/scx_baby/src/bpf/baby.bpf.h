@@ -274,11 +274,15 @@ struct task_ctx {
 	u64 last_woke_at;
 
 	/*
-	 * Peak hold of wakeup_freq with a slow leak (1/64 per wake): a
-	 * task throttled by CPU overcommit keeps its high-wake credit
-	 * for a long time, so the foreground class does not collapse
-	 * exactly when it matters, while a task whose nature changed
-	 * re-classifies within a few seconds.
+	 * Peak hold of wakeup_freq: renewed whenever the EWMA reaches
+	 * it, and decaying by 1/64 per wake only while above 64, since
+	 * a shift of a value below 64 is zero. The hold therefore falls
+	 * from a spike to 63 and stays there - and 63 sits far above
+	 * every class bar (10), so the wake-rate classes are a latch:
+	 * once earned, kept for the task's lifetime, by design. A real
+	 * decay would strip the class from a frame-paced game thread the
+	 * moment CPU overcommit throttles its frame rate, which is the
+	 * one state the credit exists for.
 	 */
 	u32 peak_freq;
 
@@ -342,7 +346,7 @@ struct task_ctx {
 /*
  * The node queue holds two or more waiting tasks: the task will rotate
  * behind them anyway, and every extra rotation costs a full switch, so
- * grant it twice the slice.
+ * the callers grant four times the deadline as the slice.
  */
 static __always_inline bool backlog_deep(u64 backlog)
 {

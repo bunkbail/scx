@@ -268,8 +268,8 @@ impl WaitCls {
 /// type * 4 + depth). `wk` is a wake handoff: the arrival became runnable
 /// with SCX_ENQ_WAKEUP. `rot` is the rotation: slice-expiry and
 /// preemption requeues, which re-enter without a runnable transition.
-/// In the oc2way rig the wake side is the schbench probe path and the
-/// rotation side the stress-ng spinners.
+/// Under a request-response load the wake side is the request path and
+/// the rotation side the compute workers.
 #[stat_doc]
 #[derive(Clone, Debug, Default, Serialize, Deserialize, Stats)]
 #[stat(top)]

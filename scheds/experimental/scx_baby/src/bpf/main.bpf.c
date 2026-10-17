@@ -39,7 +39,7 @@ private(BABY) struct bpf_cpumask __kptr *big_cpumask;
 private(BABY) struct bpf_cpumask __kptr *little_cpumask;
 
 /*
- * Saturation deferred preemption (the game2 oc2 verdict): at full CPU
+ * Saturation deferred preemption: at full CPU
  * saturation a latency-critical task that parks in a queue waits a
  * full slice behind the batch task running here, and at 2x
  * overcommit that wait is paid by every frame - the game's whole
@@ -786,8 +786,8 @@ void BPF_STRUCT_OPS(baby_dispatch, s32 cpu, struct task_struct *prev)
 			/*
 			 * Serve a lat-cri waiter one deep behind the node
 			 * head first: the overdue-batch head cannot be
-			 * re-ordered past by any deadline offset (the lcomp
-			 * verdict), so the inversion is resolved here, at
+			 * re-ordered past by any deadline offset, so the
+			 * inversion is resolved here, at
 			 * consumption. Bounded: this head is bypassed once.
 			 */
 			bool d1 = depth1_pull_node(node, cpu);
@@ -873,10 +873,10 @@ void BPF_STRUCT_OPS(baby_cpu_release, s32 cpu,
 
 /*
  * Periodic tick: account bursts, advance the CPU performance ledger and
- * renew the deadline once reached. The tick does not preempt: the
- * rotation order is the deadline order now, and a tick-driven
- * preemption would only add switches that the queue order does not
- * ask for.
+ * renew the deadline once reached. The tick preempts only through the
+ * saturation deferred-preemption gate below; the rotation order stays
+ * the deadline order, and any other tick-driven preemption would add
+ * switches the queue order does not ask for.
  */
 void BPF_STRUCT_OPS(baby_tick, struct task_struct *p)
 {

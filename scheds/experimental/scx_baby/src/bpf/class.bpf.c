@@ -135,13 +135,12 @@ __hidden bool can_resched(const struct task_ctx *tctx)
 
 /*
  * A task is interactive when it used little CPU in its previous burst
- * window and has run long enough to complete one: fresh tasks start on
- * the little cores and only move to a big core once their history shows
- * light usage, so that a spawn that turns into a CPU hog never touches
- * a big core. The boost counter feeds the deadline, not the placement:
- * on a desktop almost every task sleeps early often enough to earn
- * boost, so it is useless for telling latency-sensitive tasks apart
- * from hogs.
+ * window and has run long enough to complete one. Interactive and
+ * foreground tasks are the eligible wakers for wakeup preemption; the
+ * class bit is also stamped into the wait instrument. The boost
+ * counter feeds the deadline, not the placement: on a desktop almost
+ * every task sleeps early often enough to earn boost, so it is
+ * useless for telling latency-sensitive tasks apart from hogs.
  */
 __hidden bool is_interactive(const struct task_ctx *tctx)
 {
@@ -154,10 +153,11 @@ __hidden bool is_interactive(const struct task_ctx *tctx)
  * holds more than a quarter of the period across the current and the
  * previous window. The accounting covers both windows so that a task
  * sharing a contended little core - and rolling windows with a fraction
- * of the core each - does not lose the status it has earned. The
- * history means the task will keep running for a while, so the fast
- * core finishes the work sooner and returns to sleep (race to idle),
- * while a blip with no history stays stacked on the little cores.
+ * of the core each - does not lose the status it has earned. On a
+ * hybrid platform a proven consumer with no wake history pins a big
+ * core while the wake path packs everything else onto the little tier
+ * (docs/adr/0012); on a single-tier machine the sets are empty and the
+ * predicate only shades the preemption and frequency decisions.
  */
 __hidden bool is_heavy_proven(const struct task_ctx *tctx)
 {
@@ -168,9 +168,11 @@ __hidden bool is_heavy_proven(const struct task_ctx *tctx)
  * A task is foreground when it wakes frequently and does real work:
  * a browser renderer or an audio thread wakes dozens of times per
  * window with sizable bursts, a CPU hog never wakes, and a UI blip
- * barely uses the CPU. Foreground tasks deserve the fast cores even
- * when their bursts are too large for the interactive class, which is
- * what breaks them under heavy overcommit otherwise.
+ * barely uses the CPU. Foreground earns the fourfold slice, waker
+ * eligibility, and precedence over the heavy pin in the compaction:
+ * light workers cross the heavy bar with their mutex spins, and they
+ * must keep the little-tier packing rather than spread onto the big
+ * cores (docs/adr/0012).
  */
 #define FOREGROUND_WAKE_FREQ	10
 
@@ -198,11 +200,11 @@ __hidden u64 task_slice(const struct task_ctx *tctx)
  * overcommit a game thread is heavy_proven too, so no burst bound can
  * gate this. Unlike is_foreground() there is no runtime floor either:
  * a task that wakes often but consumes almost nothing still has
- * latency to protect. Wake-rate only, per the wait-class verdict - the
- * foreground bit owns too small a share of the overcommit wait to gate
- * anything on, and a task that never leaves runnable state (preempted,
- * slice-expired) never re-runs this EWMA, so a preempted batch victim
- * cannot pass as a waker here.
+	 * latency to protect. Wake-rate only: the foreground bit owns too
+	 * small a share of the overcommit wait to gate
+	 * anything on, and a task that never leaves runnable state (preempted,
+	 * slice-expired) never re-runs this EWMA, so a preempted batch victim
+	 * cannot pass as a waker here.
  */
 __hidden bool is_lat_cri(const struct task_ctx *tctx)
 {
@@ -244,8 +246,11 @@ __hidden void class_on_runnable(struct task_ctx *tctx, u64 enq_flags, u64 now)
 	/*
 	 * Wakes per 100ms, smoothed (EWMA) and capped: a task that wakes
 	 * every millisecond or faster saturates the counter. The peak
-	 * hold remembers the historical maximum with a slow leak, so a
-	 * throttled task keeps its foreground credit.
+	 * hold remembers the historical maximum and bleeds only while
+	 * the value sits above 64 (a shift of 6), so once a task has
+	 * earned a wake rate past a class bar it keeps the credit: a
+	 * frame-paced thread, throttled or not, does not fall out of
+	 * its class in a slow patch.
 	 */
 	tctx->wakeup_freq = calc_avg(tctx->wakeup_freq,
 				     (100 * NSEC_PER_MSEC) / delta);

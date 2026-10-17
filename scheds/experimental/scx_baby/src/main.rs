@@ -289,11 +289,12 @@ impl<'a> Scheduler<'a> {
         })
     }
 
-    // Interactive tasks steer to the big cores, the rest to the little
-    // ones. The decision is pure (tiers.rs); this function gathers the
-    // sysfs inputs and applies the result. On a platform without a
-    // usable tier split every CPU lands in one tier and the hybrid
-    // gates are statically false.
+    // Publish the core-type split for the BPF side. Placement is the
+    // deadline order; these sets only matter on a hybrid platform,
+    // where the BPF wake path packs light work onto the little tier
+    // and a proven consumer with no wake history pins a big core. On
+    // a platform without a usable tier split every CPU lands in one
+    // tier and the hybrid gates are statically false.
     fn init_core_classes(skel: &mut BpfSkel<'_>, topo: &Topology) -> Result<()> {
         // The kernel's own per-CPU capacity, exported by hybrid and
         // ARM parts.

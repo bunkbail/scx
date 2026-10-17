@@ -113,10 +113,7 @@ __hidden bool balance_try_warm_seat(struct task_struct *p, struct task_ctx *tctx
 			 * On a deep backlog - shared or local - the
 			 * task will rotate anyway and every extra
 			 * rotation costs a full switch, so grant four
-			 * times the slice: the upward rung of the
-			 * E11 ladder, untried there, run here as the
-			 * negative control on the rotation-rhythm
-			 * reading.
+			 * times the slice.
 			 */
 			u64 slice = (backlog_deep(backlog) || target_nr >= 2) ?
 				    4 * deadline_ns : task_slice(tctx);

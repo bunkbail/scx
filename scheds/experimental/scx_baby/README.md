@@ -71,7 +71,16 @@ it can reach:
 Ordering, slice length and preemption eligibility are driven by two
 measured signals - the burst history and, inspired by scx_flash, a
 wake-frequency EWMA (wakes per 100ms, tracked in `ops.runnable`) - never
-by the boost counter, which on a desktop almost every task earns:
+by the boost counter, which on a desktop almost every task earns.
+
+The wake-rate signal is a **peak hold**, and the classes it feeds are a
+latch by design: the hold is renewed whenever the EWMA reaches it and
+decays only above 64 wakes per 100ms, while every class bar sits at 10.
+A task that has once earned a wake rate keeps its class for its
+lifetime. A real decay would strip the class from a frame-paced game
+thread the moment CPU overcommit throttles its frame rate, which is the
+one state the credit exists for: the EWMA collapses under starvation,
+so the peak, not the current rate, is what proves the task's nature.
 
 - **Latency-critical**: wakes frequently enough to prove it (at least 10
   wakes per 100ms across at least four samples), whatever its burst
@@ -164,9 +173,30 @@ produced.
 ## Options
 
 - `-d, --deadline-us` : deadline offset (and time slice) in microseconds,
-  default 1180 (the original DEADLINE_NS).
+  default 1180 (the original DEADLINE_NS). Accepted range 100 to 100000.
 - `-p, --perf` : CPU frequency performance level, 0 (min) to 1024 (max),
-  default -1 (automatic, scaled from each CPU's utilization).
+  default -1 (automatic, scaled from each CPU's utilization), -2 to leave
+  the platform's cpufreq setup alone.
+- `--stats <interval>` : enable the stats report and run normally.
+- `--monitor <interval>` : run in stats monitoring mode without launching
+  the scheduler.
+- `-D, --debug` : enable BPF debugging via /sys/kernel/tracing/trace_pipe.
+- `-v, --verbose` : verbose output, including libbpf details.
+- `--help-stats` : show descriptions for the statistics.
+- `--exit-dump-len` : exit debug dump buffer length, 0 for the default.
+- `-V, --version` : print the scheduler version and exit.
+
+## Requirements
+
+Tested on kernels 7.2.9 and 7.3.0-rc4 (x86-64, one homogeneous SMT
+machine and one hybrid Arrow Lake laptop). The scheduler loads on
+anything sched_ext supports, with one floor worth knowing: the
+starve-rescue timer that hands a warm seat back to the shared queue
+uses `scx_bpf_dsq_reenq()`, a kernel 7.1 addition. Below that the
+rescue is probe-gated off, and a warm queue stranded behind an RT or
+deadline lease is only recovered when the kernel's five-second
+watchdog unloads the scheduler. The remaining kernel helpers the
+scheduler probes have older fallbacks built in.
 
 ## Building a static musl binary
 
