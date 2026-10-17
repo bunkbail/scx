@@ -62,6 +62,12 @@ extern const volatile u64 deadline_ns;
  /* Report additional debugging information */
 extern const volatile bool debug;
 
+/*
+ * The wait/census instrument and the distance histograms run; set
+ * from --stats at load.
+ */
+extern const volatile bool stats_enabled;
+
 #define dbg_msg(_fmt, ...) do {				\
 	if (debug)					\
 		bpf_printk(_fmt, ##__VA_ARGS__);	\
@@ -91,9 +97,13 @@ extern const volatile u32 topo_core[BABY_MAX_CPUS];
 extern u64 nr_little_cpus, nr_big_cpus;
 
 /*
- * Scheduling statistics.
+ * Scheduling statistics. nr_running owns a cache line: it is a
+ * control-plane input read on the hot paths, and the diagnostic
+ * counters must not share its line (see stats.bpf.c).
  */
-extern volatile u64 nr_running, nr_direct_dispatches, nr_shared_dispatches;
+extern volatile u64 nr_running __attribute__((aligned(64)));
+extern volatile u64 nr_direct_dispatches __attribute__((aligned(64))),
+	nr_shared_dispatches;
 extern volatile u64 nr_preemptions, nr_boosts, nr_sticky, nr_warmseats;
 extern volatile u64 nr_coldspreads;
 
@@ -417,7 +427,7 @@ __hidden bool try_direct_dispatch(struct task_struct *p, struct task_ctx *tctx,
  */
 __hidden void cpuperf_init(void);
 __hidden void cpuperf_on_tick(struct task_struct *p, u64 now, bool max_floor);
-__hidden void cpuperf_on_running(s32 cpu, bool max_floor);
+__hidden void cpuperf_on_running(s32 cpu, u64 now, bool max_floor);
 __hidden void cpuperf_on_stopping(s32 cpu, u64 now);
 __hidden void cpuperf_on_idle(s32 cpu);
 
@@ -426,6 +436,13 @@ __hidden void cpuperf_on_idle(s32 cpu);
  */
 __hidden bool balance_try_warm_seat(struct task_struct *p, struct task_ctx *tctx,
 			   u64 enq_flags, u64 backlog, u64 now);
+
+/*
+ * main.bpf.c: the hybrid LP-island guard: re-pick a confirmed idle
+ * pick that landed on an LP core inside the two tiers.
+ */
+__hidden s32 lp_guard_pick(struct task_struct *p, struct task_ctx *tctx,
+			   s32 cpu);
 
 /*
  * main.bpf.c: the depth-1 out-of-turn pull - serve a latency-critical

@@ -81,9 +81,8 @@ static struct cpu_ctx *try_lookup_cpu_ctx(s32 cpu)
  * keep the core below its boost clock for the first windows of every
  * work chunk.
  */
-static void update_cpuperf(struct cpu_ctx *cctx, s32 cpu, bool max_floor)
+static void update_cpuperf(struct cpu_ctx *cctx, s32 cpu, u64 now, bool max_floor)
 {
-	u64 now = bpf_ktime_get_ns();
 	u64 perf_lvl, delta_runtime, delta_t;
 
 	delta_t = now - cctx->last_running;
@@ -189,8 +188,7 @@ __hidden void cpuperf_on_tick(struct task_struct *p, u64 now, bool max_floor)
 		cctx = try_lookup_cpu_ctx(cpu);
 		if (cctx) {
 			cctx->tot_runtime += now - cctx->last_running;
-			cctx->last_running = now;
-			update_cpuperf(cctx, cpu, max_floor);
+			update_cpuperf(cctx, cpu, now, max_floor);
 		}
 	}
 }
@@ -201,14 +199,14 @@ __hidden void cpuperf_on_tick(struct task_struct *p, u64 now, bool max_floor)
  * as it runs, so give it the boost clock at once instead of
  * re-climbing the smoothing after every sleep (@max_floor).
  */
-__hidden void cpuperf_on_running(s32 cpu, bool max_floor)
+__hidden void cpuperf_on_running(s32 cpu, u64 now, bool max_floor)
 {
 	if (cpuperf_lvl < 0) {
 		struct cpu_ctx *cctx;
 
 		cctx = try_lookup_cpu_ctx(cpu);
 		if (cctx)
-			update_cpuperf(cctx, cpu, max_floor);
+			update_cpuperf(cctx, cpu, now, max_floor);
 	}
 }
 

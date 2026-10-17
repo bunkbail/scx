@@ -44,6 +44,17 @@ __hidden bool balance_try_warm_seat(struct task_struct *p, struct task_ctx *tctx
 {
 	s32 prev_cpu = scx_bpf_task_cpu(p);
 
+	/*
+	 * A rescued or RT-released task is a task the machine could not
+	 * serve where it sat: seating it straight back into the same
+	 * warm queue would reset its clock and strand it there. It has
+	 * already had its idle-CPU rescan in ops.enqueue(); anything
+	 * still waiting joins the shared queue, which every CPU can
+	 * pull.
+	 */
+	if (enq_flags & SCX_ENQ_REENQ)
+		return false;
+
 	if (bpf_cpumask_test_cpu(prev_cpu, p->cpus_ptr)) {
 		s32 target = prev_cpu;
 		u64 target_nr = scx_bpf_dsq_nr_queued(cpu2dsq(target));
@@ -77,7 +88,14 @@ __hidden bool balance_try_warm_seat(struct task_struct *p, struct task_ctx *tctx
 			 * inlined evaluations in the comparison below
 			 * explode the verifier's state space.
 			 */
-			if (!(enq_flags & SCX_ENQ_WAKEUP) ||
+			/*
+			 * The rebalance needs a seat already two deep:
+			 * below that, no queue satisfies the
+			 * shallowest-nearest bound and the scan body can
+			 * never move the task. Keep only the warm_total
+			 * accounting.
+			 */
+			if (target_nr < 2 || !(enq_flags & SCX_ENQ_WAKEUP) ||
 			    !bpf_cpumask_test_cpu((s32)i, p->cpus_ptr))
 				continue;
 
@@ -106,10 +124,11 @@ __hidden bool balance_try_warm_seat(struct task_struct *p, struct task_ctx *tctx
 			if (best != target && best_nr + 2 <= target_nr) {
 				target = best;
 				target_nr = best_nr;
-				__sync_fetch_and_add(
-					&nr_seat_move[cpu_dist(prev_cpu,
-							       target)],
-					1);
+				if (stats_enabled)
+					__sync_fetch_and_add(
+						&nr_seat_move[cpu_dist(
+							prev_cpu, target)],
+						1);
 			} else {
 				__sync_fetch_and_add(&nr_seat_self, 1);
 			}

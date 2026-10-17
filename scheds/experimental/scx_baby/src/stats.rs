@@ -710,6 +710,9 @@ impl Metrics {
                 "-".into()
             }
         };
+        // The BPF maxima are all-time high-water marks: report one
+        // only for an interval that actually had waits.
+        let smax = |m: u64, n: u64| -> String { if n > 0 { m.to_string() } else { "-".into() } };
         let (wn, wns, wmax, wsl) = (&self.wait_n, &self.wait_ns, &self.wait_max, &self.wait_slow);
         writeln!(
             w,
@@ -722,10 +725,10 @@ impl Metrics {
             mean(wns.b1, wn.b1),
             mean(wns.b2, wn.b2),
             mean(wns.b3, wn.b3),
-            wmax.b0,
-            wmax.b1,
-            wmax.b2,
-            wmax.b3,
+            smax(wmax.b0, wn.b0),
+            smax(wmax.b1, wn.b1),
+            smax(wmax.b2, wn.b2),
+            smax(wmax.b3, wn.b3),
             wsl.b0,
             wsl.b1,
             wsl.b2,
@@ -752,10 +755,10 @@ impl Metrics {
             fmean(wc.fg_ns_b1, wc.fg_b1),
             fmean(wc.fg_ns_b2, wc.fg_b2),
             fmean(wc.fg_ns_b3, wc.fg_b3),
-            wc.fg_max_b0,
-            wc.fg_max_b1,
-            wc.fg_max_b2,
-            wc.fg_max_b3,
+            smax(wc.fg_max_b0, wc.fg_b0),
+            smax(wc.fg_max_b1, wc.fg_b1),
+            smax(wc.fg_max_b2, wc.fg_b2),
+            smax(wc.fg_max_b3, wc.fg_b3),
             wc.fg_slow[0],
             wc.fg_slow[1],
             wc.fg_slow[2],
@@ -772,10 +775,10 @@ impl Metrics {
             fmean(wc.other_ns_b1, wc.other_b1),
             fmean(wc.other_ns_b2, wc.other_b2),
             fmean(wc.other_ns_b3, wc.other_b3),
-            wc.other_max_b0,
-            wc.other_max_b1,
-            wc.other_max_b2,
-            wc.other_max_b3,
+            smax(wc.other_max_b0, wc.other_b0),
+            smax(wc.other_max_b1, wc.other_b1),
+            smax(wc.other_max_b2, wc.other_b2),
+            smax(wc.other_max_b3, wc.other_b3),
             wc.other_slow[0],
             wc.other_slow[1],
             wc.other_slow[2],
@@ -793,10 +796,10 @@ impl Metrics {
             fmean(wt.wk_ns_b1, wt.wk_b1),
             fmean(wt.wk_ns_b2, wt.wk_b2),
             fmean(wt.wk_ns_b3, wt.wk_b3),
-            wt.wk_max_b0,
-            wt.wk_max_b1,
-            wt.wk_max_b2,
-            wt.wk_max_b3,
+            smax(wt.wk_max_b0, wt.wk_b0),
+            smax(wt.wk_max_b1, wt.wk_b1),
+            smax(wt.wk_max_b2, wt.wk_b2),
+            smax(wt.wk_max_b3, wt.wk_b3),
             wt.wk_slow[0],
             wt.wk_slow[1],
             wt.wk_slow[2],
@@ -815,10 +818,10 @@ impl Metrics {
             fmean(wt.rot_ns_b1, wt.rot_b1),
             fmean(wt.rot_ns_b2, wt.rot_b2),
             fmean(wt.rot_ns_b3, wt.rot_b3),
-            wt.rot_max_b0,
-            wt.rot_max_b1,
-            wt.rot_max_b2,
-            wt.rot_max_b3,
+            smax(wt.rot_max_b0, wt.rot_b0),
+            smax(wt.rot_max_b1, wt.rot_b1),
+            smax(wt.rot_max_b2, wt.rot_b2),
+            smax(wt.rot_max_b3, wt.rot_b3),
             wt.rot_slow[0],
             wt.rot_slow[1],
             wt.rot_slow[2],
@@ -839,12 +842,24 @@ impl Metrics {
                 })
                 .collect()
         };
+        let vmaxs = |m: &[u64], n: &[u64]| -> Vec<String> {
+            m.iter()
+                .zip(n.iter())
+                .map(|(m, n)| {
+                    if *n > 0 {
+                        m.to_string()
+                    } else {
+                        "-".to_string()
+                    }
+                })
+                .collect()
+        };
         writeln!(
             w,
             "  wlcri lat n[{:?}] mean[{:?}] max[{:?}] slow5ms[{:?}]",
             wl.lat_n,
             vmean(&wl.lat_ns, &wl.lat_n),
-            wl.lat_max,
+            vmaxs(&wl.lat_max, &wl.lat_n),
             wl.lat_slow,
         )?;
         writeln!(
@@ -852,7 +867,7 @@ impl Metrics {
             "  wlcri other n[{:?}] mean[{:?}] max[{:?}] slow5ms[{:?}]",
             wl.other_n,
             vmean(&wl.other_ns, &wl.other_n),
-            wl.other_max,
+            vmaxs(&wl.other_max, &wl.other_n),
             wl.other_slow,
         )?;
         let wg = &self.wait_wg;
@@ -864,7 +879,7 @@ impl Metrics {
                 tag,
                 n,
                 vmean(ns, n),
-                max,
+                vmaxs(max, n),
                 slow,
             )?;
         }

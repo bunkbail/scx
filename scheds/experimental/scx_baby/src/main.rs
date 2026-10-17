@@ -177,6 +177,12 @@ impl<'a> Scheduler<'a> {
         rodata.debug = opts.debug;
         rodata.deadline_ns = opts.deadline_us * 1000;
 
+        // The wait/census instrument and the distance histograms run
+        // only when the scheduler was started with --stats: the flag
+        // is fixed at load. The wait stamps stay unconditional; the
+        // starve-rescue timer reads them.
+        rodata.stats_enabled = opts.stats.is_some();
+
         // Publish the cache-topology distance tables. The BPF side
         // compares ids for equality, and 0 means "unfilled" there, so
         // every id is stored offset by one: an id of 0 becomes 1, and

@@ -72,12 +72,14 @@ __hidden bool try_direct_dispatch(struct task_struct *p, struct task_ctx *tctx,
 		cpu = pick_idle_cpu(p, prev_cpu, 0, &is_idle);
 		if (!is_idle)
 			return false;
+		cpu = lp_guard_pick(p, tctx, cpu);
 	} else {
 		if (!scx_bpf_test_and_clear_cpu_idle(prev_cpu))
 			return false;
 	}
 
-	__sync_fetch_and_add(&nr_land[cpu_dist(prev_cpu, cpu)], 1);
+	if (stats_enabled)
+		__sync_fetch_and_add(&nr_land[cpu_dist(prev_cpu, cpu)], 1);
 	scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL_ON | cpu, task_slice(tctx), 0);
 	__sync_fetch_and_add(&nr_direct_dispatches, 1);
 

@@ -12,11 +12,24 @@
 #include "baby.bpf.h"
 
 /*
- * Scheduling statistics.
+ * The wait/census instrument and the distance histograms run only when
+ * userspace asked for stats at load; the flag is rodata, fixed with
+ * --stats. The wait stamps stay unconditional: the starve-rescue timer
+ * reads them as its queue-arrival clock.
  */
-volatile u64 nr_running, nr_direct_dispatches, nr_shared_dispatches;
-volatile u64 nr_preemptions, nr_boosts, nr_sticky, nr_warmseats;
-volatile u64 nr_coldspreads;
+const volatile bool stats_enabled;
+
+/*
+ * Scheduling statistics. nr_running is a control-plane input read by
+ * ops.select_cpu() and the warm-seat gate on every wake and enqueue;
+ * it holds a cache line of its own so that the diagnostic counters'
+ * atomics do not bounce it under the hot paths, and the next group is
+ * aligned off it in turn.
+ */
+__attribute__((aligned(64))) volatile u64 nr_running;
+__attribute__((aligned(64))) volatile u64 nr_direct_dispatches,
+	nr_shared_dispatches, nr_preemptions, nr_boosts, nr_sticky,
+	nr_warmseats, nr_coldspreads;
 
 /*
  * Saturation deferred-preemption instrument: the victims ops.tick() cut
@@ -161,6 +174,9 @@ __hidden void stamp_wait(struct task_ctx *tctx, u64 now, u64 depth, bool shared)
  */
 __hidden void charge_wait(struct task_ctx *tctx, u64 now)
 {
+	if (!stats_enabled)
+		return;
+
 	if (tctx->wait_stamp) {
 		u64 wait = now - tctx->wait_stamp;
 		u32 b = tctx->wait_depth & (BABY_WDEPTH_NR - 1);
@@ -230,6 +246,9 @@ __hidden void charge_wait(struct task_ctx *tctx, u64 now)
  */
 __hidden void census_sample(s32 cpu)
 {
+	if (!stats_enabled)
+		return;
+
 	s32 node = __COMPAT_scx_bpf_cpu_node(cpu);
 	u64 seat = scx_bpf_dsq_nr_queued(cpu2dsq(cpu));
 	u64 backlog = scx_bpf_dsq_nr_queued(node);

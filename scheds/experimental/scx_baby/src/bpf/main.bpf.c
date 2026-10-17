@@ -201,6 +201,43 @@ static __always_inline s32 pick_idle_tier(struct task_struct *p,
 }
 
 /*
+ * The LP guard: the kernel selector may hand back an LP core, whose
+ * 0.7-1.4GHz no-L3 residency the prev-bias then locks in for the
+ * task's lifetime. While the hybrid gate can engage at all, re-pick
+ * inside the tiers - the preferred one first - and keep the LP only
+ * when both are full or affinity allows nothing else. Callers apply
+ * it to a confirmed idle pick.
+ */
+__hidden s32 lp_guard_pick(struct task_struct *p, struct task_ctx *tctx,
+			   s32 cpu)
+{
+	struct bpf_cpumask *l, *b;
+	bool on_tier;
+
+	if (!nr_little_cpus || !nr_big_cpus)
+		return cpu;
+
+	bpf_rcu_read_lock();
+	l = little_cpumask;
+	b = big_cpumask;
+	on_tier = l && b &&
+		  (bpf_cpumask_test_cpu(cpu, cast_mask(l)) ||
+		   bpf_cpumask_test_cpu(cpu, cast_mask(b)));
+	bpf_rcu_read_unlock();
+
+	if (!on_tier) {
+		bool big_first = tctx && is_heavy_proven(tctx) &&
+				 !is_foreground(tctx);
+		s32 alt = pick_idle_tier(p, big_first);
+
+		if (alt >= 0)
+			cpu = alt;
+	}
+
+	return cpu;
+}
+
+/*
  * Pick a target CPU for a task which is being woken up, and dispatch it
  * straight to the CPU when the pick found an idle one. Placement is
  * delegated to the kernel's idle-CPU selection: SMT-aware, biased to
@@ -259,8 +296,11 @@ s32 BPF_STRUCT_OPS(baby_select_cpu, struct task_struct *p,
 		if (cpu < 0 && !big_pin && is_heavy_proven(tctx))
 			cpu = pick_idle_pref(p, big_cpumask);
 		if (cpu >= 0) {
-			__sync_fetch_and_add(&nr_wake_land[cpu_dist(prev_cpu, cpu)],
-					     1);
+			if (stats_enabled)
+				__sync_fetch_and_add(
+					&nr_wake_land[cpu_dist(prev_cpu,
+								       cpu)],
+					1);
 			scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL,
 					   task_slice(tctx), 0);
 			__sync_fetch_and_add(&nr_direct_dispatches, 1);
@@ -269,37 +309,12 @@ s32 BPF_STRUCT_OPS(baby_select_cpu, struct task_struct *p,
 	}
 
 	cpu = pick_idle_cpu(p, prev_cpu, wake_flags, &is_idle);
-	if (is_idle && nr_little_cpus && nr_big_cpus) {
-		/*
-		 * LP guard: the kernel pick may return an LP core,
-		 * whose 0.7-1.4GHz no-L3 residency the prev-bias then
-		 * locks in for the task's lifetime. While the hybrid
-		 * gate can engage at all, re-pick inside the tiers -
-		 * the preferred one first - and keep the LP only when
-		 * both are full or affinity allows nothing else.
-		 */
-		struct bpf_cpumask *l, *b;
-		bool on_tier;
-
-		bpf_rcu_read_lock();
-		l = little_cpumask;
-		b = big_cpumask;
-		on_tier = l && b &&
-			  (bpf_cpumask_test_cpu(cpu, cast_mask(l)) ||
-			   bpf_cpumask_test_cpu(cpu, cast_mask(b)));
-		bpf_rcu_read_unlock();
-
-		if (!on_tier) {
-			bool big_first = tctx && is_heavy_proven(tctx) &&
-					 !is_foreground(tctx);
-			s32 alt = pick_idle_tier(p, big_first);
-
-			if (alt >= 0)
-				cpu = alt;
-		}
-	}
+	if (is_idle)
+		cpu = lp_guard_pick(p, tctx, cpu);
 	if (is_idle) {
-		__sync_fetch_and_add(&nr_wake_land[cpu_dist(prev_cpu, cpu)], 1);
+		if (stats_enabled)
+			__sync_fetch_and_add(
+				&nr_wake_land[cpu_dist(prev_cpu, cpu)], 1);
 		scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL,
 				   tctx ? task_slice(tctx) : deadline_ns, 0);
 		__sync_fetch_and_add(&nr_direct_dispatches, 1);
@@ -395,8 +410,10 @@ s32 BPF_STRUCT_OPS(baby_select_cpu, struct task_struct *p,
 		scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL_ON | prev_cpu,
 				   task_slice(tctx), SCX_ENQ_PREEMPT);
 		__sync_fetch_and_add(&nr_wake_preempts, 1);
-		__sync_fetch_and_add(&nr_wake_land[cpu_dist(prev_cpu, prev_cpu)],
-				     1);
+		if (stats_enabled)
+			__sync_fetch_and_add(
+				&nr_wake_land[cpu_dist(prev_cpu, prev_cpu)],
+				1);
 
 		return prev_cpu;
 	}
@@ -613,18 +630,22 @@ void BPF_STRUCT_OPS(baby_enqueue, struct task_struct *p, u64 enq_flags)
 	}
 
 	/*
-	 * Warm seat, gated on oversubscription (see balance.bpf.c).
+	 * Grab a confirmed idle CPU if the machine still has one: a task
+	 * that stopped on a fully-loaded core spreads to a core that went
+	 * idle since, and a reenqueued task rescans after an RT lease.
+	 * This runs before the warm seat so that a slice expiry or a
+	 * rescue can never park a task on a busy seat while a lane sits
+	 * idle; for wakes that just came through ops.select_cpu() the
+	 * scan declines in two instructions, so their seat order is
+	 * unchanged.
 	 */
-	if (balance_try_warm_seat(p, tctx, enq_flags, backlog, now))
+	if (try_direct_dispatch(p, tctx, prev_cpu, enq_flags, is_running))
 		return;
 
 	/*
-	 * The task did not go through ops.select_cpu(), or nothing was
-	 * idle when it did: grab a confirmed idle CPU if the machine
-	 * still has one, which is also how a task that stopped on a
-	 * fully-loaded core spreads to a core that went idle since.
+	 * Warm seat, gated on oversubscription (see balance.bpf.c).
 	 */
-	if (try_direct_dispatch(p, tctx, prev_cpu, enq_flags, is_running))
+	if (balance_try_warm_seat(p, tctx, enq_flags, backlog, now))
 		return;
 
 	/*
@@ -658,8 +679,22 @@ void BPF_STRUCT_OPS(baby_dispatch, s32 cpu, struct task_struct *prev)
 	struct task_ctx *tctx = prev ? try_lookup_task_ctx(prev) : NULL;
 	bool need_running = prev && is_queued(prev);
 	s32 node = __COMPAT_scx_bpf_cpu_node(cpu);
+	struct task_struct *wq, *q;
+	u64 wq_dl, g_dl, best_dl;
 
 	census_sample(cpu);
+
+	/*
+	 * One peek of each queue per dispatch: the sticky run-in check
+	 * and the arbitration below read the same heads, and the peeked
+	 * pointers stay valid until the pull below enters its own RCU
+	 * scope (the node-head note there).
+	 */
+	wq = __COMPAT_scx_bpf_dsq_peek(cpu2dsq(cpu));
+	q = __COMPAT_scx_bpf_dsq_peek(node);
+	wq_dl = wq ? wq->scx.dsq_vtime : ULLONG_MAX;
+	g_dl = q ? q->scx.dsq_vtime : ULLONG_MAX;
+	best_dl = wq_dl < g_dl ? wq_dl : g_dl;
 
 	if (need_running && tctx) {
 		/*
@@ -675,15 +710,6 @@ void BPF_STRUCT_OPS(baby_dispatch, s32 cpu, struct task_struct *prev)
 		 * has waited, so a hog yields the moment something
 		 * waits.
 		 */
-		struct task_struct *wq = __COMPAT_scx_bpf_dsq_peek(cpu2dsq(cpu));
-		struct task_struct *q = __COMPAT_scx_bpf_dsq_peek(node);
-		u64 best_dl = ULLONG_MAX;
-
-		if (wq && wq->scx.dsq_vtime < best_dl)
-			best_dl = wq->scx.dsq_vtime;
-		if (q && q->scx.dsq_vtime < best_dl)
-			best_dl = q->scx.dsq_vtime;
-
 		if ((s64)(tctx->deadline - best_dl) < 0) {
 			scx_bpf_task_set_slice(prev, task_slice(tctx));
 			__sync_fetch_and_add(&nr_sticky, 1);
@@ -700,11 +726,6 @@ void BPF_STRUCT_OPS(baby_dispatch, s32 cpu, struct task_struct *prev)
 	 * head is strictly earlier.
 	 */
 	{
-		struct task_struct *wq = __COMPAT_scx_bpf_dsq_peek(cpu2dsq(cpu));
-		struct task_struct *q = __COMPAT_scx_bpf_dsq_peek(node);
-		u64 wq_dl = wq ? wq->scx.dsq_vtime : ULLONG_MAX;
-		u64 g_dl = q ? q->scx.dsq_vtime : ULLONG_MAX;
-
 		if (g_dl < wq_dl) {
 			/*
 			 * The node head's origin, read while q is fresh: the
@@ -735,7 +756,7 @@ void BPF_STRUCT_OPS(baby_dispatch, s32 cpu, struct task_struct *prev)
 				 * stays for the in-turn pulls it attributes.
 				 */
 				node_preempt_at = 0;
-				if (!d1)
+				if (!d1 && stats_enabled)
 					__sync_fetch_and_add(
 						&nr_pull_land[cpu_dist(cpu,
 									       from)],
@@ -966,7 +987,7 @@ void BPF_STRUCT_OPS(baby_running, struct task_struct *p)
 	 * as long as it runs, so give it the boost clock at once instead
 	 * of re-climbing the smoothing after every sleep.
 	 */
-	cpuperf_on_running(scx_bpf_task_cpu(p),
+	cpuperf_on_running(scx_bpf_task_cpu(p), now,
 			   is_heavy_proven(tctx) || is_foreground(tctx));
 
 	/*
@@ -1058,7 +1079,15 @@ static int rescue_timerfn(void *map, int *key, struct bpf_timer *timer)
 				continue;
 
 			hctx = try_lookup_task_ctx(head);
-			if (hctx && now - hctx->last_acc_at > STARVE_RESCUE_NS)
+			/*
+			 * The head's wait stamp is its arrival clock at
+			 * this queue: re-stamped at every insertion and
+			 * touched by nothing else while it waits.
+			 * last_acc_at was reset by every requeue, which
+			 * made a stranded seat unrescuable.
+			 */
+			if (hctx && hctx->wait_stamp &&
+			    now - hctx->wait_stamp > STARVE_RESCUE_NS)
 				scx_bpf_dsq_reenq___compat(dsq, 0);
 		}
 	}
