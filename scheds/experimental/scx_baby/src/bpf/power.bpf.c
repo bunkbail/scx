@@ -2,6 +2,8 @@
 /*
  * scx_baby: sched_ext port of the Baby Scheduler deadline variant (baby-dl)
  *
+ * Copyright (C) 2026 bunkbail <nabildanial.93@gmail.com>
+ *
  * CPU performance scaling. This module owns the per-CPU performance
  * ledger: the utilization window, the smoothing, the hysteresis and
  * the request suppression that keeps the platform's iowait boost

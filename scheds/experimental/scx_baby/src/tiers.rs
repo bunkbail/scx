@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0
 //
+// Copyright (C) 2026 bunkbail <nabildanial.93@gmail.com>
+//
 // Core-tier classification. Decides which CPUs are big cores, which are
 // little ones and which low-power islands stay out of both tiers. The
 // decision is pure over its inputs so the tests can pin every branch;

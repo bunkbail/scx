@@ -2,6 +2,8 @@
 /*
  * scx_baby: sched_ext port of the Baby Scheduler deadline variant (baby-dl)
  *
+ * Copyright (C) 2026 bunkbail <nabildanial.93@gmail.com>
+ *
  * Task classification and deadline derivation. This module owns the
  * burst accounting behind the hog throttle, the wake-frequency EWMA
  * behind the foreground class, the class predicates, the per-class

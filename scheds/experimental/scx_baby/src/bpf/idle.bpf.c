@@ -2,6 +2,8 @@
 /*
  * scx_baby: sched_ext port of the Baby Scheduler deadline variant (baby-dl)
  *
+ * Copyright (C) 2026 bunkbail <nabildanial.93@gmail.com>
+ *
  * Idle-CPU acquisition. Placement is delegated to the kernel's idle-CPU
  * selection: SMT-aware, biased to the previous CPU, spread across the
  * LLCs - the cache warmth the per-CPU queues used to pin comes from

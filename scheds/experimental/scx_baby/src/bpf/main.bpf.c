@@ -2,8 +2,7 @@
 /*
  * scx_baby: sched_ext port of the Baby Scheduler deadline variant (baby-dl)
  *
- * Copyright (C) 2021, Hamad Al Marri <hamad.s.almarri@gmail.com>
- * (original baby-dl scheduler, baby-dl-5.14.patch)
+ * Copyright (C) 2026 bunkbail <nabildanial.93@gmail.com>
  *
  * Every task owns a deadline, an absolute timestamp by which it would like
  * to run. The CPU always runs the task with the earliest deadline: tasks

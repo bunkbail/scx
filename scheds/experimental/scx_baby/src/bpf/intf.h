@@ -2,8 +2,7 @@
 /*
  * scx_baby: sched_ext port of the Baby Scheduler deadline variant (baby-dl)
  *
- * Original scheduler by Hamad Al Marri
- * (https://github.com/hamadmarri/Baby-CPU-Scheduler, baby-dl-5.14.patch)
+ * Copyright (C) 2026 bunkbail <nabildanial.93@gmail.com>
  *
  * This software may be used and distributed according to the terms of the
  * GNU General Public License version 2.

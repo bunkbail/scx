@@ -1,3 +1,10 @@
+// SPDX-License-Identifier: GPL-2.0
+//
+// Copyright (C) 2026 bunkbail <nabildanial.93@gmail.com>
+//
+// This software may be used and distributed according to the terms of the
+// GNU General Public License version 2.
+
 use std::io::Write;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;

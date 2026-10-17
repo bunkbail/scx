@@ -2,6 +2,8 @@
 /*
  * scx_baby: sched_ext port of the Baby Scheduler deadline variant (baby-dl)
  *
+ * Copyright (C) 2026 bunkbail <nabildanial.93@gmail.com>
+ *
  * Scheduling statistics and the measurement instruments: the placement
  * histograms, the wait-at-depth instrument and the consumption census.
  * The counters are read by userspace through the skeleton, so their
