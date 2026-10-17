@@ -72,7 +72,7 @@ private(BABY) struct bpf_cpumask __kptr *little_cpumask;
  *
  * The waiting head is observed by peeking, not by a latch signaled
  * from ops.enqueue(): the enqueue sits at the verifier's
- * jump-complexity ceiling (adr/0003), and the peek -> lookup -> class
+ * jump-complexity ceiling (docs/adr/0003), and the peek -> lookup -> class
  * pattern is already verifier-proven in the starve-rescue timer.
  */
 #define BABY_TICK_PREEMPT_PROTECT_NS	(200ULL * NSEC_PER_USEC)
@@ -144,7 +144,7 @@ static int init_cpumask(struct bpf_cpumask **cpumask)
 }
 
 /*
- * The compaction pick (adr/0012): the lowest-numbered idle CPU of the
+ * The compaction pick (docs/adr/0012): the lowest-numbered idle CPU of the
  * given tier, so wakeups stack onto the same few cores and the rest
  * of the tier idles at its boost floor. Claims bits atomically; a
  * lost race retries the next idle bit of the tier rather than
@@ -271,7 +271,7 @@ s32 BPF_STRUCT_OPS(baby_select_cpu, struct task_struct *p,
 	wake_flags &= ~SCX_WAKE_SYNC;
 
 	/*
-	 * Light-placement compaction (adr/0011; argon round 8). The
+	 * Light-placement compaction (docs/adr/0011). The
 	 * kernel selector below is prev-biased and spreads across LLCs
 	 * by design, so at light load it locks each task onto whatever
 	 * core it first touched - the counters read wake: self ~99% -

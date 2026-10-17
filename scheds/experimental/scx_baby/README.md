@@ -140,7 +140,7 @@ census of the seat depth and shared backlog each lane sees at dispatch,
 and the saturation-preemption counters (victims cut short at the tick,
 split by where the waiter sat).
 These counters are the readout the overcommit program reasons over; the
-decision records under `target/design/adr/` hold the verdicts they
+decision records under `docs/adr/` hold the verdicts they
 produced.
 
 ## Mapping to sched_ext

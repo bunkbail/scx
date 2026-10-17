@@ -9,7 +9,7 @@ to this crate.
 
 The BPF program is split across modules linked into one object. Every
 module includes only "baby.bpf.h", the shared interface. Project
-language and decision records live in target/design/ (GLOSSARY.md,
+language and decision records live in docs/ (GLOSSARY.md,
 adr/); read an ADR when touching the module it is attached to below.
 
 - `baby.bpf.h`: the interface hub. task_ctx, the DSQ layout, constants,
