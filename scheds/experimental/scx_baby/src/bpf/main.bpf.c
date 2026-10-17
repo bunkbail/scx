@@ -760,6 +760,14 @@ void BPF_STRUCT_OPS(baby_dispatch, s32 cpu, struct task_struct *prev)
 		 * waits.
 		 */
 		if ((s64)(tctx->deadline - best_dl) < 0) {
+			/*
+			 * The victim kept its CPU, so the tick's cut did
+			 * not happen: consume the mark here, where no
+			 * ops.running() will run to clear it, or its next
+			 * natural requeue would take the deep-backlog
+			 * rung it did not earn.
+			 */
+			tctx->tick_preempted = false;
 			scx_bpf_task_set_slice(prev, task_slice(tctx));
 			__sync_fetch_and_add(&nr_sticky, 1);
 			return;
@@ -836,8 +844,14 @@ void BPF_STRUCT_OPS(baby_dispatch, s32 cpu, struct task_struct *prev)
 	if (need_running) {
 		/*
 		 * Nothing is queued anywhere: keep the task running, as
-		 * the original does across its deadline renewals.
+		 * the original does across its deadline renewals. A
+		 * pending tick cut is consumed with it - the queues the
+		 * waiter was seen in emptied under the mark, so the
+		 * cut did not happen and the requeue slice rung is the
+		 * task's own again.
 		 */
+		if (tctx)
+			tctx->tick_preempted = false;
 		scx_bpf_task_set_slice(prev,
 				       tctx ? task_slice(tctx) : deadline_ns);
 	} else {
