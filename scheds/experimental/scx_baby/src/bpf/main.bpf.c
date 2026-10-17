@@ -614,13 +614,23 @@ void BPF_STRUCT_OPS(baby_enqueue, struct task_struct *p, u64 enq_flags)
 
 	tctx->last_acc_at = now;
 
-	if (tctx->yield_pending) {
+	/*
+	 * Consume the yield mark unconditionally: a mark that survived
+	 * to an enqueue it does not belong to would push the wrong
+	 * arrival behind the round. The push itself only applies to a
+	 * rotation requeue - the requeue right after the yield - never
+	 * to a wake, which keeps the sleep-time deadline rule.
+	 */
+	bool yielded = tctx->yield_pending;
+
+	tctx->yield_pending = false;
+
+	if (yielded && !(enq_flags & SCX_ENQ_WAKEUP)) {
 		/*
 		 * yield_task_fair() marks the deadline so the task is
 		 * picked last in the current round; push it behind every
 		 * task queued in this round.
 		 */
-		tctx->yield_pending = false;
 		tctx->deadline = now + deadline_ns + deadline_ns +
 				 task_prio_factor(p, tctx);
 	} else if (!(enq_flags & (SCX_ENQ_LAST | SCX_ENQ_WAKEUP |
@@ -745,7 +755,7 @@ void BPF_STRUCT_OPS(baby_dispatch, s32 cpu, struct task_struct *prev)
 	g_dl = q ? q->scx.dsq_vtime : ULLONG_MAX;
 	best_dl = wq_dl < g_dl ? wq_dl : g_dl;
 
-	if (need_running && tctx) {
+	if (need_running && tctx && !tctx->yield_pending) {
 		/*
 		 * pick_next_entity() keeps the current task only while
 		 * its deadline still beats the earliest head of both
@@ -757,7 +767,8 @@ void BPF_STRUCT_OPS(baby_dispatch, s32 cpu, struct task_struct *prev)
 		 * that keeps running renews its deadline every slice,
 		 * and any waiting task's deadline is older the longer it
 		 * has waited, so a hog yields the moment something
-		 * waits.
+		 * waits. A yielding task has given this round up, so
+		 * the keep does not apply to it.
 		 */
 		if ((s64)(tctx->deadline - best_dl) < 0) {
 			/*
@@ -848,10 +859,15 @@ void BPF_STRUCT_OPS(baby_dispatch, s32 cpu, struct task_struct *prev)
 		 * pending tick cut is consumed with it - the queues the
 		 * waiter was seen in emptied under the mark, so the
 		 * cut did not happen and the requeue slice rung is the
-		 * task's own again.
+		 * task's own again. A yield mark set moments before is
+		 * consumed too: the queues emptied under the yield, so
+		 * there was nothing to yield to, and the mark must not
+		 * survive into an unrelated enqueue.
 		 */
-		if (tctx)
+		if (tctx) {
 			tctx->tick_preempted = false;
+			tctx->yield_pending = false;
+		}
 		scx_bpf_task_set_slice(prev,
 				       tctx ? task_slice(tctx) : deadline_ns);
 	} else {
@@ -997,6 +1013,14 @@ void BPF_STRUCT_OPS(baby_stopping, struct task_struct *p, bool runnable)
 	 */
 	tctx->arrival_is_wake = 0;
 
+	/*
+	 * A task that sleeps with an unconsumed yield mark would fire
+	 * the push at its wake; a wake is a fresh arrival and keeps its
+	 * sleep-time deadline, so drop the mark with the task.
+	 */
+	if (!runnable)
+		tctx->yield_pending = false;
+
 	update_bursts(tctx, now);
 
 	class_boost_on_sleep(p, tctx, runnable, now);
@@ -1076,6 +1100,11 @@ void BPF_STRUCT_OPS(baby_running, struct task_struct *p)
  * sched_yield(): give up the CPU for the rest of this round, like the
  * original YIELD_MARK. With nothing else queued there is nothing to yield
  * to.
+ *
+ * With ops.yield defined the kernel leaves the slice alone
+ * (yield_task_scx), so give it up here: only then does the task stop
+ * running and re-enter through ops.enqueue(), where the mark is
+ * consumed.
  */
 bool BPF_STRUCT_OPS(baby_yield, struct task_struct *p)
 {
@@ -1090,6 +1119,7 @@ bool BPF_STRUCT_OPS(baby_yield, struct task_struct *p)
 		return false;
 
 	tctx->yield_pending = true;
+	scx_bpf_task_set_slice(p, 0);
 
 	return true;
 }
