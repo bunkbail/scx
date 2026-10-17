@@ -187,7 +187,7 @@ impl WaitCls {
         let mut other_slow = Vec::with_capacity(4);
         for b in 0..4 {
             fg_slow.push(a_slow[2 * 4 + b] + a_slow[3 * 4 + b]);
-            other_slow.push(a_slow[0 * 4 + b] + a_slow[1 * 4 + b]);
+            other_slow.push(a_slow[b] + a_slow[4 + b]);
         }
         WaitCls {
             fg_b0: a_n[2 * 4] + a_n[3 * 4],
