@@ -56,24 +56,34 @@ const SCHEDULER_NAME: &str = "scx_baby";
     name = "scx_baby",
     version,
     disable_version_flag = true,
-    about = "A sched_ext port of the Baby CPU Scheduler (deadline variant).",
+    about = "An earliest-deadline-first sched_ext scheduler with warm seats and hybrid-tier compaction.",
     long_about = r#"
-scx_baby is a port of the Baby Scheduler deadline variant (baby-dl) by
-Hamad Al Marri to sched_ext.
-
 Every runnable task owns a deadline, an absolute timestamp by which it
-would like to run. The CPU always runs the task with the earliest
-deadline: tasks are inserted into a global deadline-ordered queue and
-dispatched earliest-deadline-first.
+would like to run, and each CPU serves the earliest deadline it can
+reach: waking tasks go straight onto idle cores, and once the machine
+is oversubscribed they park in the warm seat on the CPU they last ran
+on, behind the task holding it.
 
-Tasks that voluntarily sleep before consuming their deadline are treated
-as interactive: their effective nice level is boosted by one step (down
-to -20), which pulls their future deadlines earlier.
+Four measured classes - latency-critical, interactive, foreground and
+heavy, classified from burst history and wake frequency - set the
+slice lengths and decide who may preempt whom. A latency-critical
+waiter cuts a saturated CPU's holding slice short at the tick, and on
+hybrid platforms light work compacts onto the little cores while
+heavy tasks hold the big ones.
+
+Tasks that voluntarily sleep before consuming their deadline are
+treated as interactive: their effective nice level is boosted by one
+step (down to -20), which pulls their future deadlines earlier.
 
 CPU hogs are throttled by a burst tracker that accounts the runtime a
 task accumulates over a 200ms window: a task whose bursts keep growing
 behind the previous window cannot preempt other tasks even when its
 deadline is earlier.
+
+The deadline scheme, the burst throttle and the sleep-before-deadline
+boost descend from Hamad Al Marri's Baby CPU Scheduler, deadline
+variant (baby-dl); the queue topology, warm seats, classes and
+placement are original to this scheduler.
 "#
 )]
 struct Opts {
