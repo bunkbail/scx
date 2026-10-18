@@ -134,11 +134,11 @@ __hidden bool balance_try_warm_seat(struct task_struct *p, struct task_ctx *tctx
 			 * task will rotate anyway and every extra
 			 * rotation costs a full switch, so grant four
 			 * times the slice (e13c, docs/adr/0006). The
-			 * rung is bulk-only: a lat-cri task rotates in
-			 * its own lane, ahead of the bulk heads, and a
-			 * long un-preemptible lat-cri quantum holds a
-			 * CPU hostage (task_slice() keeps the class at
-			 * the base quantum).
+			 * rung is bulk-only: foreground lat-cri tasks
+			 * already earn the fourfold slice from
+			 * task_slice(), and the M1.3a arm keeps the
+			 * non-foreground lat-cri blips at the base
+			 * quantum - the exact M1.0 slice policy.
 			 */
 			u64 slice = (!lat && (backlog_deep(backlog) ||
 					      bulk_nr >= 2 ||

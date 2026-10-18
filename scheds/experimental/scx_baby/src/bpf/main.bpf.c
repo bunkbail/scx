@@ -568,13 +568,12 @@ void BPF_STRUCT_OPS(baby_enqueue, struct task_struct *p, u64 enq_flags)
 	/*
 	 * Nothing idle anywhere: take a place in the deadline order.
 	 * On an oversubscribed machine hand out longer slices to the
-	 * bulk classes, since the task will rotate anyway and every
-	 * extra rotation costs a full switch (the e13c rung). The
-	 * latency-critical class takes the Fast-Lane node queue, where
-	 * dispatch serves it ahead of the bulk heads under the quota;
-	 * it keeps the base quantum (task_slice()), because a long
-	 * lat-cri quantum is one the tick gate and the wake-preempt
-	 * both refuse to cut.
+	 * bulk classes (the e13c rung); the M1.3a arm keeps the exact
+	 * M1.0 slice policy - foreground lat-cri tasks earn the
+	 * fourfold slice from task_slice(), the non-foreground rest
+	 * stay at the base quantum. The latency-critical class takes
+	 * the Fast-Lane node queue, where dispatch serves it ahead of
+	 * the bulk heads under the quota.
 	 */
 	{
 		s32 node = __COMPAT_scx_bpf_cpu_node(prev_cpu);

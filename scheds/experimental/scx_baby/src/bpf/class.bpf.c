@@ -184,18 +184,16 @@ __hidden bool is_foreground(const struct task_ctx *tctx)
 }
 
 /*
- * Per-class base slice. A latency-critical task always runs the base
- * quantum: in the dual-lane topology a longer slice buys it nothing its
- * lane order does not already give, and a resident the tick gate and
- * the wake-preempt both refuse to cut would hold the CPU for the whole
- * of it - the M1.1 game-cell lesson (a 4.72ms un-preemptible blocker,
- * p99 frame 4.98ms). The foreground fourfold slice is a bulk-class
- * privilege.
+ * Foreground tasks get a longer slice: their requests are memory-bound
+ * and interleaving them with hog slices on a busy core multiplies the
+ * wall time of each request. Note the class relation: every foreground
+ * task is also latency-critical (the wake-rate bars are the same and
+ * foreground only adds the runtime floor), so a latency-critical gate
+ * above the foreground test here would make the fourfold slice dead
+ * code for the whole scheduler - the M1.2 lesson (d0 rot 5.7x).
  */
 __hidden u64 task_slice(const struct task_ctx *tctx)
 {
-	if (is_lat_cri(tctx))
-		return deadline_ns;
 	return is_foreground(tctx) ? 4 * deadline_ns : deadline_ns;
 }
 
