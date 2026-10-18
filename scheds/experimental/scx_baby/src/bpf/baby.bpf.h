@@ -17,29 +17,23 @@
 #include "intf.h"
 
 /*
- * The tasks wait in one deadline-ordered queue per NUMA node, mirroring
- * the original global run list. The DSQ id is the node id; on a
- * single-node machine there is exactly one queue. There is nothing to
- * steal: an idle CPU pulls the earliest-deadline task, so the queue
- * order IS the placement.
+ * Tasks wait in one deadline-ordered queue per NUMA node, mirroring the
+ * original global run list. The DSQ id is the node id; a single-node
+ * machine has one queue. An idle CPU pulls the earliest-deadline task,
+ * so queue order is the placement.
  *
- * Each CPU also owns a small warm queue, deadline-ordered like the
- * node one, that holds tasks continuing on that CPU (see the warm
- * seat in ops.enqueue). The warm queues are bounded - a deeper
- * backlog overflows into the node queue, where every idle CPU can
- * reach it - so they carry cache locality without becoming homes.
- *
- * The warm queues take the DSQ ids starting at BABY_CPU_DSQ_BASE
- * (intf.h, shared with userspace, which refuses to load a topology
- * with more nodes than that).
+ * Each CPU also owns a small warm queue, deadline-ordered like the node
+ * queue, for tasks continuing on that CPU (see the warm seat in
+ * balance.bpf.c). The warm queues take the DSQ ids starting at
+ * BABY_CPU_DSQ_BASE (intf.h, shared with userspace, which refuses a
+ * topology with more nodes than that).
  *
  * The latency-critical class runs on its own pair of queues with the
- * same layout one id space over (the fast lane): a per-node queue
- * from BABY_FL_NODE_DSQ_BASE and per-CPU warm seats from
- * BABY_FL_CPU_DSQ_BASE. Keeping the class out of the bulk seats is
- * what lets the depth-0 wake preempt fire past an occupied bulk seat
- * instead of missing it, and a per-CPU dispatch quota bounds what the
- * fast lane can take from a contended CPU.
+ * same layout one id space over (the fast lane): a per-node queue from
+ * BABY_FL_NODE_DSQ_BASE and per-CPU seats from BABY_FL_CPU_DSQ_BASE.
+ * Keeping the class out of the bulk seats lets the wake-path preempt
+ * fire past an occupied bulk seat, and a per-CPU dispatch quota bounds
+ * what the fast lane can take from a contended CPU.
  */
 
 extern u64 nr_cpu_ids;
@@ -80,7 +74,7 @@ static __always_inline u64 fl_node2dsq(s32 node)
  */
 extern const volatile u64 deadline_ns;
 
- /* Report additional debugging information */
+/* Report additional debugging information. */
 extern const volatile bool debug;
 
 /*
@@ -120,9 +114,9 @@ extern u64 nr_little_cpus, nr_big_cpus;
 /*
  * Per-CPU running-class residency, stamped in ops.running() and cleared
  * in ops.stopping(). Queue depth cannot answer whether a CPU runs a
- * tick-cuttable bulk resident: spinners never queue (game2 oc2 reads
- * bulk_total == 0 at the 1x wall), so the M4 relocation filter and the
- * per-lane warm gate read this instead.
+ * tick-cuttable bulk resident: CPU-bound workers never queue, so bulk
+ * depth can read zero while bulk residency is total. The warm gate and
+ * the relocation filter read this instead.
  */
 extern bool cpu_is_lat[BABY_MAX_CPUS];
 
@@ -182,10 +176,9 @@ extern volatile u64 nr_wait_type_slow[BABY_WDEPTH_NR * BABY_WTYPE_NR];
 
 /*
  * The same charge, split by wake-rate latency-criticality (2 * 4
- * entries, lcri-major: lcri * BABY_WDEPTH_NR + depth). Latency-critical
- * waits are the schbench-2x question: whether the wakees the tick gate
- * serves actually wait, at what depth, and how long - or whether they
- * are served at depth 0 and the gap lives elsewhere.
+ * entries, lcri-major: lcri * BABY_WDEPTH_NR + depth). It answers
+ * whether latency-critical wakees actually wait, at what depth, and
+ * for how long, or whether they are served at depth 0.
  */
 extern volatile u64 nr_wait_lcri_n[BABY_WDEPTH_NR * 2];
 extern volatile u64 nr_wait_lcri_ns[BABY_WDEPTH_NR * 2];
@@ -219,27 +212,23 @@ extern volatile u64 nr_wait_wg_max[BABY_WDEPTH_NR * BABY_WG_NR];
 extern volatile u64 nr_wait_wg_slow[BABY_WDEPTH_NR * BABY_WG_NR];
 
 /*
- * Saturation deferred-preemption instrument: the victims ops.tick() cut
- * short because a latency-critical task waited at a queue head, split
- * by where the waiter sat - the shared deadline queue or the CPU's own
- * warm seat.
+ * Saturation preemption instrument: the victims ops.tick() cut short
+ * because a latency-critical task waited at a queue head, split by
+ * where the waiter sat (the shared queue or the CPU's own seat).
  */
 extern volatile u64 nr_tick_preempts, nr_tick_preempts_warm;
 
 /*
- * Fast-Lane services under bulk pressure: the dispatches
- * ops.dispatch() served out of the fast lane while the CPU's bulk
- * queue held waiting work, each one spending a unit of the CPU's
- * fast-lane quota, split by which queue held them - the fast-lane
- * node queue or the CPU's own fast-lane warm seat.
+ * Fast-lane services under bulk pressure: dispatches that served the
+ * fast lane while the CPU's bulk queue held waiting work, each spending
+ * a quota unit, split by which fast-lane queue held the task.
  */
 extern volatile u64 nr_depth1_pulls, nr_depth1_pulls_seat;
 
 /*
- * Depth-0 wake-path preempts (the IPI-fast twin of the tick gate): the
- * lat-cri wakees ops.select_cpu() handed a busy CPU to - preempting the
- * running non-lat-cri victim at wake time instead of waiting for the
- * tick gate's next cut window.
+ * Wake-path preempts: latency-critical wakees handed a busy CPU at wake
+ * time, preempting a non-latency-critical victim instead of waiting for
+ * the tick.
  */
 extern volatile u64 nr_wake_preempts;
 
@@ -302,15 +291,14 @@ struct task_ctx {
 	u64 last_woke_at;
 
 	/*
-	 * Peak hold of wakeup_freq: renewed whenever the EWMA reaches
-	 * it, and decaying by 1/64 per wake only while above 64, since
-	 * a shift of a value below 64 is zero. The hold therefore falls
-	 * from a spike to 63 and stays there - and 63 sits far above
-	 * every class bar (10), so the wake-rate classes are a latch:
-	 * once earned, kept for the task's lifetime, by design. A real
-	 * decay would strip the class from a frame-paced game thread the
-	 * moment CPU overcommit throttles its frame rate, which is the
-	 * one state the credit exists for.
+	 * Peak hold of wakeup_freq: renewed whenever the EWMA reaches it,
+	 * and decaying by 1/64 per wake only while above 64 (a shift of a
+	 * value below 64 is zero). The hold therefore falls from a spike
+	 * to 63 and stays there; 63 is far above every class bar (10), so
+	 * the wake-rate classes latch once earned, by design. A real decay
+	 * would strip the class from a frame-paced thread the moment
+	 * overcommit throttles its frame rate, which is the state the
+	 * credit exists for.
 	 */
 	u32 peak_freq;
 

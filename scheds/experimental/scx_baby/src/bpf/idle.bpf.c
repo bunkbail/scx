@@ -5,9 +5,7 @@
  * Copyright (C) 2026 bunkbail <nabildanial.93@gmail.com>
  *
  * Idle-CPU acquisition. Placement is delegated to the kernel's idle-CPU
- * selection: SMT-aware, biased to the previous CPU, spread across the
- * LLCs - the cache warmth the per-CPU queues used to pin comes from
- * the kernel's own sense of the topology.
+ * selection: SMT-aware, previous-CPU biased and spread across LLCs.
  */
 #include "baby.bpf.h"
 
@@ -64,9 +62,8 @@ __hidden bool try_direct_dispatch(struct task_struct *p, struct task_ctx *tctx,
 		return false;
 
 	/*
-	 * Migrate only to a confirmed idle CPU: a task pushed onto a
-	 * busy core would wait behind whatever runs there, which is
-	 * exactly the stranding the per-CPU queues used to create.
+	 * Migrate only to a confirmed idle CPU: a task pushed onto a busy
+	 * core would wait behind whatever runs there.
 	 */
 	if (!is_pcpu_task(p)) {
 		cpu = pick_idle_cpu(p, prev_cpu, 0, &is_idle);

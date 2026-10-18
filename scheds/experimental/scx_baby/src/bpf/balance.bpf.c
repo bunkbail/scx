@@ -4,40 +4,32 @@
  *
  * Copyright (C) 2026 bunkbail <nabildanial.93@gmail.com>
  *
- * The warm-seat balance under oversubscription: the sum-gate
- * discriminator, the shallowest-nearest seat scan and the slice the
- * rotation grants. Returns whether the task was seated, so the caller
- * can fall through to direct dispatch and the shared queue otherwise.
+ * The warm-seat balance under oversubscription: the sum gate, the
+ * shallowest-nearest seat scan and the slice an arrival receives.
+ * Returns true when the task was seated, so the caller can fall through
+ * to direct dispatch and the shared queue otherwise.
  */
 #include "baby.bpf.h"
 
 /*
- * Warm seat, gated on oversubscription. On a machine with more
- * runnable work than CPUs, a task that has nowhere to run right
- * now waits on the CPU it last ran on, right behind whatever
- * runs there: its cache and TLB are still warm, and the CPU
- * serves it at its next slice end. The shared queue would pull
- * it to whichever CPU expires first, which is how a machine at
- * oversubscription turns every rotation into a cold migration -
- * the medium rig loses 11% to that and pure flash, with no warm
- * path at all, loses 14%.
+ * Warm seat, gated on oversubscription. When runnable work exceeds the
+ * CPU count, an arrival waits on the CPU it last ran on, behind
+ * whatever runs there: its cache and TLB are still warm, and the CPU
+ * serves it at its next slice end. Pulling it to whichever CPU expires
+ * first turns every rotation into a cold migration.
  *
- * At the wall the seat is poison: with every lane holding one
- * task, the seat freezes whatever lane skew exists - overloaded
- * lanes rotate internally while the lanes whose task blocked
- * starve, and the instrumentation shows the argon2 run then
- * burns its wall clock at 68% utilization where the cold path
- * holds 97%. The discriminator is the machine's outstanding
- * runnable work - running lanes plus everything queued, shared
- * or warm. It is conserved across the running-to-queued
- * transitions that race a bare nr_running gate (the E5 lesson:
- * workers block between chunks and the counter dips), and it
- * reads 12-13 at the wall against 14+ under oversubscription.
- * One lane of margin keeps the wall's transient two-deep queue
- * from flipping the mode back.
+ * At full saturation the seat is harmful: with every CPU holding one
+ * task, it freezes lane skew. Overloaded lanes rotate internally while
+ * CPUs whose task blocked starve. The discriminator is the machine's
+ * outstanding runnable work: running lanes plus everything queued,
+ * shared or warm. The sum is conserved across the running-to-queued
+ * transitions that race a bare nr_running gate, because a worker can
+ * block between chunks and make nr_running dip. One lane of margin
+ * keeps a transient two-deep queue at saturation from flipping the
+ * mode back.
  *
- * Returns true when the task was seated on a warm queue; false
- * leaves the enqueue to the direct dispatch and the shared queue.
+ * Returns true when the task was seated on a warm queue; false leaves
+ * the enqueue to the direct dispatch and the shared queue.
  */
 __hidden bool balance_try_warm_seat(struct task_struct *p, struct task_ctx *tctx,
 			   u64 enq_flags, u64 backlog, u64 now)
@@ -94,43 +86,39 @@ __hidden bool balance_try_warm_seat(struct task_struct *p, struct task_ctx *tctx
 		}
 
 		/*
-		 * Per-lane oversubscription. One gate summing
-		 * bulk_running (inside nr_running) with fast-lane backlog
-		 * seats game wakes warm whenever bulk sits at its 1x
-		 * wall and the frame threads burst - 12.6pp of game2
-		 * (the M1.6 law). The bulk clause is the single-lane
-		 * gate: queue depth plus the task's own seat. The lat
-		 * clause opens warm seats only when the lat lane
-		 * itself is oversubscribed (the ab5600 swarm, whose
-		 * bulk lane is empty).
+		 * Per-lane oversubscription. The bulk clause is the
+		 * single-lane gate: running lanes, shared backlog and bulk
+		 * seats, plus a latency-critical arrival's own seat depth.
+		 * The fast-lane clause opens seats when the fast lane
+		 * itself is oversubscribed: latency-critical residents,
+		 * shared backlog and fast-lane seats. A single summed gate
+		 * cannot serve both cases: counting fast-lane backlog
+		 * against bulk saturation seats wakes warm when they should
+		 * not be, and counting bulk residency against a
+		 * fast-lane-only workload closes the seats.
 		 */
 		if (nr_running + backlog + b_warm + (lat ? target_nr : 0) >
 			    nr_cpu_ids + 1 ||
 		    lat_running + backlog + q_warm > nr_cpu_ids + 1) {
 			/*
-			 * A waking lat-cri task whose prev_cpu is running
-			 * another lat-cri task (BABY_WG_M4_VICTIM_LAT) gets
-			 * an effective depth of two and relocates to the
-			 * nearest CPU whose fast-lane seat is shallow AND whose
-			 * resident is cuttable bulk: for shallow seats the
-			 * scan skips lat-resident CPUs, since a relocation
-			 * onto an un-cuttable lat resident is a pure
-			 * migration (the M1.6a lesson, which cost 2x its
-			 * p99.9). A pure lat swarm filters out every CPU,
-			 * so M4 stays off there.
+			 * A waking latency-critical task whose previous
+			 * CPU runs another latency-critical task gets an
+			 * effective depth of two and relocates to the
+			 * nearest CPU with a shallow fast-lane seat and a
+			 * cuttable bulk resident. For shallow seats the
+			 * scan skips latency-critical residents, since
+			 * relocating onto one is a pure migration. A pure
+			 * latency-critical swarm filters out every CPU, so
+			 * no relocation happens there.
 			 */
 			u64 eff_nr = target_nr + (vlat ? 2 : 0);
 			/*
-			 * The depth rung is bulk-only: a slice above
-			 * task_slice() must exclude the lat lane, because a
-			 * non-foreground lat-cri arrival granted 4x becomes a
-			 * 4.72ms fast-lane resident that neither the tick gate, the
-			 * wake-preempt gates nor a seat relocation can cut -
-			 * and game threads stack two-deep on exactly those
-			 * seats (the M1.1/M1.4 lesson). Foreground tasks earn
-			 * the fourfold slice from task_slice() itself, so the
-			 * exclusion is a no-op wherever every lat-cri task is
-			 * foreground (ab5600 med/sat).
+			 * The depth rung is bulk-only: a non-foreground
+			 * latency-critical arrival granted four slices
+			 * becomes a long fast-lane resident that neither
+			 * the tick gate, the wake-path preempt nor a seat
+			 * relocation can cut. Foreground tasks get the
+			 * fourfold slice from task_slice() anyway.
 			 */
 			u64 slice = (!lat && (backlog_deep(backlog) ||
 					      target_nr >= 2)) ?
@@ -161,9 +149,9 @@ __hidden bool balance_try_warm_seat(struct task_struct *p, struct task_ctx *tctx
 
 		/*
 		 * Not oversubscribed: leave the seat open and let the
-		 * cold path run - a requeue re-scans for an idle lane
-		 * before joining the shared queue, which is what keeps
-		 * the wall's load distribution flowing.
+		 * cold path run. A requeue re-scans for an idle lane
+		 * before joining the shared queue, which keeps the load
+		 * distribution flowing at saturation.
 		 */
 		__sync_fetch_and_add(&nr_coldspreads, 1);
 	}

@@ -32,25 +32,22 @@ __attribute__((aligned(64))) volatile u64 nr_direct_dispatches,
 	nr_warmseats, nr_coldspreads;
 
 /*
- * Saturation deferred-preemption instrument: the victims ops.tick() cut
- * short because a latency-critical task waited at a queue head, split
- * by where the waiter sat - the shared deadline queue or the CPU's own
- * warm seat.
+ * Saturation preemption instrument: victims ops.tick() cut short
+ * because a latency-critical task waited at a queue head, split by
+ * where the waiter sat.
  */
 volatile u64 nr_tick_preempts, nr_tick_preempts_warm;
 
 /*
- * Fast-Lane services under bulk pressure: the dispatches served out
- * of the fast lane while the CPU's bulk queue held waiting work (one
- * quota unit each), split by which queue held them - the fast-lane
- * node queue or the CPU's own fast-lane warm seat (where the wake
- * arrivals park).
+ * Fast-lane services under bulk pressure: dispatches that served the
+ * fast lane while the bulk queue held waiting work, split by queue.
  */
 volatile u64 nr_depth1_pulls, nr_depth1_pulls_seat;
 
 /*
- * Depth-0 wake-path preempts: lat-cri wakees handed a busy CPU at
- * ops.select_cpu() - the IPI-fast twin of the tick gate.
+ * Wake-path preempts: latency-critical wakees handed a busy CPU at wake
+ * time, preempting a non-latency-critical victim instead of waiting for
+ * the tick.
  */
 volatile u64 nr_wake_preempts;
 
@@ -67,12 +64,11 @@ volatile u64 nr_seat_move[BABY_DIST_NR];
 volatile u64 nr_pull_land[BABY_DIST_NR];
 
 /*
- * Wait-at-depth instrument. When an enqueue parks a task in a warm
- * seat or the shared queue, it stamps the arrival time and the depth
- * the task will wait behind (0, 1, 2, 3+). ops.running() charges the
- * realized wait to that bucket. The overcommit tail can then be
- * attributed to the depth it waited at: waits behind nothing (depth
- * 0) point at consumption, waits at depth point at rotation cost.
+ * Wait-at-depth instrument. An enqueue that parks a task in a seat or
+ * the shared queue stamps the arrival time and the depth it waits
+ * behind (0, 1, 2, 3+). ops.running() charges the realized wait to that
+ * bucket, so a tail can be attributed to consumption (depth 0) or
+ * rotation cost.
  */
 volatile u64 nr_wait_n[BABY_WDEPTH_NR];
 volatile u64 nr_wait_ns[BABY_WDEPTH_NR];
@@ -83,13 +79,11 @@ volatile u64 nr_arr_seat, nr_arr_shared;
 #define BABY_WAIT_SLOW_NS	(5ULL * NSEC_PER_MSEC)
 
 /*
- * The same charge, split by class. Each stamped task carries two
- * class bits, derived in ops.runnable() where the burst and
- * wake-frequency EWMAs they read are fresh: bit 0 interactive, bit 1
- * foreground. ops.running() files the wait into class-major 4x4
- * arrays, entry class * BABY_WDEPTH_NR + depth, so the overcommit
- * wait can be attributed to the classes a deadline-ordering change
- * would prioritize.
+ * The same charge, split by class. Each stamped task carries two class
+ * bits from ops.runnable(), where the burst and wake-frequency EWMAs
+ * are fresh: bit 0 interactive, bit 1 foreground. ops.running() files
+ * the wait into class-major 4x4 arrays, entry class * BABY_WDEPTH_NR +
+ * depth.
  */
 volatile u64 nr_wait_cls_n[BABY_WDEPTH_NR * BABY_WCLS_NR];
 volatile u64 nr_wait_cls_ns[BABY_WDEPTH_NR * BABY_WCLS_NR];
@@ -97,14 +91,11 @@ volatile u64 nr_wait_cls_max[BABY_WDEPTH_NR * BABY_WCLS_NR];
 volatile u64 nr_wait_cls_slow[BABY_WDEPTH_NR * BABY_WCLS_NR];
 
 /*
- * The same charge, split by arrival type. Type 1 is a wake handoff:
- * the arrival became runnable with SCX_ENQ_WAKEUP (ops.runnable()
+ * The same charge, split by arrival type. Type 1 is a wake handoff, an
+ * arrival that became runnable with SCX_ENQ_WAKEUP (ops.runnable()
  * stamps the bit, ops.stopping() clears it). The complement is the
- * rotation - slice-expiry and preemption requeues, which re-enter
- * without a runnable transition. The split prices the handoff the
- * overcommit tail is blamed on separately from the rotation that
- * dominates the charge counts. Type-major: type * BABY_WDEPTH_NR +
- * depth.
+ * rotation: slice-expiry and preemption requeues. Type-major: type *
+ * BABY_WDEPTH_NR + depth.
  */
 volatile u64 nr_wait_type_n[BABY_WDEPTH_NR * BABY_WTYPE_NR];
 volatile u64 nr_wait_type_ns[BABY_WDEPTH_NR * BABY_WTYPE_NR];

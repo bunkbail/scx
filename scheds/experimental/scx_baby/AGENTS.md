@@ -51,7 +51,7 @@ adr/); read an ADR when touching the module it is attached to below.
   entries as static, so the verifier inlines them at load. A plain
   global function instead faces the kernel's global-function ABI
   checks, which reject pointer returns and mis-verify trusted
-  task_struct arguments (observed on the 5600X's 7.2.9 kernel).
+  task_struct arguments (observed on a 7.2.9 kernel).
   Defense in depth on top: the BPF calling convention passes arguments
   in R1-R5, so a cross-module call still takes at most 5 arguments;
   pack wider state into a context struct instead.
@@ -60,6 +60,26 @@ adr/); read an ADR when touching the module it is attached to below.
 - intf.h is the bindgen-facing header (src/bpf_intf.rs is generated from
   it). Keep scheduler logic out of it; it stays limited to types and
   constants shared with src/main.rs, such as core_arg.
+
+## Source comments and the README
+
+Both are read by developers who do not have this project's benchmark
+history. Keep them upstream-facing:
+
+- Explain the mechanism and the constraint. Do not narrate the
+  development history, benchmark campaigns or measurement verdicts.
+  Those belong in docs/adr/ and the benchmark notes under docs/.
+- Do not name test machines, rigs or benchmark cells (the laptop, the
+  5600X, Arrow Lake, ab5600, game2, oc2). Name the workload property
+  instead: "a hybrid machine", "a saturated CPU", "a latency-critical
+  wake".
+- Do not use milestone labels such as M1.x, M4 or e13c. State the
+  technical reason, or point at docs/adr/NNNN.
+- Long comments are reserved for verifier constraints, kernel
+  semantics, and ordering or lifetime invariants. Everything else
+  should fit in a few lines.
+- The tested-hardware sentence under "Production Ready?" in the README
+  is the one place where real machine names are allowed.
 
 ## Build constraints
 

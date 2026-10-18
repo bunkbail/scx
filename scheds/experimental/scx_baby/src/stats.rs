@@ -127,9 +127,7 @@ impl WaitB {
 /// The wait-at-depth charge split by class (16 entries, class-major:
 /// class * 4 + depth). Class 0 is neither interactive nor foreground,
 /// 1 is interactive-only, 2 is foreground-only, 3 is both. `other`
-/// sums classes 0 and 1; `urgent` sums classes 2 and 3 - the
-/// foreground side, the classes a deadline-ordering change would
-/// prioritize.
+/// sums classes 0 and 1; `fg` sums classes 2 and 3.
 #[stat_doc]
 #[derive(Clone, Debug, Default, Serialize, Deserialize, Stats)]
 #[stat(top)]
@@ -407,9 +405,8 @@ impl WaitType {
 /// The wait-at-depth charge split by wake-rate latency-criticality
 /// (8 entries, lcri-major: lcri * 4 + depth). `lat` is a task the
 /// is_lat_cri() predicate (wake samples + peak frequency) holds at
-/// charge time; `other` is everything else. This is the schbench-2x
-/// question: whether the wakees the tick gate serves actually wait,
-/// at what depth, and for how long.
+/// charge time; `other` is everything else. It shows whether the wakees
+/// the tick gate serves actually wait, at what depth, and for how long.
 #[stat_doc]
 #[derive(Clone, Debug, Default, Serialize, Deserialize, Stats)]
 #[stat(top)]
@@ -538,8 +535,6 @@ impl WaitGateMiss {
 
 /// Where the queues stood when a lane came to pick work, sampled in
 /// ops.dispatch(): the seat depth is what its warm queue holds at the
-/// pick, the shared backlog the rotation it turns against. Eight
-/// buckets, the last one 7 or deeper.
 /// pick, the shared backlog the rotation it turns against. Eight
 /// buckets, the last one 7 or deeper.
 #[stat_doc]

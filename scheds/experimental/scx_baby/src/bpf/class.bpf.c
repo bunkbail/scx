@@ -137,10 +137,10 @@ __hidden bool can_resched(const struct task_ctx *tctx)
  * A task is interactive when it used little CPU in its previous burst
  * window and has run long enough to complete one. Interactive and
  * foreground tasks are the eligible wakers for wakeup preemption; the
- * class bit is also stamped into the wait instrument. The boost
- * counter feeds the deadline, not the placement: on a desktop almost
- * every task sleeps early often enough to earn boost, so it is
- * useless for telling latency-sensitive tasks apart from hogs.
+ * class bit is also stamped into the wait instrument. The boost counter
+ * feeds the deadline, not the placement: almost every desktop task
+ * sleeps early often enough to earn boost, so it cannot separate
+ * latency-sensitive tasks from hogs.
  */
 __hidden bool is_interactive(const struct task_ctx *tctx)
 {
@@ -151,13 +151,11 @@ __hidden bool is_interactive(const struct task_ctx *tctx)
 /*
  * A task is a proven CPU consumer once its recent burst accounting
  * holds more than a quarter of the period across the current and the
- * previous window. The accounting covers both windows so that a task
- * sharing a contended little core - and rolling windows with a fraction
- * of the core each - does not lose the status it has earned. On a
- * hybrid platform a proven consumer with no wake history pins a big
- * core while the wake path packs everything else onto the little tier
- * (docs/adr/0012); on a single-tier machine the sets are empty and the
- * predicate only shades the preemption and frequency decisions.
+ * previous window. Covering both windows keeps the status on a task
+ * that shares a contended core and rolls windows with a fraction of
+ * the core each. On a hybrid platform a proven consumer with no wake
+ * history pins a big core; on a single-tier machine the tier sets are
+ * empty and the predicate only shades preemption and frequency.
  */
 __hidden bool is_heavy_proven(const struct task_ctx *tctx)
 {
@@ -165,14 +163,13 @@ __hidden bool is_heavy_proven(const struct task_ctx *tctx)
 }
 
 /*
- * A task is foreground when it wakes frequently and does real work:
- * a browser renderer or an audio thread wakes dozens of times per
- * window with sizable bursts, a CPU hog never wakes, and a UI blip
- * barely uses the CPU. Foreground earns the fourfold slice, waker
- * eligibility, and precedence over the heavy pin in the compaction:
- * light workers cross the heavy bar with their mutex spins, and they
- * must keep the little-tier packing rather than spread onto the big
- * cores (docs/adr/0012).
+ * A task is foreground when it wakes frequently and does real work: a
+ * browser renderer or an audio thread wakes dozens of times per window
+ * with sizable bursts, a CPU hog never wakes, and a UI blip barely uses
+ * the CPU. Foreground earns the fourfold slice, waker eligibility and
+ * precedence over the heavy pin in the compaction, so light workers
+ * that cross the heavy bar with their mutex spins keep the little-tier
+ * packing.
  */
 #define FOREGROUND_WAKE_FREQ	10
 
@@ -184,13 +181,12 @@ __hidden bool is_foreground(const struct task_ctx *tctx)
 }
 
 /*
- * Foreground tasks get a longer slice: their requests are memory-bound
+ * Foreground tasks get a longer slice: their requests are memory-bound,
  * and interleaving them with hog slices on a busy core multiplies the
- * wall time of each request. Note the class relation: every foreground
- * task is also latency-critical (the wake-rate bars are the same and
- * foreground only adds the runtime floor), so a latency-critical gate
- * above the foreground test here would make the fourfold slice dead
- * code for the whole scheduler - the M1.2 lesson (d0 rot 5.7x).
+ * wall time of each request. Every foreground task is also
+ * latency-critical (the wake-rate bars are the same; foreground only
+ * adds the runtime floor), so a latency-critical check above the
+ * foreground test would make the fourfold slice dead code.
  */
 __hidden u64 task_slice(const struct task_ctx *tctx)
 {
@@ -202,13 +198,11 @@ __hidden u64 task_slice(const struct task_ctx *tctx)
  * it, whatever its burst size: game render threads, compositors and
  * submission workers wake per frame or per request, and under CPU
  * overcommit a game thread is heavy_proven too, so no burst bound can
- * gate this. Unlike is_foreground() there is no runtime floor either:
- * a task that wakes often but consumes almost nothing still has
-	 * latency to protect. Wake-rate only: the foreground bit owns too
-	 * small a share of the overcommit wait to gate
-	 * anything on, and a task that never leaves runnable state (preempted,
-	 * slice-expired) never re-runs this EWMA, so a preempted batch victim
-	 * cannot pass as a waker here.
+ * gate this. Unlike is_foreground() there is no runtime floor: a task
+ * that wakes often but consumes almost nothing still has latency to
+ * protect. A task that never leaves runnable state (preempted,
+ * slice-expired) never re-runs this EWMA, so a preempted batch victim
+ * cannot pass as a waker.
  */
 __hidden bool is_lat_cri(const struct task_ctx *tctx)
 {
@@ -285,14 +279,12 @@ __hidden void class_boost_on_sleep(struct task_struct *p, struct task_ctx *tctx,
 }
 
 /*
- * task_fork_fair(): start the task with a fresh deadline and an
- * empty burst history - except for a quarter of its parent's
- * recent runtime. The child of a busy task is likely busy too (a
- * compiler, a benchmark worker), and without credit it would
- * spend its first moments on a little core before the up-ramp
- * notices. Children of light tasks inherit almost nothing and
- * keep the compaction. This also covers the tasks that exist at
- * attach: their parents have no context yet and seed nothing.
+ * task_fork_fair(): start the task with a fresh deadline and an empty
+ * burst history, except for a quarter of its parent's recent runtime.
+ * The child of a busy task is likely busy too (a compiler, a build
+ * worker), and without credit it would spend its first moments on a
+ * little core. Children of light tasks inherit almost nothing. Tasks
+ * that exist at attach have no parent context and seed nothing.
  */
 __hidden void class_init_task(struct task_ctx *tctx, struct task_struct *p, u64 now)
 {

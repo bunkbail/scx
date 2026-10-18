@@ -65,12 +65,12 @@ reach: waking tasks go straight onto idle cores, and once the machine
 is oversubscribed they park in the warm seat on the CPU they last ran
 on, behind the task holding it.
 
-Four measured classes - latency-critical, interactive, foreground and
-heavy, classified from burst history and wake frequency - set the
-slice lengths and decide who may preempt whom. A latency-critical
-waiter cuts a saturated CPU's holding slice short at the tick, and on
-hybrid platforms light work compacts onto the little cores while
-heavy tasks hold the big ones.
+Four classes - latency-critical, interactive, foreground and heavy,
+classified from burst history and wake frequency - set the slice
+lengths and decide who may preempt whom. A latency-critical waiter cuts
+a saturated CPU's holding slice short at the tick, and on hybrid
+platforms light work compacts onto the little cores while heavy tasks
+hold the big ones.
 
 Tasks that voluntarily sleep before consuming their deadline are
 treated as interactive: their effective nice level is boosted by one

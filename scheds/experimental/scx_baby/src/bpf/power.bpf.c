@@ -125,8 +125,8 @@ static void update_cpuperf(struct cpu_ctx *cctx, s32 cpu, u64 now, bool max_floo
 
 	/*
 	 * Request the level only when it changed. Beyond saving the
-	 * write, the suppression is what keeps the platform's iowait
-	 * boost latched: see the comment on perf_req.
+	 * write, the suppression keeps the platform's iowait boost
+	 * latched; see the comment on perf_req.
 	 */
 	if (cctx->perf_req != perf_lvl) {
 		scx_bpf_cpuperf_set(cpu, perf_lvl);
@@ -226,10 +226,8 @@ __hidden void cpuperf_on_stopping(s32 cpu, u64 now)
 }
 
 /*
- * The CPU is going idle: drop its performance level so that it clocks
- * down until the next task runs. The write happens once, when the
- * level actually changes - see the comment on perf_req for why the
- * idle path must not churn the request either.
+ * The CPU is going idle: drop its performance level. The write happens
+ * once, when the level changes; see the comment on perf_req.
  */
 __hidden void cpuperf_on_idle(s32 cpu)
 {

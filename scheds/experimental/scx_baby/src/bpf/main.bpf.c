@@ -4,87 +4,67 @@
  *
  * Copyright (C) 2026 bunkbail <nabildanial.93@gmail.com>
  *
- * Every task owns a deadline, an absolute timestamp by which it would like
- * to run. The CPU always runs the task with the earliest deadline: tasks
- * are inserted into a global deadline-ordered queue and dispatched
- * earliest-deadline-first.
- *
- * Tasks that voluntarily sleep before consuming their deadline are treated
- * as interactive: their effective nice level is boosted by one step (down
- * to -20), which pulls their future deadlines earlier. CPU hogs are
- * throttled by a burst tracker that accounts the runtime a task accumulates
- * over a 200ms window: a task whose bursts keep growing behind the previous
- * window cannot preempt other tasks even when its deadline is earlier.
+ * Every runnable task owns an absolute deadline and each CPU runs the
+ * earliest one it can reach. Tasks that sleep before consuming their
+ * deadline are treated as interactive and earn a nice boost; CPU hogs
+ * are throttled by a burst tracker over a 200ms window.
  */
 #include "baby.bpf.h"
 
 char _license[] SEC("license") = "GPL";
 
 /*
- * Default deadline offset (1.18ms, the original DEADLINE_NS).
+ * Default deadline offset and base slice, in nanoseconds (1.18ms from
+ * the original DEADLINE_NS).
  */
 const volatile u64 deadline_ns = 1180000ULL;
 
- /* Report additional debugging information */
+/* Report additional debugging information. */
 const volatile bool debug;
 
 /*
- * Big and little CPU sets, published by userspace at startup from the
- * platform's core types. The deadline order is placement-blind - an
- * idle CPU pulls the earliest-deadline task from wherever it waits -
- * so the sets steer nothing on a single-tier machine; they stay for
- * the per-tier queues a hybrid platform needs.
+ * Big and little CPU sets, published by userspace at startup. They drive
+ * the hybrid compaction below; both stay empty on a single-tier machine,
+ * which disables every hybrid path.
  */
 private(BABY) struct bpf_cpumask __kptr *big_cpumask;
 private(BABY) struct bpf_cpumask __kptr *little_cpumask;
 
 /*
- * Saturation deferred preemption: at full CPU
- * saturation a latency-critical task that parks in a queue waits a
- * full slice behind the batch task running here, and at 2x
- * overcommit that wait is paid by every frame - the game's whole
- * frame-time distribution shifts right by one slice quantum. The tick
- * cuts the victim short instead, under these gates:
+ * Saturation preemption: at full saturation a latency-critical waiter
+ * parks behind a batch task for a full slice. The tick cuts the holder
+ * short instead, under these gates:
  *
- * - the victim is not itself latency-critical (classified by the
- *   wake-rate EWMA; homogeneous batch workers never preempt each
- *   other);
- * - a latency-critical task waits at a head this CPU serves - its own
- *   warm seat or the shared deadline queue. With an idle CPU anywhere
- *   the waiter would have been pulled already, so a waiting head
- *   encodes saturation on its own;
- * - the victim has held the CPU longer than the protect window, so a
+ * - the victim is not latency-critical, so batch workers never preempt
+ *   each other;
+ * - a latency-critical task waits at a head this CPU serves (its warm
+ *   seat or the shared queue). With an idle CPU anywhere that task
+ *   would have been pulled already, so a waiting head implies
+ *   saturation;
+ * - the victim has held the CPU for at least the protect window, so a
  *   task that just got the CPU keeps it;
- * - for the shared-queue head, one CPU at a time: the synchronized
- *   per-CPU ticks would otherwise all preempt for the same single
- *   waiter, and only the first pull serves it. A global stamp with a
- *   deadline-length quiet window bounds the herd. Warm-seat waiters
- *   are per-CPU precise and need no stamp: the preempted victim's
- *   rotation pulls the waiter in the same scheduling cycle, which
- *   empties the queue head and disarms the gate.
+ * - for a shared-queue head, one CPU at a time claims it: the per-CPU
+ *   ticks would otherwise all preempt for the same waiter. A global
+ *   stamp with a short quiet window bounds the herd. Warm-seat waiters
+ *   are per-CPU precise; the victim's rotation pulls the waiter in the
+ *   same scheduling cycle.
  *
- * The kernel reschedules when ops.tick() leaves the slice at zero, and
- * the preempted victim re-enters through ops.enqueue() with its
- * deadline intact - behind the waiter that displaced it, which the
- * deadline order already prefers. The victim carries tick_preempted
- * so its requeue takes the base slice, not the deep-backlog rung it
- * did not earn.
+ * The victim requeues with its deadline intact, behind the waiter, on
+ * the base slice rather than the deep-backlog rung it did not earn.
  *
- * The waiting head is observed by peeking, not by a latch signaled
- * from ops.enqueue(): the enqueue sits at the verifier's
- * jump-complexity ceiling (docs/adr/0003), and the peek -> lookup -> class
- * pattern is already verifier-proven in the starve-rescue timer.
+ * The waiting head is found by peeking, not by a latch signaled from
+ * enqueue: the enqueue path sits at the verifier's jump-complexity
+ * ceiling, and the peek/lookup/class pattern is already verifier-proven
+ * in the rescue timer.
  */
 #define BABY_TICK_PREEMPT_PROTECT_NS	(200ULL * NSEC_PER_USEC)
 
 /*
- * Fallback quiet window for the shared-queue claim, covering only the
- * tick -> resched -> dispatch flight of the preempting CPU - its
- * dispatch may be diverted to a warm-seat arrival and never pull the
- * waiter. The stamp is cleared the moment any CPU pulls the shared
- * head, so under wake bursts (multiple waiters microseconds apart) the
- * next staggered tick (>100us later) can serve the next waiter instead
- * of waiting out a whole slice.
+ * Fallback quiet window for the shared-queue claim. It covers the
+ * tick -> resched -> dispatch flight, which may be diverted to a
+ * warm-seat arrival and never pull the waiter. The stamp is cleared
+ * when any CPU pulls the shared head, so a later staggered tick can
+ * serve the next waiter instead of waiting out a slice.
  */
 #define BABY_TICK_PREEMPT_FALLBACK_NS	(100ULL * NSEC_PER_USEC)
 
@@ -93,16 +73,13 @@ bool cpu_is_lat[BABY_MAX_CPUS];
 static u64 node_preempt_at;
 
 /*
- * Maximum consecutive fast-lane (latency-critical) dispatches a CPU
- * may serve while its bulk queue holds waiting work. Once
- * fl_streak[cpu] reaches BABY_FL_QUOTA, the next dispatch on that CPU
- * serves the bulk queue and resets the streak to 0, guaranteeing bulk
- * tasks at least 1 / (BABY_FL_QUOTA + 1) of every contended CPU. The
- * quota lives only
- * in ops.dispatch(): wake and tick preemptions are self-bounded by the
- * displaced resident's SCX_DSQ_LOCAL occupancy and its fresh 200us
- * residency stamp, so counting them here would black the lane out
- * without any dispatch in between to reset it (the M1.0 lesson).
+ * Maximum consecutive fast-lane dispatches a CPU may serve while its
+ * bulk queue holds waiting work. When fl_streak reaches the quota, the
+ * next dispatch serves bulk and resets the streak, so bulk keeps at
+ * least 1 / (BABY_FL_QUOTA + 1) of a contended CPU. The quota is
+ * counted only in ops.dispatch(): wake and tick preemptions happen
+ * between dispatches and are self-bounded, and counting them would
+ * black the lane out without a dispatch to reset the streak.
  */
 #define BABY_FL_QUOTA	2
 
@@ -145,13 +122,11 @@ static int init_cpumask(struct bpf_cpumask **cpumask)
 }
 
 /*
- * The compaction pick (docs/adr/0012): the lowest-numbered idle CPU of the
- * given tier, so wakeups stack onto the same few cores and the rest
- * of the tier idles at its boost floor. Claims bits atomically; a
- * lost race retries the next idle bit of the tier rather than
- * spilling out of it - two messengers waking simultaneously would
- * otherwise race the same first bit and one of them would fall
- * through to the spread-first kernel path.
+ * Pick the lowest-numbered idle CPU of the given tier. Stacking
+ * wakeups on the same few cores lets the rest of the tier idle at its
+ * boost floor. The idle bit is claimed atomically; a lost race tries
+ * the next bit of the tier instead of spilling to the kernel's
+ * spread-first path.
  */
 static __always_inline s32 pick_idle_pref(struct task_struct *p,
 					  struct bpf_cpumask *pref)
@@ -180,11 +155,11 @@ static __always_inline s32 pick_idle_pref(struct task_struct *p,
 }
 
 /*
- * Re-pick off a core outside both tiers - in practice an LP the
- * kernel selector chose. The preferred tier goes first: a heavy
- * non-foreground consumer wants a big core, everything else the
- * little stack. A task pinned to LP cores by affinity finds nothing
- * in either tier and keeps its pick.
+ * Re-pick off a core outside both tiers, in practice an LP core the
+ * kernel selector chose. Callers ask for the big tier first for a
+ * heavy non-foreground consumer and the little tier first otherwise.
+ * A task pinned to LP cores by affinity finds nothing in either tier
+ * and keeps its pick.
  */
 static __always_inline s32 pick_idle_tier(struct task_struct *p,
 					  bool big_first)
@@ -202,12 +177,11 @@ static __always_inline s32 pick_idle_tier(struct task_struct *p,
 }
 
 /*
- * The LP guard: the kernel selector may hand back an LP core, whose
- * 0.7-1.4GHz no-L3 residency the prev-bias then locks in for the
- * task's lifetime. While the hybrid gate can engage at all, re-pick
- * inside the tiers - the preferred one first - and keep the LP only
- * when both are full or affinity allows nothing else. Callers apply
- * it to a confirmed idle pick.
+ * The LP guard: the kernel selector can return an LP core, whose low
+ * clock and absent L3 the previous-CPU bias would then keep for the
+ * task's lifetime. While the tier masks exist, re-pick inside them and
+ * keep the LP only when both tiers are full or affinity allows nothing
+ * else. Callers apply this to a confirmed idle pick.
  */
 __hidden s32 lp_guard_pick(struct task_struct *p, struct task_ctx *tctx,
 			   s32 cpu)
@@ -239,12 +213,10 @@ __hidden s32 lp_guard_pick(struct task_struct *p, struct task_ctx *tctx,
 }
 
 /*
- * Pick a target CPU for a task which is being woken up, and dispatch it
- * straight to the CPU when the pick found an idle one. Placement is
- * delegated to the kernel's idle-CPU selection: SMT-aware, biased to
- * the previous CPU, spread across the LLCs - the cache warmth the
- * per-CPU queues used to pin comes from the kernel's own sense of the
- * topology.
+ * Pick a target CPU for a waking task and dispatch it straight to the
+ * pick when that CPU is idle. Placement is delegated to the kernel's
+ * idle-CPU selection: SMT-aware, previous-CPU biased and spread across
+ * LLCs.
  */
 s32 BPF_STRUCT_OPS(baby_select_cpu, struct task_struct *p,
 		   s32 prev_cpu, u64 wake_flags)
@@ -254,39 +226,30 @@ s32 BPF_STRUCT_OPS(baby_select_cpu, struct task_struct *p,
 	s32 cpu;
 
 	/*
-	 * The wake-gate miss reason always describes the most recent
-	 * wake that reached this function: reset it at entry, before
-	 * anything can return early. charge_wait() files it for the
-	 * wake that actually waits; a wake the old enqueue-side gate
-	 * serves never charges a wait, so no other clear point exists.
+	 * The miss reason always describes the most recent wake. Reset it
+	 * at entry, before any early return; charge_wait() files it for a
+	 * wake that actually waits.
 	 */
 	if (tctx)
 		tctx->wake_gate_miss = BABY_WG_NO_GATE;
 
 	/*
-	 * Don't trust userspace about the waker releasing the CPU: a
-	 * waker that keeps running after the wake leaves the wakee
-	 * stacked behind it on a hot core while other cores idle, and
-	 * the sync hint is exactly how one hot core starves the rest.
+	 * Don't trust the sync hint: a waker that keeps running after the
+	 * wake would stack the wakee behind it while other CPUs idle.
 	 */
 	wake_flags &= ~SCX_WAKE_SYNC;
 
 	/*
-	 * Light-placement compaction (docs/adr/0011). The
-	 * kernel selector below is prev-biased and spreads across LLCs
-	 * by design, so at light load it locks each task onto whatever
-	 * core it first touched - the counters read wake: self ~99% -
-	 * which on a hybrid box parks workers on P cores at half a
-	 * boosted E's clock and scatters the stack the per-CPU queues
-	 * used to keep. Below the saturation line the wake path packs
-	 * lowest-idle-first onto the little tier instead, the class
-	 * order the per-CPU queues used: foreground and interactive
-	 * tasks stack, a heavy consumer with no wake history pins a
-	 * big core, everything else stacks with a big as its fallback.
-	 * The gates are statically false on a single-tier machine (the
-	 * little set is empty there) and disengage well before
-	 * saturation, so neither the homogeneous box's suite nor the
-	 * heavy profiles see them.
+	 * Light-placement compaction: at light load the kernel selector is
+	 * previous-CPU biased and spreads across LLCs, which parks short
+	 * workers on whichever core they first touched and scatters them
+	 * across tiers. Below the saturation line, pack wakeups
+	 * lowest-idle-first onto the little tier instead: foreground and
+	 * interactive tasks stack there, a proven consumer with no wake
+	 * history pins a big core, and a proven consumer that is also
+	 * foreground starts little and falls back to big. The gates are
+	 * statically false on a single-tier machine and disengage before
+	 * saturation.
 	 */
 	if (tctx && nr_little_cpus && nr_big_cpus &&
 	    nr_running <= nr_little_cpus + 2) {
@@ -321,43 +284,25 @@ s32 BPF_STRUCT_OPS(baby_select_cpu, struct task_struct *p,
 		__sync_fetch_and_add(&nr_direct_dispatches, 1);
 	} else if (wake_flags & (SCX_WAKE_TTWU | SCX_WAKE_FORK)) {
 		/*
-		 * No idle CPU: the depth-0 wake-path preempt (the tick
-		 * gate's IPI-fast twin). The tick gate serves a lat-cri
-		 * SEAT head by cutting the victim at the first tick with
-		 * 200us residency - mean ~700us of quantization wait on
-		 * a 1000Hz kernel, which is the depth-0 lat wait the
-		 * wlcri instrument read at 2x. This path serves the same
-	 * pair the moment the wake happens: when the wakee is
-	 * latency-critical, the victim is not, the wakee can
-	 * only run here, its Fast-Lane seat is empty (a bulk
-	 * head in the warm seat no longer hides it), and the
-	 * victim has held the CPU for the same 200us floor, hand
-	 * it the CPU now instead of waiting for a tick.
+		 * No idle CPU: the depth-0 wake-path preempt, the
+		 * wake-time twin of the tick gate. If the wakee is
+		 * latency-critical and its previous CPU runs a
+		 * non-latency-critical victim, hand it the CPU now
+		 * instead of waiting for the tick.
 		 *
-		 * The deadline-beat check of the enqueue-side gate is
-		 * deliberately absent: the running victim renews its
-		 * deadline forward while it runs (calc_deadline at the
-		 * renewal points), so the beat binds only for victims
-		 * deep into an un-renewed stretch - the A/B counters
-		 * showed the old gate already fires ~1200/5s at 2x and
-		 * the beat-drop recovers almost nothing. can_resched is
-		 * likewise dropped: the tick gate cuts the same victims
-		 * without it (its condition is !is_lat_cri + residency
-		 * + head), and the pair gate plus the 200us residency
-		 * floor bound the churn instead. What remains is the
-		 * class pair (lat-cri wakee, non-lat-cri victim), the
-		 * prio order and the residency floor.
+		 * The deadline-beat check and can_resched() are
+		 * deliberately absent. The victim renews its deadline
+		 * while it runs, so the beat rarely binds, and the tick
+		 * gate cuts the same victims without either check. The
+		 * class pair, the priority order and the 200us residency
+		 * floor bound the churn.
 		 *
-		 * Kernel semantics (v6.12 ext.c, source-verified):
-		 * SCX_ENQ_PREEMPT lands the wakee at the HEAD of the
-		 * local DSQ, zeroes rq->curr's slice (the victim) and
-		 * rescheds; the victim with remaining slice is kept by
-		 * put_prev_task_scx at the local DSQ head via
-		 * SCX_ENQ_HEAD - ops.enqueue() is NOT called for it, so
-		 * the 4x deep-backlog rung (which ops.enqueue hands
-		 * out) is not in play and no tick_preempted-style mark
-		 * is needed. The victim resumes after the wakee's
-		 * slice with its remainder intact.
+		 * SCX_ENQ_PREEMPT puts the wakee at the head of the local
+		 * DSQ, zeroes the victim's slice and reschedules. The
+		 * victim keeps its remaining slice at the local DSQ head
+		 * through SCX_ENQ_HEAD; ops.enqueue() is not called for
+		 * it, so the deep-backlog slice and the tick_preempted
+		 * mark do not apply.
 		 */
 		struct task_struct *curr;
 		struct task_ctx *cctx;
@@ -375,16 +320,13 @@ s32 BPF_STRUCT_OPS(baby_select_cpu, struct task_struct *p,
 			return cpu;
 		}
 		/*
-		 * The wakee runs on its own Fast-Lane seat, so a bulk
-		 * head in the warm seat no longer hides it; the gate
-		 * misses only when the Fast-Lane seat itself holds a
-		 * waiter. Starvation is self-bounded: the displaced
-		 * resident sits in SCX_DSQ_LOCAL (blocking a second
-		 * preempt via LOCAL_BUSY) and gets a fresh 200us
-		 * residency stamp when it resumes. The fast-lane quota takes
-		 * no part here: the preempt happens between dispatches,
-		 * and counting it would black the lane out - the M1.0
-		 * black-out trap.
+		 * A bulk head in the warm seat cannot hide the wakee: it
+		 * runs on its own fast-lane seat, so only a fast-lane
+		 * waiter blocks the preempt. Starvation is self-bounded:
+		 * the displaced victim sits in SCX_DSQ_LOCAL (blocking a
+		 * second preempt via LOCAL_BUSY) and gets a fresh 200us
+		 * residency stamp when it resumes. The quota takes no
+		 * part here: the preempt happens between dispatches.
 		 */
 		if (scx_bpf_dsq_nr_queued(fl_cpu2dsq(prev_cpu))) {
 			tctx->wake_gate_miss = BABY_WG_M3_SEAT_BUSY;
@@ -408,10 +350,10 @@ s32 BPF_STRUCT_OPS(baby_select_cpu, struct task_struct *p,
 		if (is_lat_cri(cctx)) {
 			tctx->wake_gate_miss = BABY_WG_M4_VICTIM_LAT;
 			/*
-			 * The wakee's prev_cpu is running another lat-cri
-			 * task; balance_try_warm_seat() reads this stamp
-			 * and spreads the wakee to the nearest CPU with
-			 * an empty fast-lane seat instead of stacking it here.
+			 * The previous CPU runs another latency-critical
+			 * task. The miss stamp makes balance_try_warm_seat()
+			 * spread the wakee to the nearest CPU with an empty
+			 * fast-lane seat instead of stacking it here.
 			 */
 			return cpu;
 		}
@@ -442,10 +384,9 @@ s32 BPF_STRUCT_OPS(baby_select_cpu, struct task_struct *p,
 }
 
 /*
- * Number of tasks waiting in the node queues. scx_bpf_dsq_nr_queued()
- * fails verification inside an RCU read side section, so callers probe
- * it outside any. The fast-lane node queue counts toward the
- * backlog: it is work this node holds, whatever lane it waits in.
+ * Waiting work in this node's bulk and fast-lane queues. The queue
+ * probe cannot run inside an RCU read-side section, so callers call
+ * this outside one.
  */
 static u64 node_backlog(s32 cpu)
 {
@@ -456,10 +397,8 @@ static u64 node_backlog(s32 cpu)
 }
 
 /*
- * Enqueue a task that has no idle CPU to run on.
- *
- * The deadline order is the scheduling decision: tasks are placed in the
- * node queue by their deadline, and the earliest one is dispatched next.
+ * Enqueue a task with no idle CPU to run on. The node queue is ordered
+ * by deadline, and dispatch takes the earliest one.
  */
 void BPF_STRUCT_OPS(baby_enqueue, struct task_struct *p, u64 enq_flags)
 {
@@ -474,11 +413,11 @@ void BPF_STRUCT_OPS(baby_enqueue, struct task_struct *p, u64 enq_flags)
 	tctx->last_acc_at = now;
 
 	/*
-	 * Consume the yield mark unconditionally: a mark that survived
-	 * to an enqueue it does not belong to would push the wrong
-	 * arrival behind the round. The push itself only applies to a
-	 * rotation requeue - the requeue right after the yield - never
-	 * to a wake, which keeps the sleep-time deadline rule.
+	 * Consume the yield mark on every enqueue: a mark that survived
+	 * into an unrelated enqueue would push the wrong arrival behind
+	 * the round. The push applies only to the rotation requeue that
+	 * follows the yield, never to a wake, which keeps the sleep-time
+	 * deadline.
 	 */
 	bool yielded = tctx->yield_pending;
 
@@ -495,17 +434,13 @@ void BPF_STRUCT_OPS(baby_enqueue, struct task_struct *p, u64 enq_flags)
 	} else if (!(enq_flags & (SCX_ENQ_LAST | SCX_ENQ_WAKEUP |
 				  SCX_ENQ_REENQ))) {
 		/*
-		 * Migrated and freshly created tasks are renormalized to
-		 * a fresh deadline. Woken tasks keep the deadline they
-		 * had when they went to sleep, which is what makes
-		 * interactive tasks run first when they wake up, and a
-		 * task that stopped but stays runnable keeps its
-		 * deadline too, like the original put_prev_entity():
-		 * ops.stopping() has already renewed it if it was
-		 * reached. A task pushed back by ops.cpu_release()
-		 * keeps its deadline as well: it was already runnable
-		 * and waiting, and a fresh one would move it behind
-		 * arrivals that queued after it.
+		 * Migrated and freshly created tasks get a fresh deadline.
+		 * Woken tasks keep the deadline they had when they went to
+		 * sleep. A task that stopped but stayed runnable also
+		 * keeps its own; ops.stopping() renewed it if it was
+		 * reached. A task pushed back by cpu_release() keeps it
+		 * too: it was already waiting, and a fresh deadline would
+		 * move it behind later arrivals.
 		 */
 		tctx->deadline = calc_deadline(p, tctx, now);
 	}
@@ -513,17 +448,15 @@ void BPF_STRUCT_OPS(baby_enqueue, struct task_struct *p, u64 enq_flags)
 	backlog = node_backlog(prev_cpu);
 
 	/*
-	 * check_preempt_wakeup(): preempt the task running on the
-	 * previous CPU if the waker has an earlier deadline and does not
-	 * have a lower priority, unless the running task is protecting
-	 * its CPU burst or the CPU already holds a warm backlog - with
-	 * one waiting, the preempted victim would trade places with a
-	 * queue that is about to run anyway, and under deep
-	 * oversubscription the preemptions alone are churn. The
-	 * preempted victim warm-seats behind its own successor further
-	 * down, so a preemption is a same-CPU alternation, not a cold
-	 * displacement. Interactive and foreground tasks only: a task
-	 * that never wakes has no latency to protect.
+	 * check_preempt_wakeup(): preempt the previous CPU's task when the
+	 * waker has an earlier deadline and no lower priority, provided
+	 * the CPU has no warm backlog and the running task passes
+	 * can_resched(). A preemption into a deep queue would only trade
+	 * places with work that runs anyway, and a burst hog must not be
+	 * preempted. Only interactive and foreground wakers are eligible:
+	 * a task that never wakes has no latency to protect. The victim
+	 * warm-seats behind its successor, so this is a same-CPU
+	 * alternation.
 	 */
 	if ((enq_flags & SCX_ENQ_WAKEUP) &&
 	    !scx_bpf_dsq_nr_queued(fl_cpu2dsq(prev_cpu)) &&
@@ -550,13 +483,10 @@ void BPF_STRUCT_OPS(baby_enqueue, struct task_struct *p, u64 enq_flags)
 
 	/*
 	 * Grab a confirmed idle CPU if the machine still has one: a task
-	 * that stopped on a fully-loaded core spreads to a core that went
-	 * idle since, and a reenqueued task rescans after an RT lease.
-	 * This runs before the warm seat so that a slice expiry or a
-	 * rescue can never park a task on a busy seat while a lane sits
-	 * idle; for wakes that just came through ops.select_cpu() the
-	 * scan declines in two instructions, so their seat order is
-	 * unchanged.
+	 * that stopped on a loaded core spreads to a core that went idle
+	 * since, and a reenqueued task rescans after an RT lease. This
+	 * runs before the warm seat so a requeue or rescue never parks on
+	 * a busy seat while a lane sits idle.
 	 */
 	if (try_direct_dispatch(p, tctx, prev_cpu, enq_flags, is_running))
 		return;
@@ -568,12 +498,10 @@ void BPF_STRUCT_OPS(baby_enqueue, struct task_struct *p, u64 enq_flags)
 		return;
 
 	/*
-	 * Nothing idle anywhere: take a place in the deadline order.
-	 * On an oversubscribed machine hand out longer slices on a
-	 * deep backlog (the e13c rung, both lanes since M1.4). The
-	 * latency-critical class takes the Fast-Lane node queue,
-	 * where dispatch serves it ahead of the bulk heads under the
-	 * quota.
+	 * No idle CPU: join the deadline order. A deep backlog grants the
+	 * fourfold slice; a tick-preempted victim keeps the base slice.
+	 * Latency-critical tasks use their own node queue, which dispatch
+	 * serves ahead of bulk under the quota.
 	 */
 	{
 		s32 node = __COMPAT_scx_bpf_cpu_node(prev_cpu);
@@ -600,14 +528,10 @@ void BPF_STRUCT_OPS(baby_enqueue, struct task_struct *p, u64 enq_flags)
 /*
  * Dispatch the earliest-deadline task to the CPU.
  *
- * The two lanes arbitrate per dispatch: the fast lane (the
- * latency-critical warm seat and node queue) is served whenever it
- * holds work and the CPU's quota allows it, the bulk lane (the warm
- * seat and node queue of the other classes) otherwise. The quota is
- * the starvation bound - BABY_FL_QUOTA fast-lane services between
- * bulk services, so a bulk task always keeps at least one in
- * BABY_FL_QUOTA + 1 of a contended CPU - and serving the bulk lane
- * resets the count.
+ * The lanes arbitrate per dispatch: the fast lane is served whenever it
+ * holds work and the CPU's quota allows it, the bulk lane otherwise.
+ * Serving bulk resets the fast-lane streak, so bulk keeps at least one
+ * in BABY_FL_QUOTA + 1 dispatches on a contended CPU.
  */
 void BPF_STRUCT_OPS(baby_dispatch, s32 cpu, struct task_struct *prev)
 {
@@ -625,10 +549,9 @@ void BPF_STRUCT_OPS(baby_dispatch, s32 cpu, struct task_struct *prev)
 	census_sample(cpu);
 
 	/*
-	 * One peek of each lane per dispatch: the sticky run-in check
-	 * and the arbitration below read the same heads, and the peeked
-	 * pointers stay valid until the pulls below enter their own RCU
-	 * scope (the node-head note there).
+	 * One peek of each lane per dispatch: the sticky check and the
+	 * arbitration read the same heads, and the peeked pointers stay
+	 * valid until the pulls enter their own RCU scope.
 	 */
 	fl_wq = __COMPAT_scx_bpf_dsq_peek(fl_seat_dsq);
 	fl_q = __COMPAT_scx_bpf_dsq_peek(fl_node_dsq);
@@ -641,11 +564,10 @@ void BPF_STRUCT_OPS(baby_dispatch, s32 cpu, struct task_struct *prev)
 	g_dl = q ? q->scx.dsq_vtime : ULLONG_MAX;
 
 	/*
-	 * The lane emptiness reads off the deadline sentinels, not off
-	 * the peeked pointers: an OR of two pointer null-tests compiles
-	 * to pointer|pointer, which the verifier rejects (the 7.2.9
-	 * load probe). No vtime reaches ULLONG_MAX, so the sentinel
-	 * means an empty lane.
+	 * Lane emptiness reads off the deadline sentinels, not the peeked
+	 * pointers: an OR of two pointer null-tests compiles to
+	 * pointer|pointer, which the verifier rejects. No vtime reaches
+	 * ULLONG_MAX, so the sentinel means an empty lane.
 	 */
 	fl_dl = MIN(fl_wq_dl, fl_g_dl);
 	bulk_dl = MIN(wq_dl, g_dl);
@@ -655,16 +577,13 @@ void BPF_STRUCT_OPS(baby_dispatch, s32 cpu, struct task_struct *prev)
 
 	if (need_running && tctx && !tctx->yield_pending) {
 		/*
-		 * pick_next_entity() keeps the current task only while
-		 * its deadline still beats the earliest head of the lane
-		 * that would run next; ties go to the waiter.
-		 * ops.stopping() has already renewed the deadline once it
-		 * was reached, so the task competes with the same deadline
-		 * it would carry into the queue - a sticky run in absolute
-		 * deadlines. A yielding task has given this round up, so
-		 * the keep does not apply to it. A bulk prev cannot keep
-		 * the CPU out of turn when the Fast Lane is being served:
-		 * its claim is the quota's business, not the deadline's.
+		 * Keep the current task only while its deadline beats the
+		 * earliest head of the lane that would run next; ties go to
+		 * the waiter. ops.stopping() renewed the deadline once it
+		 * was reached, so this is a sticky run in absolute
+		 * deadlines. A yielding task has given the round up. A bulk
+		 * task cannot keep the CPU out of turn when the fast lane
+		 * is served: that is the quota's business.
 		 */
 		if (serve_fl && !is_lat_cri(tctx)) {
 			best_dl = 0;
@@ -690,12 +609,10 @@ void BPF_STRUCT_OPS(baby_dispatch, s32 cpu, struct task_struct *prev)
 	}
 
 	/*
-	 * Serve the Fast Lane: the node queue first when its head beats
-	 * the seat's (warm seats win ties, as below), then the seat,
-	 * then the node queue for the raced first try. Under bulk
-	 * pressure a serve spends one unit of the quota and is counted
-	 * with the out-of-turn pull counters; an uncontended serve is
-	 * just this CPU's own work and lands in the pull histogram.
+	 * Serve the fast lane: the node queue first when its head beats
+	 * the seat's (the seat wins ties), then the seat, then the node
+	 * queue again for a raced first try. Under bulk pressure a serve
+	 * spends one quota unit.
 	 */
 	if (serve_fl) {
 		if (fl_g_dl < fl_wq_dl) {
@@ -734,31 +651,27 @@ void BPF_STRUCT_OPS(baby_dispatch, s32 cpu, struct task_struct *prev)
 	}
 
 	/*
-	 * Serve the bulk lane (either the fast lane is empty, its move
-	 * raced, or fl_streak reached BABY_FL_QUOTA). Serving a bulk
-	 * task resets the fast-lane streak so the next fast-lane
-	 * arrival has its full quota again.
-	 * The arbitration is what keeps the warm queues honest - a
-	 * self-sustaining warm queue must not starve the overflow, so
-	 * the shared queue wins whenever its head is strictly earlier.
+	 * Serve the bulk lane: the fast lane is empty, its move raced, or
+	 * the quota is spent. Serving bulk resets the fast-lane streak.
+	 * The shared queue wins when its head is strictly earlier, so a
+	 * self-sustaining warm queue cannot starve the overflow.
 	 */
 	if (g_dl < wq_dl) {
 		/*
-		 * The node head's origin, read while q is fresh: the
-		 * pull below may enter an RCU scope, and pointers
-		 * peeked before it keep their marks only as long as
-		 * nothing re-reads them after the unlock.
+		 * Read the node head's CPU while q is fresh: the pull below
+		 * may enter an RCU scope, and a pointer peeked before it
+		 * cannot be re-read after the unlock.
 		 */
 		s32 from = q ? scx_bpf_task_cpu(q) : -1;
 
 		if (scx_bpf_dsq_move_to_local(node, 0)) {
 			fl_streak[idx] = 0;
 			/*
-			 * The waiter this tick's claim was made for is
-			 * served (or another head took its place - either
-			 * way the next staggered tick may claim again).
-			 * Plain store: a racing tick CAS against the
-			 * cleared stamp just fails and retries next tick.
+			 * The waiter this claim was made for is served, or
+			 * another head took its place; either way the next
+			 * staggered tick may claim again. A racing tick CAS
+			 * against the cleared stamp fails and retries next
+			 * tick.
 			 */
 			node_preempt_at = 0;
 			if (stats_enabled)
@@ -795,17 +708,11 @@ void BPF_STRUCT_OPS(baby_dispatch, s32 cpu, struct task_struct *prev)
 
 	if (need_running) {
 		/*
-		 * Nothing is queued anywhere: keep the task running, as
-		 * the original does across its deadline renewals. A
-		 * pending tick cut is consumed with it - the queues the
-		 * waiter was seen in emptied under the mark, so the cut
-		 * did not happen and the requeue slice rung is the
-		 * task's own again. A yield mark set moments before is
-		 * consumed too: the queues emptied under the yield, so
-		 * there was nothing to yield to, and the mark must not
-		 * survive into an unrelated enqueue. A bulk task that
-		 * keeps the CPU idle-side also restores the quota it
-		 * may have been holding the counter at.
+		 * Nothing queued: keep the task running. Consume a pending
+		 * tick mark, since the queues the waiter was seen in
+		 * emptied under the mark and the cut never happened, and a
+		 * yield mark, since there was nothing to yield to. A bulk
+		 * task also restores the quota.
 		 */
 		if (tctx) {
 			tctx->tick_preempted = false;
@@ -817,11 +724,9 @@ void BPF_STRUCT_OPS(baby_dispatch, s32 cpu, struct task_struct *prev)
 				       tctx ? task_slice(tctx) : deadline_ns);
 	} else {
 		/*
-		 * The CPU is going idle: drop its performance level so
-		 * that it clocks down until the next task runs. The
-		 * write happens once, when the level actually changes -
-		 * see the comment on perf_req for why the idle path must
-		 * not churn the request either.
+		 * The CPU is going idle: drop its performance level. The
+		 * write happens once, when the level changes; see the
+		 * comment on perf_req.
 		 */
 		fl_streak[idx] = 0;
 		cpuperf_on_idle(cpu);
@@ -829,12 +734,10 @@ void BPF_STRUCT_OPS(baby_dispatch, s32 cpu, struct task_struct *prev)
 }
 
 /*
- * The kernel took the CPU away for an RT or deadline task and has just
- * given it back. Tasks dispatch() already moved into the local DSQ
- * waited out the whole lease where no other CPU could see them; push
- * them back through ops.enqueue(), which lands each one on an idle
- * core or in the deadline order, where the rest of the machine can
- * reach it.
+ * The kernel took the CPU for an RT or deadline task and has given it
+ * back. Tasks that dispatch() had moved into the local DSQ waited out
+ * the lease where no other CPU could see them; push them back through
+ * enqueue, where they land on an idle core or in the deadline order.
  */
 void BPF_STRUCT_OPS(baby_cpu_release, s32 cpu,
 		    struct scx_cpu_release_args *args)
@@ -849,10 +752,9 @@ void BPF_STRUCT_OPS(baby_cpu_release, s32 cpu,
 
 /*
  * Periodic tick: account bursts, advance the CPU performance ledger and
- * renew the deadline once reached. The tick preempts only through the
- * saturation deferred-preemption gate below; the rotation order stays
- * the deadline order, and any other tick-driven preemption would add
- * switches the queue order does not ask for.
+ * renew the deadline once reached. The only tick-driven preemption is
+ * the saturation gate below; the rotation order stays the deadline
+ * order.
  */
 void BPF_STRUCT_OPS(baby_tick, struct task_struct *p)
 {
@@ -872,16 +774,13 @@ void BPF_STRUCT_OPS(baby_tick, struct task_struct *p)
 		tctx->deadline = calc_deadline(p, tctx, now);
 
 	/*
-	 * The saturation deferred-preemption gate (comment at the top of
-	 * the file). The victim's residency is measured from its
-	 * ops.running() stamp; the waiter is recognized by a non-empty
-	 * fast lane: this CPU's own fast-lane seat, or the fast-lane
-	 * node queue under the same one-CPU-at-a-time stamp as before.
-	 * The quota takes no part in the cut - the tick fires between
-	 * dispatches, and counting it would black the lane out without
-	 * a dispatch to reset it (the M1.0 lesson); baby_dispatch()
-	 * owns the quota when it chooses which queue to pop after the
-	 * slice ends.
+	 * The saturation preemption gate (see the top of the file). The
+	 * victim's residency comes from its ops.running() stamp; the
+	 * waiter is any non-empty fast lane: this CPU's seat, or the
+	 * fast-lane node queue under the one-CPU-at-a-time stamp. The
+	 * quota takes no part: the tick fires between dispatches, and
+	 * counting it would black the lane out with no dispatch to reset
+	 * it. baby_dispatch() owns the quota.
 	 */
 	if (!is_lat_cri(tctx)) {
 		s32 cpu = scx_bpf_task_cpu(p);
@@ -1003,11 +902,10 @@ void BPF_STRUCT_OPS(baby_running, struct task_struct *p)
 	__sync_fetch_and_add(&nr_running, 1);
 
 	/*
-	 * The victim-residency stamp for the tick preemption gate, and
-	 * the point where a task that was cut short stops carrying the
-	 * preempted mark: the requeue has happened by now. The running
-	 * class rides along for the warm gate and the M4 relocation
-	 * filter (see cpu_is_lat).
+	 * The victim-residency stamp for the tick gate, and the point where
+	 * a task that was cut short stops carrying the preempted mark: the
+	 * requeue has happened by now. The running class feeds the warm
+	 * gate and the relocation filter (see cpu_is_lat).
 	 */
 	{
 		u32 cpu_idx = scx_bpf_task_cpu(p) & (BABY_MAX_CPUS - 1);
@@ -1044,13 +942,10 @@ void BPF_STRUCT_OPS(baby_running, struct task_struct *p)
 
 /*
  * sched_yield(): give up the CPU for the rest of this round, like the
- * original YIELD_MARK. With nothing else queued there is nothing to yield
- * to.
- *
- * With ops.yield defined the kernel leaves the slice alone
- * (yield_task_scx), so give it up here: only then does the task stop
- * running and re-enter through ops.enqueue(), where the mark is
- * consumed.
+ * original YIELD_MARK. With nothing queued there is nothing to yield to.
+ * The kernel leaves the slice alone when ops.yield is defined, so zero
+ * it here; only then does the task re-enter through enqueue, where the
+ * mark is consumed.
  */
 bool BPF_STRUCT_OPS(baby_yield, struct task_struct *p)
 {
@@ -1092,13 +987,12 @@ s32 BPF_STRUCT_OPS(baby_init_task, struct task_struct *p,
 }
 
 /*
- * A warm queue that no CPU can serve - an RT lease outlived it, or
- * affinity moved under it - strands its tasks where the rest of the
+ * A warm queue that no CPU can serve, behind an RT lease or with
+ * affinity moved under it, strands its tasks where the rest of the
  * machine cannot see them. A head that has waited this long is overdue
- * by far more than any warm wait can be; hand its queue back to the
- * shared one. The kernel watchdog force-unloads the whole scheduler
- * five seconds after a queued task stops being consumable, so this
- * has to fire well before that.
+ * by far more than a warm wait; re-enqueue the queue. The kernel
+ * watchdog unloads the scheduler five seconds after a queued task stops
+ * being consumable, so this fires well before that.
  */
 #define STARVE_RESCUE_NS	1000000000ull
 
@@ -1115,9 +1009,8 @@ struct {
 
 /*
  * One queue's rescue: a head that has waited past the starve window is
- * handed back to the shared queue. Both lanes get this per CPU - a
- * stranded Fast-Lane seat is as invisible to the rest of the machine
- * as a stranded bulk one.
+ * re-enqueued. Both lanes get this per CPU; a stranded fast-lane seat
+ * is as invisible to the rest of the machine as a stranded bulk one.
  */
 static void rescue_one_dsq(u64 dsq, u64 now)
 {
@@ -1133,10 +1026,9 @@ static void rescue_one_dsq(u64 dsq, u64 now)
 
 	hctx = try_lookup_task_ctx(head);
 	/*
-	 * The head's wait stamp is its arrival clock at this queue:
-	 * re-stamped at every insertion and touched by nothing else
-	 * while it waits. last_acc_at was reset by every requeue, which
-	 * made a stranded seat unrescuable.
+	 * wait_stamp is the arrival clock at this queue: re-stamped at
+	 * every insertion and untouched while the task waits. last_acc_at
+	 * is reset by every requeue and cannot serve that purpose.
 	 */
 	if (hctx && hctx->wait_stamp &&
 	    now - hctx->wait_stamp > STARVE_RESCUE_NS)
@@ -1172,8 +1064,8 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(baby_init)
 	nr_cpu_ids = scx_bpf_nr_cpu_ids();
 
 	/*
-	 * Create the warm queues and the per-node deadline-ordered
-	 * queues, both lanes: the bulk classes and the fast lane.
+	 * Create the per-CPU seats and the per-node deadline queues for
+	 * both lanes.
 	 */
 	bpf_for(cpu, 0, nr_cpu_ids) {
 		err = scx_bpf_create_dsq(cpu2dsq(cpu), -1);

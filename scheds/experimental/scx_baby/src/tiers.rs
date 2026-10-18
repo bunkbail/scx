@@ -112,13 +112,13 @@ pub fn classify(
 }
 
 /// Cores far below the little tier - the L3-less low-power islands on
-/// hybrid laptop parts - stay out of the little set: that set is the
-/// tier the queue work waits in, and a worker pulled onto an LP core
-/// runs at a fraction of the little cores' speed with no last-level
-/// cache, which stretches every batch of a batch-parallel workload to
-/// its slowest worker. They are not lost to scheduling: the kernel's
-/// placement and the direct-dispatch scan still run work there when
-/// nothing else fits. Only the tier assignment skips them.
+/// hybrid parts - stay out of the little set: that set is the tier the
+/// queue work waits in, and a worker pulled onto an LP core runs at a
+/// fraction of the little cores' speed with no last-level cache, which
+/// stretches every batch of a batch-parallel workload to its slowest
+/// worker. They are not lost to scheduling: the kernel's placement and
+/// the direct-dispatch scan still run work there when nothing else
+/// fits. Only the tier assignment skips them.
 fn split_lps(rest: &[usize], capacity: &impl Fn(usize) -> Option<u32>) -> (Vec<usize>, Vec<usize>) {
     let little_cap = rest.iter().filter_map(|id| capacity(*id)).max();
     let mut little = Vec::new();
@@ -157,9 +157,9 @@ mod tests {
     }
 
     #[test]
-    fn capacity_split_matches_the_hybrid_laptop_shape() {
-        // Arrow Lake-H: 4 P at the top capacity, 8 E at 0.771, 2 LP-E
-        // islands below half of the little tier.
+    fn capacity_split_matches_the_hybrid_shape() {
+        // Four big cores at the top capacity, eight little ones at
+        // 0.771, and two LP islands below half of the little tier.
         let mut caps = vec![Some(1024u32); 4];
         caps.extend(vec![Some(790); 8]);
         caps.extend(vec![Some(256); 2]);
@@ -173,7 +173,7 @@ mod tests {
 
     #[test]
     fn homogeneous_core_types_publish_no_split() {
-        // The 5600X shape: no capacity files, every core type big.
+        // A homogeneous desktop: no capacity files, every core type big.
         let n = 12;
         let (ids, capacity, is_big, max_freq) =
             fixture(vec![None; n], vec![Some(true); n], vec![Some(5700000); n]);
@@ -185,10 +185,10 @@ mod tests {
 
     #[test]
     fn uncorroborated_core_type_split_is_refused() {
-        // A homogeneous Zen4/5 desktop as amd_pstate prefcore ranking
-        // presents it: a 1.45x ranking spread across identical cores
-        // trips the ladder's big/little bar, but the clocks differ by
-        // 5 percent - the fake-tier guard must collapse to one tier.
+        // A homogeneous desktop whose amd_pstate preferred-core ranking
+        // presents a 1.45x spread across identical cores: it trips the
+        // ladder's big/little bar, but the clocks differ by 5 percent,
+        // so the fake-tier guard must collapse to one tier.
         let n = 16;
         let mut bigs = vec![Some(true); n];
         bigs[12..16].fill(Some(false));
