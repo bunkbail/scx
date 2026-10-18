@@ -58,20 +58,23 @@ __hidden bool balance_try_warm_seat(struct task_struct *p, struct task_ctx *tctx
 	if (bpf_cpumask_test_cpu(prev_cpu, p->cpus_ptr)) {
 		bool lat = is_lat_cri(tctx);
 		s32 target = prev_cpu;
-		u64 target_nr = scx_bpf_dsq_nr_queued(lat ?
-						      q1_cpu2dsq(target) :
-						      cpu2dsq(target));
-		u64 warm_total = lat ? target_nr : 0, best_nr = target_nr, i;
+		u64 bulk_nr = scx_bpf_dsq_nr_queued(cpu2dsq(target));
+		u64 target_nr = lat ?
+				scx_bpf_dsq_nr_queued(q1_cpu2dsq(target)) :
+				bulk_nr;
+		/*
+		 * A waking lat-cri task whose prev_cpu is already running
+		 * another lat-cri task (BABY_WG_M4_VICTIM_LAT) or holds a
+		 * two-deep Q1 seat must spread to the nearest CPU with an
+		 * empty Q1 seat instead of self-stacking on prev_cpu.
+		 */
+		u64 eff_nr = target_nr +
+			     (lat && tctx->wake_gate_miss ==
+					     BABY_WG_M4_VICTIM_LAT ? 2 : 0);
+		u64 warm_total = lat ? target_nr : 0, best_nr = eff_nr, i;
 		u32 best_rank = BABY_DIST_SELF, rank;
 		s32 best = target;
 
-		/*
-		 * The Q1 Fast Lane does not rebalance: its wakes park on
-		 * the cache-warm seat they belong to, and the depth-0
-		 * wake preempt plus the dispatch quota keep a busy
-		 * Fast-Lane seat from hiding the waiter. Only the bulk
-		 * classes read the shallowest-nearest scan.
-		 */
 		bpf_for(i, 0, nr_cpu_ids) {
 			u64 nr = scx_bpf_dsq_nr_queued(cpu2dsq(i));
 
@@ -97,18 +100,24 @@ __hidden bool balance_try_warm_seat(struct task_struct *p, struct task_ctx *tctx
 			 * variable (see the note on cpu_dist): two
 			 * inlined evaluations in the comparison below
 			 * explode the verifier's state space.
+			 *
+			 * The rebalance needs an effective depth of two,
+			 * and never re-reads the seat the task came from:
+			 * its depth and distance are already seeded into
+			 * best, and letting the scan re-read them lets an
+			 * empty local Q1 seat capture the vlat relocation
+			 * and pins lat-cri twins onto one CPU (the M1.1
+			 * dead-code lesson). The Q1 Fast Lane scans its
+			 * own seats when it does rebalance - a lat-cri
+			 * wake stacks onto a busy bulk seat without harm.
 			 */
-			/*
-			 * The rebalance needs a seat already two deep:
-			 * below that, no queue satisfies the
-			 * shallowest-nearest bound and the scan body can
-			 * never move the task. Keep only the warm_total
-			 * accounting.
-			 */
-			if (lat || target_nr < 2 ||
+			if ((s32)i == target || eff_nr < 2 ||
 			    !(enq_flags & SCX_ENQ_WAKEUP) ||
 			    !bpf_cpumask_test_cpu((s32)i, p->cpus_ptr))
 				continue;
+
+			if (lat)
+				nr = scx_bpf_dsq_nr_queued(q1_cpu2dsq(i));
 
 			rank = cpu_dist(prev_cpu, i);
 			if (nr < best_nr ||
@@ -124,17 +133,20 @@ __hidden bool balance_try_warm_seat(struct task_struct *p, struct task_ctx *tctx
 			 * On a deep backlog - shared or local - the
 			 * task will rotate anyway and every extra
 			 * rotation costs a full switch, so grant four
-			 * times the slice. The Fast Lane keeps its own
-			 * slice: its service comes from the lane order,
-			 * and inflating it would only extend the seat
-			 * occupancy the quota arbitrates.
+			 * times the slice (e13c, docs/adr/0006). The
+			 * rung is bulk-only: a lat-cri task rotates in
+			 * its own lane, ahead of the bulk heads, and a
+			 * long un-preemptible lat-cri quantum holds a
+			 * CPU hostage (task_slice() keeps the class at
+			 * the base quantum).
 			 */
-			u64 dsq = lat ? q1_cpu2dsq(target) : cpu2dsq(target);
 			u64 slice = (!lat && (backlog_deep(backlog) ||
+					      bulk_nr >= 2 ||
 					      target_nr >= 2)) ?
 				    4 * deadline_ns : task_slice(tctx);
+			u64 dsq;
 
-			if (best != target && best_nr + 2 <= target_nr) {
+			if (best != target && best_nr + 2 <= eff_nr) {
 				target = best;
 				target_nr = best_nr;
 				if (stats_enabled)
@@ -146,6 +158,7 @@ __hidden bool balance_try_warm_seat(struct task_struct *p, struct task_ctx *tctx
 				__sync_fetch_and_add(&nr_seat_self, 1);
 			}
 
+			dsq = lat ? q1_cpu2dsq(target) : cpu2dsq(target);
 			scx_bpf_dsq_insert_vtime(p, dsq, slice,
 						 tctx->deadline, 0);
 			stamp_wait(tctx, now, target_nr, false);

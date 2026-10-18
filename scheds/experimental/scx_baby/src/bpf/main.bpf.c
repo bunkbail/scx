@@ -92,11 +92,15 @@ static u64 cpu_running_at[BABY_MAX_CPUS];
 static u64 node_preempt_at;
 
 /*
- * Maximum consecutive Q1 (latency-critical) dispatches or wake/tick
- * preemptions a CPU may serve while its bulk queue holds waiting work.
- * Once q1_streak[cpu] reaches BABY_Q1_QUOTA, the next dispatch on that
- * CPU serves the bulk queue and resets the streak to 0, guaranteeing
- * bulk tasks at least 1 / (BABY_Q1_QUOTA + 1) of every contended CPU.
+ * Maximum consecutive Q1 (latency-critical) dispatches a CPU may serve
+ * while its bulk queue holds waiting work. Once q1_streak[cpu] reaches
+ * BABY_Q1_QUOTA, the next dispatch on that CPU serves the bulk queue
+ * and resets the streak to 0, guaranteeing bulk tasks at least
+ * 1 / (BABY_Q1_QUOTA + 1) of every contended CPU. The quota lives only
+ * in ops.dispatch(): wake and tick preemptions are self-bounded by the
+ * displaced resident's SCX_DSQ_LOCAL occupancy and its fresh 200us
+ * residency stamp, so counting them here would black the lane out
+ * without any dispatch in between to reset it (the M1.0 lesson).
  */
 #define BABY_Q1_QUOTA	2
 
@@ -321,13 +325,12 @@ s32 BPF_STRUCT_OPS(baby_select_cpu, struct task_struct *p,
 		 * 200us residency - mean ~700us of quantization wait on
 		 * a 1000Hz kernel, which is the depth-0 lat wait the
 		 * wlcri instrument read at 2x. This path serves the same
-		 * pair the moment the wake happens: when the wakee is
-		 * latency-critical, the victim is not, the wakee can
-		 * only run here, its Fast-Lane seat is empty (a bulk
-		 * head in the warm seat no longer hides it) with a unit
-		 * of the CPU's Q1 quota left, and the victim has held
-		 * the CPU for the same 200us floor, hand it the CPU now
-		 * instead of waiting for a tick.
+	 * pair the moment the wake happens: when the wakee is
+	 * latency-critical, the victim is not, the wakee can
+	 * only run here, its Fast-Lane seat is empty (a bulk
+	 * head in the warm seat no longer hides it), and the
+	 * victim has held the CPU for the same 200us floor, hand
+	 * it the CPU now instead of waiting for a tick.
 		 *
 		 * The deadline-beat check of the enqueue-side gate is
 		 * deliberately absent: the running victim renews its
@@ -357,7 +360,6 @@ s32 BPF_STRUCT_OPS(baby_select_cpu, struct task_struct *p,
 		struct task_struct *curr;
 		struct task_ctx *cctx;
 		u32 pcpu_idx = (u32)prev_cpu & (BABY_MAX_CPUS - 1);
-		bool bulk_busy;
 		u64 ran_at;
 
 		if (!tctx)
@@ -372,16 +374,17 @@ s32 BPF_STRUCT_OPS(baby_select_cpu, struct task_struct *p,
 		}
 		/*
 		 * The wakee runs on its own Fast-Lane seat, so a bulk
-		 * head in the warm seat no longer hides it. The gate
-		 * misses only when the Fast Lane seat itself is busy,
-		 * or the bulk seat is and the CPU's Q1 quota is spent
-		 * - in both cases the preempt would displace a waiter
-		 * of the same or higher claim.
+		 * head in the warm seat no longer hides it; the gate
+		 * misses only when the Fast-Lane seat itself holds a
+		 * waiter. Starvation is self-bounded: the displaced
+		 * resident sits in SCX_DSQ_LOCAL (blocking a second
+		 * preempt via LOCAL_BUSY) and gets a fresh 200us
+		 * residency stamp when it resumes. The Q1 quota takes
+		 * no part here: the preempt happens between dispatches,
+		 * and counting it would black the lane out - the M1.0
+		 * black-out trap.
 		 */
-		bulk_busy = scx_bpf_dsq_nr_queued(cpu2dsq(prev_cpu)) > 0;
-
-		if (scx_bpf_dsq_nr_queued(q1_cpu2dsq(prev_cpu)) ||
-		    (bulk_busy && q1_streak[pcpu_idx] >= BABY_Q1_QUOTA)) {
+		if (scx_bpf_dsq_nr_queued(q1_cpu2dsq(prev_cpu))) {
 			tctx->wake_gate_miss = BABY_WG_M3_SEAT_BUSY;
 			return cpu;
 		}
@@ -402,6 +405,12 @@ s32 BPF_STRUCT_OPS(baby_select_cpu, struct task_struct *p,
 		}
 		if (is_lat_cri(cctx)) {
 			tctx->wake_gate_miss = BABY_WG_M4_VICTIM_LAT;
+			/*
+			 * The wakee's prev_cpu is running another lat-cri
+			 * task; balance_try_warm_seat() reads this stamp
+			 * and spreads the wakee to the nearest CPU with
+			 * an empty Q1 seat instead of stacking it here.
+			 */
 			return cpu;
 		}
 		if (p->static_prio > curr->static_prio) {
@@ -416,19 +425,8 @@ s32 BPF_STRUCT_OPS(baby_select_cpu, struct task_struct *p,
 			return cpu;
 		}
 
-		/*
-		 * Under a busy bulk seat the preemptive slice is capped
-		 * to the deadline: a heavy foreground wakeup must not
-		 * delay the displaced resident - parked at the head of
-		 * the local DSQ - and the waiting bulk seat for four
-		 * deadlines. The serve also spends one unit of the
-		 * CPU's Q1 quota.
-		 */
-		if (bulk_busy)
-			q1_streak[pcpu_idx]++;
 		scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL_ON | prev_cpu,
-				   bulk_busy ? deadline_ns : task_slice(tctx),
-				   SCX_ENQ_PREEMPT);
+				   task_slice(tctx), SCX_ENQ_PREEMPT);
 		__sync_fetch_and_add(&nr_wake_preempts, 1);
 		if (stats_enabled)
 			__sync_fetch_and_add(
@@ -526,6 +524,7 @@ void BPF_STRUCT_OPS(baby_enqueue, struct task_struct *p, u64 enq_flags)
 	 * that never wakes has no latency to protect.
 	 */
 	if ((enq_flags & SCX_ENQ_WAKEUP) &&
+	    !scx_bpf_dsq_nr_queued(q1_cpu2dsq(prev_cpu)) &&
 	    !scx_bpf_dsq_nr_queued(cpu2dsq(prev_cpu)) &&
 	    (is_interactive(tctx) || is_foreground(tctx))) {
 		struct task_struct *curr = __COMPAT_scx_bpf_cpu_curr(prev_cpu);
@@ -568,13 +567,14 @@ void BPF_STRUCT_OPS(baby_enqueue, struct task_struct *p, u64 enq_flags)
 
 	/*
 	 * Nothing idle anywhere: take a place in the deadline order.
-	 * On an oversubscribed machine hand out longer slices, since
-	 * the task will rotate anyway and every extra rotation costs a
-	 * full switch. The latency-critical class takes the Fast-Lane
-	 * node queue, where dispatch serves it ahead of the bulk heads
-	 * under the quota; its slice never takes the deep-backlog
-	 * rung - its service comes from the lane order, not from a
-	 * longer quantum.
+	 * On an oversubscribed machine hand out longer slices to the
+	 * bulk classes, since the task will rotate anyway and every
+	 * extra rotation costs a full switch (the e13c rung). The
+	 * latency-critical class takes the Fast-Lane node queue, where
+	 * dispatch serves it ahead of the bulk heads under the quota;
+	 * it keeps the base quantum (task_slice()), because a long
+	 * lat-cri quantum is one the tick gate and the wake-preempt
+	 * both refuse to cut.
 	 */
 	{
 		s32 node = __COMPAT_scx_bpf_cpu_node(prev_cpu);
@@ -876,17 +876,18 @@ void BPF_STRUCT_OPS(baby_tick, struct task_struct *p)
 	 * the file). The victim's residency is measured from its
 	 * ops.running() stamp; the waiter is recognized by a non-empty
 	 * Fast Lane: this CPU's own Q1 seat, or the Q1 node queue under
-	 * the same one-CPU-at-a-time stamp as before. The quota gates
-	 * the cut like it gates the dispatch: past it, the CPU serves
-	 * bulk and the waiter waits for a quota reset instead of a cut.
+	 * the same one-CPU-at-a-time stamp as before. The quota takes
+	 * no part in the cut - the tick fires between dispatches, and
+	 * counting it would black the lane out without a dispatch to
+	 * reset it (the M1.0 lesson); baby_dispatch() owns the quota
+	 * when it chooses which queue to pop after the slice ends.
 	 */
 	if (!is_lat_cri(tctx)) {
 		s32 cpu = scx_bpf_task_cpu(p);
 		u32 idx = (u32)cpu & (BABY_MAX_CPUS - 1);
 		u64 ran_at = cpu_running_at[idx];
 
-		if (q1_streak[idx] < BABY_Q1_QUOTA &&
-		    now - ran_at >= BABY_TICK_PREEMPT_PROTECT_NS) {
+		if (now - ran_at >= BABY_TICK_PREEMPT_PROTECT_NS) {
 			s32 node = __COMPAT_scx_bpf_cpu_node(cpu);
 			bool cri = false;
 			bool warm = false;
