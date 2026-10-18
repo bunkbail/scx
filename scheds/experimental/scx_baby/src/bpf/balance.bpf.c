@@ -2,8 +2,6 @@
 /*
  * scx_baby: sched_ext port of the Baby Scheduler deadline variant (baby-dl)
  *
- * Copyright (C) 2026 bunkbail <nabildanial.93@gmail.com>
- *
  * The warm-seat balance under oversubscription: the sum gate, the
  * shallowest-nearest seat scan and the slice an arrival receives.
  * Returns true when the task was seated, so the caller can fall through

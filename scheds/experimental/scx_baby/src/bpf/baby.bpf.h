@@ -2,8 +2,6 @@
 /*
  * scx_baby: sched_ext port of the Baby Scheduler deadline variant (baby-dl)
  *
- * Copyright (C) 2026 bunkbail <nabildanial.93@gmail.com>
- *
  * Shared interface of the BPF modules. Every module includes this header:
  * it holds the shared types, the declarations of the tunables and counters
  * the skeleton publishes to userspace, the pure helpers and the

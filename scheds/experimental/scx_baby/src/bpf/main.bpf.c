@@ -2,8 +2,6 @@
 /*
  * scx_baby: sched_ext port of the Baby Scheduler deadline variant (baby-dl)
  *
- * Copyright (C) 2026 bunkbail <nabildanial.93@gmail.com>
- *
  * Every runnable task owns an absolute deadline and each CPU runs the
  * earliest one it can reach. Tasks that sleep before consuming their
  * deadline are treated as interactive and earn a nice boost; CPU hogs

@@ -2,8 +2,6 @@
 /*
  * scx_baby: sched_ext port of the Baby Scheduler deadline variant (baby-dl)
  *
- * Copyright (C) 2026 bunkbail <nabildanial.93@gmail.com>
- *
  * Per-task context and the cache-topology distance. This module owns the
  * task storage map, the topology tables userspace publishes and the
  * distance rank they define.
