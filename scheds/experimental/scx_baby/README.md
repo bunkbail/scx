@@ -12,12 +12,14 @@ Every runnable task owns a **deadline**, an absolute timestamp by which it
 would like to run. The CPU always runs the task with the earliest deadline
 it can reach:
 
-- All tasks wait in one deadline-ordered queue per NUMA node (a BPF DSQ
+- All bulk tasks wait in one deadline-ordered queue per NUMA node (a BPF DSQ
   priority queue keyed by the deadline), mirroring the original global run
   list. The queue order IS the placement: an idle CPU pulls the
   earliest-deadline task from wherever it waits. Each CPU also owns a
   small warm queue for tasks continuing on it (below), bounded so a
-  deeper backlog overflows into the node queue.
+  deeper backlog overflows into the node queue. The latency-critical
+  class waits in its own pair of queues beside these, the fast lane
+  (below).
 - Waking tasks are placed by the kernel's own idle-CPU selection
   (SMT-aware, previous-CPU biased, LLC-spread); a hit dispatches straight
   onto the CPU, skipping the queue. A task that stops on a fully loaded
@@ -66,6 +68,69 @@ it can reach:
   (a CPU hog) cannot preempt other tasks even when its deadline is earlier
   (`can_resched_curr()` carried over verbatim).
 
+### Dual lanes
+
+The mlfq line's structural addition to the deadline design: the
+latency-critical class no longer waits in the bulk queues. It gets a
+per-node fast-lane queue beside every bulk node queue and a per-CPU
+fast-lane seat beside every warm seat, so a game thread's wake never
+sits behind a batch slice. The line is named mlfq, but the landed
+design is a two-lane split, not a multilevel feedback queue: a bulk
+lane hierarchy was cut at kickoff for want of a population to order,
+since every measured cell's bulk lane held either nothing or
+single-class spinners.
+
+The trigger was 2x CPU overcommit, where the shared warm seat was
+occupied by batch work two thirds of the time: that occupancy made
+the depth-0 wake preempt miss and the shallowest-first rebalance
+evict latency-critical wakes, and it was the root of the remaining 2x
+gap to scx_lavd. Dispatch arbitrates the lanes with a per-CPU quota:
+a CPU serves at most BABY_Q1_QUOTA (2) fast-lane tasks between bulk
+tasks while its bulk queue holds waiting work, so bulk keeps at least
+a third of every contended CPU and the fast lane still empties
+instantly when bulk is idle. The quota lives only in ops.dispatch():
+wake and tick preemptions are self-bounded by the displaced
+resident's local-queue occupancy and its fresh 200us residency stamp,
+and counting them here would black the lane out with no dispatch in
+between to reset the streak. With the class out of the bulk seats,
+the wake preempt no longer misses on bulk occupancy, its preemptive
+slice is capped to the deadline when the bulk seat is busy so a
+foreground wakeup cannot stretch the displaced resident's wait to
+four deadlines, and the three two-entry queue iterators the old
+depth-1 pulls and the tick's seat peek needed become redundant and
+are deleted - the fast lane exposes the waiter by queue
+non-emptiness.
+
+The oversubscription gates are per lane, keyed on state the queues
+cannot express: queue depth cannot say whether a CPU runs a
+tick-cuttable bulk resident, since at the 1x wall the spinners never
+queue and bulk depth reads zero exactly where bulk residency is
+total. A per-CPU cpu_is_lat[] array, stamped in ops.running() and
+cleared in ops.stopping(), carries that residency. The bulk clause
+keeps the single-lane gate (queue depth plus the task's own seat
+depth); the fast-lane clause opens warm seats only when the fast lane
+itself is oversubscribed, its running residents plus backlog past one
+spare lane. The same array filters the tick preemption's relocation
+scan: below a two-deep seat a latency-critical wake relocates only
+onto a CPU running cuttable bulk, since a relocation onto another
+un-cuttable latency-critical resident is a pure migration. The
+warm-seat depth rung stays bulk-only, because a non-foreground
+latency-critical arrival granted the fourfold slice becomes a long
+resident no preemption path can cut; the shared-node rung drops its
+lane condition, since foreground tasks already pay the fourfold slice
+in task_slice().
+
+One summed gate for both lanes seats game-thread wakes warm behind
+bulk and cost the gaming cell 12.6pp of its frames; dropping the
+fast-lane term instead leaves warm seats off on a pure
+latency-critical swarm and cost the medium and saturated cells
+7.5-8.0%. The per-lane gates clear both. Against the single-lane
+deadline build, the line measures +5.9..+6.3% in the gaming cell,
++5.0% at 2x overcommit with p99.9 waits down 18%, +4.5% at 1x, and
+parity at 4x and in the medium and saturated cells on the homogeneous
+test machine, and parity on the hybrid laptop's light and Geekbench
+single-core gates.
+
 ### Task classes
 
 Ordering, slice length and preemption eligibility are driven by two
@@ -87,10 +152,11 @@ so the peak, not the current rate, is what proves the task's nature.
   size - game render threads, compositors, submission workers; under
   CPU overcommit a game thread is heavy too, so no burst bound can gate
   this, and a task that never left runnable state never re-runs the
-  EWMA, so a preempted batch task cannot pass as a waker. No placement
-  and no slice role: this class gates the saturation tick preemption,
-  on both sides - a latency-critical waiter triggers it, a
-  latency-critical victim is shielded from it.
+  EWMA, so a preempted batch task cannot pass as a waker. Placement:
+  the class waits in the fast lane, never behind bulk work (above).
+  It also gates the saturation tick preemption, on both sides - a
+  latency-critical waiter triggers it, a latency-critical victim is
+  shielded from it.
 - **Interactive**: used less than a quarter of a CPU in its last window.
   UI blips and event loops. Eligible to preempt on wakeup.
 - **Foreground**: wakes frequently and does real work. A browser renderer
@@ -104,9 +170,11 @@ so the peak, not the current rate, is what proves the task's nature.
   It holds its CPU across slice boundaries through the sticky rule and
   ramps the CPU frequency to full at once.
 
-The classes do not steer placement: on a single-tier machine the deadline
-order places everything. The big/little sets the scheduler still publishes
-are for the per-tier queues a hybrid platform needs.
+The classes do not steer CPU selection: on a single-tier machine the
+deadline order places everything, and the latency-critical class's fast
+lane is the one queue-level exception (above). The big/little sets the
+scheduler still publishes are for the per-tier queues a hybrid platform
+needs.
 
 ### Fairness
 
@@ -156,7 +224,7 @@ produced.
 
 | Original (5.14 sched class) | scx_baby |
 | --- | --- |
-| per-rq linked list, O(n) earliest-deadline scan (`pick_next_entity`) | one per-node DSQ priority queue ordered by deadline |
+| per-rq linked list, O(n) earliest-deadline scan (`pick_next_entity`) | per-node DSQ priority queues ordered by deadline: the bulk lane, plus the fast-lane pair for the latency-critical class |
 | `update_curr()` burst accounting and deadline renewal | `ops.stopping()` / `ops.tick()` |
 | `hrtick_start_fair()` micro-preemption | slice-end comparison in `ops.dispatch()`: the running task continues only while its deadline beats the heads of the warm and node queues |
 | `check_preempt_wakeup()` | deadline comparison against the previous CPU's current task, gated to an empty warm queue on that CPU; eligible wakers are placed ahead of the victim on its local queue |
@@ -168,6 +236,7 @@ produced.
 | saturation service for latency-critical wakes (absent in the original) | `ops.tick()` cuts a batch victim's slice short when a wake-rate-classified latency-critical task waits at a queue head this CPU serves; the victim requeues on the base slice, behind the waiter |
 | sleep-before-deadline `p->prio--` | per-task `boost` counter shifting the effective nice level, since sched_ext cannot change a task's static priority |
 | wake-frequency interactivity (absent in the original) | wake-frequency EWMA from `ops.runnable`, in the spirit of scx_flash's `wakeup_freq` |
+| latency-critical wakes queuing behind batch slices (absent in the original) | fast-lane queue pair with `BABY_Q1_QUOTA` dispatch arbitration, and per-lane oversubscription gates keyed on `cpu_is_lat[]` running-class residency |
 | 803 HZ / periodic tick / no dynticks kernel hacks | dropped: sched_ext does not need them |
 
 ## Options
