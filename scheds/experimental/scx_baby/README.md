@@ -313,8 +313,7 @@ counters are diagnostic and do not feed the scheduling policy.
 $ cargo build --release -p scx_baby
 ```
 
-The binary lands in `target/release/scx_baby`. For a static musl build, see
-[docs/musl-static-build.md](docs/musl-static-build.md).
+The binary lands in `target/release/scx_baby`.
 
 ## Example
 

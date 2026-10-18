@@ -11,9 +11,6 @@ tree.
   Support crates are under rust/ and tools under tools/. The C example
   schedulers live in the kernel tree, under tools/sched_ext.
   DEVELOPER_GUIDE.md covers development kernels and tooling.
-- A crate can carry its own AGENTS.md with local conventions. Read it
-  before editing that crate; it extends this file rather than replacing
-  it.
 - Build with `cargo build` and test with `cargo test`. CI checks `cargo
   fmt`, runs clang-format on the C sources of tools/scxtop,
   scheds/rust/scx_chaos and scheds/rust/scx_mitosis, runs `make -C
