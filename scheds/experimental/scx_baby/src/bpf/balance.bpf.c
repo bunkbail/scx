@@ -57,67 +57,32 @@ __hidden bool balance_try_warm_seat(struct task_struct *p, struct task_ctx *tctx
 
 	if (bpf_cpumask_test_cpu(prev_cpu, p->cpus_ptr)) {
 		bool lat = is_lat_cri(tctx);
+		bool vlat = lat && tctx->wake_gate_miss == BABY_WG_M4_VICTIM_LAT;
 		s32 target = prev_cpu;
-		u64 bulk_nr = scx_bpf_dsq_nr_queued(cpu2dsq(target));
-		u64 target_nr = lat ?
-				scx_bpf_dsq_nr_queued(q1_cpu2dsq(target)) :
-				bulk_nr;
-		/*
-		 * A waking lat-cri task whose prev_cpu is already running
-		 * another lat-cri task (BABY_WG_M4_VICTIM_LAT) or holds a
-		 * two-deep Q1 seat must spread to the nearest CPU with an
-		 * empty Q1 seat instead of self-stacking on prev_cpu.
-		 */
-		u64 eff_nr = target_nr +
-			     (lat && tctx->wake_gate_miss ==
-					     BABY_WG_M4_VICTIM_LAT ? 2 : 0);
-		u64 warm_total = lat ? target_nr : 0, best_nr = eff_nr, i;
-		u32 best_rank = BABY_DIST_SELF, rank;
+		u64 target_nr = scx_bpf_dsq_nr_queued(lat ?
+						      q1_cpu2dsq(target) :
+						      cpu2dsq(target));
+		u64 b_warm = 0, q_warm = 0, lat_running = 0;
+		u64 best_nr = BABY_MAX_CPUS, i;
+		u32 best_rank = BABY_DIST_NR, rank;
 		s32 best = target;
 
 		bpf_for(i, 0, nr_cpu_ids) {
-			u64 nr = scx_bpf_dsq_nr_queued(cpu2dsq(i));
+			u64 b_nr = scx_bpf_dsq_nr_queued(cpu2dsq(i));
+			u64 q_nr = scx_bpf_dsq_nr_queued(q1_cpu2dsq(i));
+			u64 nr = lat ? q_nr : b_nr;
+			bool i_lat = cpu_is_lat[i & (BABY_MAX_CPUS - 1)];
 
-			warm_total += nr;
+			b_warm += b_nr;
+			q_warm += q_nr;
+			if (i_lat)
+				lat_running++;
 
-			/*
-			 * The warm-seat balance: a wake whose previous CPU
-			 * already holds two more waiting tasks than the
-			 * shallowest warm queue seats the shallowest one
-			 * instead, the way the old saturation rebalance
-			 * evened the home queues out. Without it the seats
-			 * drift into a skew that no idle CPU can heal,
-			 * since a warm queue is invisible to the other
-			 * CPUs; the shared queue only sees what spills
-			 * into it.
-			 *
-			 * Depth dominates, distance breaks ties: among
-			 * queues at the same depth, the one nearest the
-			 * task's previous CPU - SMT sibling before a
-			 * farther core - keeps the refill cost down
-			 * without giving up any of the balance. The
-			 * distance is computed once per queue into a
-			 * variable (see the note on cpu_dist): two
-			 * inlined evaluations in the comparison below
-			 * explode the verifier's state space.
-			 *
-			 * The rebalance needs an effective depth of two,
-			 * and never re-reads the seat the task came from:
-			 * its depth and distance are already seeded into
-			 * best, and letting the scan re-read them lets an
-			 * empty local Q1 seat capture the vlat relocation
-			 * and pins lat-cri twins onto one CPU (the M1.1
-			 * dead-code lesson). The Q1 Fast Lane scans its
-			 * own seats when it does rebalance - a lat-cri
-			 * wake stacks onto a busy bulk seat without harm.
-			 */
-			if ((s32)i == target || eff_nr < 2 ||
+			if ((s32)i == target ||
+			    (target_nr < 2 && (!vlat || i_lat)) ||
 			    !(enq_flags & SCX_ENQ_WAKEUP) ||
 			    !bpf_cpumask_test_cpu((s32)i, p->cpus_ptr))
 				continue;
-
-			if (lat)
-				nr = scx_bpf_dsq_nr_queued(q1_cpu2dsq(i));
 
 			rank = cpu_dist(prev_cpu, i);
 			if (nr < best_nr ||
@@ -128,20 +93,46 @@ __hidden bool balance_try_warm_seat(struct task_struct *p, struct task_ctx *tctx
 			}
 		}
 
-		if (nr_running + backlog + warm_total > nr_cpu_ids + 1) {
+		/*
+		 * Per-lane oversubscription. One gate summing
+		 * bulk_running (inside nr_running) with Q1 backlog
+		 * seats game wakes warm whenever bulk sits at its 1x
+		 * wall and the frame threads burst - 12.6pp of game2
+		 * (the M1.6 law). The bulk clause is the single-lane
+		 * gate: queue depth plus the task's own seat. The lat
+		 * clause opens warm seats only when the lat lane
+		 * itself is oversubscribed (the ab5600 swarm, whose
+		 * bulk lane is empty).
+		 */
+		if (nr_running + backlog + b_warm + (lat ? target_nr : 0) >
+			    nr_cpu_ids + 1 ||
+		    lat_running + backlog + q_warm > nr_cpu_ids + 1) {
 			/*
-			 * On a deep backlog - shared or local - the
-			 * task will rotate anyway and every extra
-			 * rotation costs a full switch, so grant four
-			 * times the slice (e13c, docs/adr/0006). The
-			 * rung is bulk-only: foreground lat-cri tasks
-			 * already earn the fourfold slice from
-			 * task_slice(), and the M1.3a arm keeps the
-			 * non-foreground lat-cri blips at the base
-			 * quantum - the exact M1.0 slice policy.
+			 * A waking lat-cri task whose prev_cpu is running
+			 * another lat-cri task (BABY_WG_M4_VICTIM_LAT) gets
+			 * an effective depth of two and relocates to the
+			 * nearest CPU whose Q1 seat is shallow AND whose
+			 * resident is cuttable bulk: for shallow seats the
+			 * scan skips lat-resident CPUs, since a relocation
+			 * onto an un-cuttable lat resident is a pure
+			 * migration (the M1.6a lesson, which cost 2x its
+			 * p99.9). A pure lat swarm filters out every CPU,
+			 * so M4 stays off there.
+			 */
+			u64 eff_nr = target_nr + (vlat ? 2 : 0);
+			/*
+			 * The depth rung is bulk-only: a slice above
+			 * task_slice() must exclude the lat lane, because a
+			 * non-foreground lat-cri arrival granted 4x becomes a
+			 * 4.72ms Q1 resident that neither the tick gate, the
+			 * wake-preempt gates nor a seat relocation can cut -
+			 * and game threads stack two-deep on exactly those
+			 * seats (the M1.1/M1.4 lesson). Foreground tasks earn
+			 * the fourfold slice from task_slice() itself, so the
+			 * exclusion is a no-op wherever every lat-cri task is
+			 * foreground (ab5600 med/sat).
 			 */
 			u64 slice = (!lat && (backlog_deep(backlog) ||
-					      bulk_nr >= 2 ||
 					      target_nr >= 2)) ?
 				    4 * deadline_ns : task_slice(tctx);
 			u64 dsq;

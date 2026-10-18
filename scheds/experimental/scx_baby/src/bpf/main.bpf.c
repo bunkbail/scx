@@ -89,6 +89,7 @@ private(BABY) struct bpf_cpumask __kptr *little_cpumask;
 #define BABY_TICK_PREEMPT_FALLBACK_NS	(100ULL * NSEC_PER_USEC)
 
 static u64 cpu_running_at[BABY_MAX_CPUS];
+bool cpu_is_lat[BABY_MAX_CPUS];
 static u64 node_preempt_at;
 
 /*
@@ -567,19 +568,17 @@ void BPF_STRUCT_OPS(baby_enqueue, struct task_struct *p, u64 enq_flags)
 
 	/*
 	 * Nothing idle anywhere: take a place in the deadline order.
-	 * On an oversubscribed machine hand out longer slices to the
-	 * bulk classes (the e13c rung); the M1.3a arm keeps the exact
-	 * M1.0 slice policy - foreground lat-cri tasks earn the
-	 * fourfold slice from task_slice(), the non-foreground rest
-	 * stay at the base quantum. The latency-critical class takes
-	 * the Fast-Lane node queue, where dispatch serves it ahead of
-	 * the bulk heads under the quota.
+	 * On an oversubscribed machine hand out longer slices on a
+	 * deep backlog (the e13c rung, both lanes since M1.4). The
+	 * latency-critical class takes the Fast-Lane node queue,
+	 * where dispatch serves it ahead of the bulk heads under the
+	 * quota.
 	 */
 	{
 		s32 node = __COMPAT_scx_bpf_cpu_node(prev_cpu);
 		bool lat = is_lat_cri(tctx);
 
-		slice = (!lat && backlog_deep(backlog) && !tctx->tick_preempted)
+		slice = backlog_deep(backlog) && !tctx->tick_preempted
 			? 4 * deadline_ns : task_slice(tctx);
 
 		scx_bpf_dsq_insert_vtime(p, lat ? q1_node2dsq(node) : (u64)node,
@@ -930,6 +929,12 @@ void BPF_STRUCT_OPS(baby_stopping, struct task_struct *p, bool runnable)
 
 	__sync_fetch_and_sub(&nr_running, 1);
 
+	/*
+	 * The CPU's running-class residency lapses with the resident;
+	 * ops.running() re-stamps it when the next task is served.
+	 */
+	cpu_is_lat[scx_bpf_task_cpu(p) & (BABY_MAX_CPUS - 1)] = false;
+
 	if (!tctx)
 		return;
 
@@ -997,9 +1002,16 @@ void BPF_STRUCT_OPS(baby_running, struct task_struct *p)
 	/*
 	 * The victim-residency stamp for the tick preemption gate, and
 	 * the point where a task that was cut short stops carrying the
-	 * preempted mark: the requeue has happened by now.
+	 * preempted mark: the requeue has happened by now. The running
+	 * class rides along for the warm gate and the M4 relocation
+	 * filter (see cpu_is_lat).
 	 */
-	cpu_running_at[scx_bpf_task_cpu(p) & (BABY_MAX_CPUS - 1)] = now;
+	{
+		u32 cpu_idx = scx_bpf_task_cpu(p) & (BABY_MAX_CPUS - 1);
+
+		cpu_running_at[cpu_idx] = now;
+		cpu_is_lat[cpu_idx] = tctx && is_lat_cri(tctx);
+	}
 
 	if (!tctx)
 		return;

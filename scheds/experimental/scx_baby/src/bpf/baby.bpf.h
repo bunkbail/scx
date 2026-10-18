@@ -118,6 +118,15 @@ extern const volatile u32 topo_core[BABY_MAX_CPUS];
 extern u64 nr_little_cpus, nr_big_cpus;
 
 /*
+ * Per-CPU running-class residency, stamped in ops.running() and cleared
+ * in ops.stopping(). Queue depth cannot answer whether a CPU runs a
+ * tick-cuttable bulk resident: spinners never queue (game2 oc2 reads
+ * bulk_total == 0 at the 1x wall), so the M4 relocation filter and the
+ * per-lane warm gate read this instead.
+ */
+extern bool cpu_is_lat[BABY_MAX_CPUS];
+
+/*
  * Scheduling statistics. nr_running owns a cache line: it is a
  * control-plane input read on the hot paths, and the diagnostic
  * counters must not share its line (see stats.bpf.c).
