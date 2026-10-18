@@ -56,12 +56,22 @@ __hidden bool balance_try_warm_seat(struct task_struct *p, struct task_ctx *tctx
 		return false;
 
 	if (bpf_cpumask_test_cpu(prev_cpu, p->cpus_ptr)) {
+		bool lat = is_lat_cri(tctx);
 		s32 target = prev_cpu;
-		u64 target_nr = scx_bpf_dsq_nr_queued(cpu2dsq(target));
-		u64 warm_total = 0, best_nr = target_nr, i;
+		u64 target_nr = scx_bpf_dsq_nr_queued(lat ?
+						      q1_cpu2dsq(target) :
+						      cpu2dsq(target));
+		u64 warm_total = lat ? target_nr : 0, best_nr = target_nr, i;
 		u32 best_rank = BABY_DIST_SELF, rank;
 		s32 best = target;
 
+		/*
+		 * The Q1 Fast Lane does not rebalance: its wakes park on
+		 * the cache-warm seat they belong to, and the depth-0
+		 * wake preempt plus the dispatch quota keep a busy
+		 * Fast-Lane seat from hiding the waiter. Only the bulk
+		 * classes read the shallowest-nearest scan.
+		 */
 		bpf_for(i, 0, nr_cpu_ids) {
 			u64 nr = scx_bpf_dsq_nr_queued(cpu2dsq(i));
 
@@ -95,7 +105,8 @@ __hidden bool balance_try_warm_seat(struct task_struct *p, struct task_ctx *tctx
 			 * never move the task. Keep only the warm_total
 			 * accounting.
 			 */
-			if (target_nr < 2 || !(enq_flags & SCX_ENQ_WAKEUP) ||
+			if (lat || target_nr < 2 ||
+			    !(enq_flags & SCX_ENQ_WAKEUP) ||
 			    !bpf_cpumask_test_cpu((s32)i, p->cpus_ptr))
 				continue;
 
@@ -113,9 +124,14 @@ __hidden bool balance_try_warm_seat(struct task_struct *p, struct task_ctx *tctx
 			 * On a deep backlog - shared or local - the
 			 * task will rotate anyway and every extra
 			 * rotation costs a full switch, so grant four
-			 * times the slice.
+			 * times the slice. The Fast Lane keeps its own
+			 * slice: its service comes from the lane order,
+			 * and inflating it would only extend the seat
+			 * occupancy the quota arbitrates.
 			 */
-			u64 slice = (backlog_deep(backlog) || target_nr >= 2) ?
+			u64 dsq = lat ? q1_cpu2dsq(target) : cpu2dsq(target);
+			u64 slice = (!lat && (backlog_deep(backlog) ||
+					      target_nr >= 2)) ?
 				    4 * deadline_ns : task_slice(tctx);
 
 			if (best != target && best_nr + 2 <= target_nr) {
@@ -130,7 +146,7 @@ __hidden bool balance_try_warm_seat(struct task_struct *p, struct task_ctx *tctx
 				__sync_fetch_and_add(&nr_seat_self, 1);
 			}
 
-			scx_bpf_dsq_insert_vtime(p, cpu2dsq(target), slice,
+			scx_bpf_dsq_insert_vtime(p, dsq, slice,
 						 tctx->deadline, 0);
 			stamp_wait(tctx, now, target_nr, false);
 			__sync_fetch_and_add(&nr_arr_seat, 1);

@@ -40,10 +40,10 @@ __attribute__((aligned(64))) volatile u64 nr_direct_dispatches,
 volatile u64 nr_tick_preempts, nr_tick_preempts_warm;
 
 /*
- * Depth-1 out-of-turn pulls: latency-critical waiters served past a
- * non-lat-cri queue head at ops.dispatch(), split by which queue held
- * them - the node deadline queue or the CPU's own warm seat (where the
- * wake arrivals park).
+ * Fast-Lane services under bulk pressure: Q1 dispatches served while
+ * the CPU's bulk queue held waiting work (one quota unit each), split
+ * by which queue held them - the fast-lane node queue or the CPU's
+ * own fast-lane warm seat (where the wake arrivals park).
  */
 volatile u64 nr_depth1_pulls, nr_depth1_pulls_seat;
 
@@ -249,9 +249,10 @@ __hidden void charge_wait(struct task_ctx *tctx, u64 now)
 
 /*
  * Consumption census: the queue state a lane came to pick work from -
- * the depth left in its warm seat and the shared backlog the rotation
- * turns on. Sampled at every dispatch, so the distribution carries the
- * consumption-rate weighting the arrival-time wait stamp lacks.
+ * the depth left in its warm seats (both lanes) and the shared backlog
+ * the rotation turns on. Sampled at every dispatch, so the
+ * distribution carries the consumption-rate weighting the arrival-time
+ * wait stamp lacks.
  */
 __hidden void census_sample(s32 cpu)
 {
@@ -259,8 +260,10 @@ __hidden void census_sample(s32 cpu)
 		return;
 
 	s32 node = __COMPAT_scx_bpf_cpu_node(cpu);
-	u64 seat = scx_bpf_dsq_nr_queued(cpu2dsq(cpu));
-	u64 backlog = scx_bpf_dsq_nr_queued(node);
+	u64 seat = scx_bpf_dsq_nr_queued(cpu2dsq(cpu)) +
+		   scx_bpf_dsq_nr_queued(q1_cpu2dsq(cpu));
+	u64 backlog = scx_bpf_dsq_nr_queued(node) +
+		      scx_bpf_dsq_nr_queued(q1_node2dsq(node));
 	u8 s = (u8)MIN(seat, BABY_CENSUS_NR - 1);
 	u8 g = (u8)MIN(backlog, BABY_CENSUS_NR - 1);
 
