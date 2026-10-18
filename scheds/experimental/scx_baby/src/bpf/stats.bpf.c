@@ -40,10 +40,11 @@ __attribute__((aligned(64))) volatile u64 nr_direct_dispatches,
 volatile u64 nr_tick_preempts, nr_tick_preempts_warm;
 
 /*
- * Fast-Lane services under bulk pressure: Q1 dispatches served while
- * the CPU's bulk queue held waiting work (one quota unit each), split
- * by which queue held them - the fast-lane node queue or the CPU's
- * own fast-lane warm seat (where the wake arrivals park).
+ * Fast-Lane services under bulk pressure: the dispatches served out
+ * of the fast lane while the CPU's bulk queue held waiting work (one
+ * quota unit each), split by which queue held them - the fast-lane
+ * node queue or the CPU's own fast-lane warm seat (where the wake
+ * arrivals park).
  */
 volatile u64 nr_depth1_pulls, nr_depth1_pulls_seat;
 
@@ -261,9 +262,9 @@ __hidden void census_sample(s32 cpu)
 
 	s32 node = __COMPAT_scx_bpf_cpu_node(cpu);
 	u64 seat = scx_bpf_dsq_nr_queued(cpu2dsq(cpu)) +
-		   scx_bpf_dsq_nr_queued(q1_cpu2dsq(cpu));
+		   scx_bpf_dsq_nr_queued(fl_cpu2dsq(cpu));
 	u64 backlog = scx_bpf_dsq_nr_queued(node) +
-		      scx_bpf_dsq_nr_queued(q1_node2dsq(node));
+		      scx_bpf_dsq_nr_queued(fl_node2dsq(node));
 	u8 s = (u8)MIN(seat, BABY_CENSUS_NR - 1);
 	u8 g = (u8)MIN(backlog, BABY_CENSUS_NR - 1);
 

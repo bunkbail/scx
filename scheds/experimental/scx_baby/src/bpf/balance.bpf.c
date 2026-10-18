@@ -60,7 +60,7 @@ __hidden bool balance_try_warm_seat(struct task_struct *p, struct task_ctx *tctx
 		bool vlat = lat && tctx->wake_gate_miss == BABY_WG_M4_VICTIM_LAT;
 		s32 target = prev_cpu;
 		u64 target_nr = scx_bpf_dsq_nr_queued(lat ?
-						      q1_cpu2dsq(target) :
+						      fl_cpu2dsq(target) :
 						      cpu2dsq(target));
 		u64 b_warm = 0, q_warm = 0, lat_running = 0;
 		u64 best_nr = BABY_MAX_CPUS, i;
@@ -69,7 +69,7 @@ __hidden bool balance_try_warm_seat(struct task_struct *p, struct task_ctx *tctx
 
 		bpf_for(i, 0, nr_cpu_ids) {
 			u64 b_nr = scx_bpf_dsq_nr_queued(cpu2dsq(i));
-			u64 q_nr = scx_bpf_dsq_nr_queued(q1_cpu2dsq(i));
+			u64 q_nr = scx_bpf_dsq_nr_queued(fl_cpu2dsq(i));
 			u64 nr = lat ? q_nr : b_nr;
 			bool i_lat = cpu_is_lat[i & (BABY_MAX_CPUS - 1)];
 
@@ -95,7 +95,7 @@ __hidden bool balance_try_warm_seat(struct task_struct *p, struct task_ctx *tctx
 
 		/*
 		 * Per-lane oversubscription. One gate summing
-		 * bulk_running (inside nr_running) with Q1 backlog
+		 * bulk_running (inside nr_running) with fast-lane backlog
 		 * seats game wakes warm whenever bulk sits at its 1x
 		 * wall and the frame threads burst - 12.6pp of game2
 		 * (the M1.6 law). The bulk clause is the single-lane
@@ -111,7 +111,7 @@ __hidden bool balance_try_warm_seat(struct task_struct *p, struct task_ctx *tctx
 			 * A waking lat-cri task whose prev_cpu is running
 			 * another lat-cri task (BABY_WG_M4_VICTIM_LAT) gets
 			 * an effective depth of two and relocates to the
-			 * nearest CPU whose Q1 seat is shallow AND whose
+			 * nearest CPU whose fast-lane seat is shallow AND whose
 			 * resident is cuttable bulk: for shallow seats the
 			 * scan skips lat-resident CPUs, since a relocation
 			 * onto an un-cuttable lat resident is a pure
@@ -124,7 +124,7 @@ __hidden bool balance_try_warm_seat(struct task_struct *p, struct task_ctx *tctx
 			 * The depth rung is bulk-only: a slice above
 			 * task_slice() must exclude the lat lane, because a
 			 * non-foreground lat-cri arrival granted 4x becomes a
-			 * 4.72ms Q1 resident that neither the tick gate, the
+			 * 4.72ms fast-lane resident that neither the tick gate, the
 			 * wake-preempt gates nor a seat relocation can cut -
 			 * and game threads stack two-deep on exactly those
 			 * seats (the M1.1/M1.4 lesson). Foreground tasks earn
@@ -149,7 +149,7 @@ __hidden bool balance_try_warm_seat(struct task_struct *p, struct task_ctx *tctx
 				__sync_fetch_and_add(&nr_seat_self, 1);
 			}
 
-			dsq = lat ? q1_cpu2dsq(target) : cpu2dsq(target);
+			dsq = lat ? fl_cpu2dsq(target) : cpu2dsq(target);
 			scx_bpf_dsq_insert_vtime(p, dsq, slice,
 						 tctx->deadline, 0);
 			stamp_wait(tctx, now, target_nr, false);

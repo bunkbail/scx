@@ -21,15 +21,16 @@ enum consts {
 	NSEC_PER_SEC = (1000ULL * NSEC_PER_MSEC),
 
 	/*
-	 * DSQ ID layout:
-	 *   [0 .. BABY_Q1_NODE_DSQ_BASE)          : bulk per-node DSQs
-	 *   [BABY_Q1_NODE_DSQ_BASE .. BABY_CPU_DSQ_BASE) : Q1 lat-cri per-node DSQs
-	 *   [BABY_CPU_DSQ_BASE .. BABY_Q1_CPU_DSQ_BASE)  : bulk per-CPU warm seats
-	 *   [BABY_Q1_CPU_DSQ_BASE .. )            : Q1 lat-cri per-CPU warm seats
+	 * DSQ ID layout. FL marks the fast lane, the latency-critical
+	 * class's own queues:
+	 *   [0 .. BABY_FL_NODE_DSQ_BASE)          : bulk per-node DSQs
+	 *   [BABY_FL_NODE_DSQ_BASE .. BABY_CPU_DSQ_BASE) : FL per-node DSQs
+	 *   [BABY_CPU_DSQ_BASE .. BABY_FL_CPU_DSQ_BASE)  : bulk per-CPU warm seats
+	 *   [BABY_FL_CPU_DSQ_BASE .. )            : FL per-CPU warm seats
 	 */
-	BABY_Q1_NODE_DSQ_BASE = 50,
+	BABY_FL_NODE_DSQ_BASE = 50,
 	BABY_CPU_DSQ_BASE = 100,
-	BABY_Q1_CPU_DSQ_BASE = 300,
+	BABY_FL_CPU_DSQ_BASE = 300,
 };
 
 #ifndef __VMLINUX_H__

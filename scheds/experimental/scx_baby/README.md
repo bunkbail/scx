@@ -70,22 +70,21 @@ it can reach:
 
 ### Dual lanes
 
-The mlfq line's structural addition to the deadline design: the
-latency-critical class no longer waits in the bulk queues. It gets a
-per-node fast-lane queue beside every bulk node queue and a per-CPU
-fast-lane seat beside every warm seat, so a game thread's wake never
-sits behind a batch slice. The line is named mlfq, but the landed
-design is a two-lane split, not a multilevel feedback queue: a bulk
-lane hierarchy was cut at kickoff for want of a population to order,
-since every measured cell's bulk lane held either nothing or
-single-class spinners.
+The structural addition to the deadline design: the latency-critical
+class no longer waits in the bulk queues. It gets a per-node
+fast-lane queue beside every bulk node queue and a per-CPU fast-lane
+seat beside every warm seat, so a game thread's wake never sits
+behind a batch slice. The design is a two-lane split rather than a
+deeper hierarchy: a bulk lane hierarchy was considered and cut early,
+for want of a population to order - every measured cell's bulk lane
+held either nothing or single-class spinners.
 
 The trigger was 2x CPU overcommit, where the shared warm seat was
 occupied by batch work two thirds of the time: that occupancy made
 the depth-0 wake preempt miss and the shallowest-first rebalance
 evict latency-critical wakes, and it was the root of the remaining 2x
 gap to scx_lavd. Dispatch arbitrates the lanes with a per-CPU quota:
-a CPU serves at most BABY_Q1_QUOTA (2) fast-lane tasks between bulk
+a CPU serves at most BABY_FL_QUOTA (2) fast-lane tasks between bulk
 tasks while its bulk queue holds waiting work, so bulk keeps at least
 a third of every contended CPU and the fast lane still empties
 instantly when bulk is idle. The quota lives only in ops.dispatch():
@@ -125,7 +124,7 @@ bulk and cost the gaming cell 12.6pp of its frames; dropping the
 fast-lane term instead leaves warm seats off on a pure
 latency-critical swarm and cost the medium and saturated cells
 7.5-8.0%. The per-lane gates clear both. Against the single-lane
-deadline build, the line measures +5.9..+6.3% in the gaming cell,
+deadline build, the dual-lane build measures +5.9..+6.3% in the gaming cell,
 +5.0% at 2x overcommit with p99.9 waits down 18%, +4.5% at 1x, and
 parity at 4x and in the medium and saturated cells on the homogeneous
 test machine, and parity on the hybrid laptop's light and Geekbench
@@ -236,7 +235,7 @@ produced.
 | saturation service for latency-critical wakes (absent in the original) | `ops.tick()` cuts a batch victim's slice short when a wake-rate-classified latency-critical task waits at a queue head this CPU serves; the victim requeues on the base slice, behind the waiter |
 | sleep-before-deadline `p->prio--` | per-task `boost` counter shifting the effective nice level, since sched_ext cannot change a task's static priority |
 | wake-frequency interactivity (absent in the original) | wake-frequency EWMA from `ops.runnable`, in the spirit of scx_flash's `wakeup_freq` |
-| latency-critical wakes queuing behind batch slices (absent in the original) | fast-lane queue pair with `BABY_Q1_QUOTA` dispatch arbitration, and per-lane oversubscription gates keyed on `cpu_is_lat[]` running-class residency |
+| latency-critical wakes queuing behind batch slices (absent in the original) | fast-lane queue pair with `BABY_FL_QUOTA` dispatch arbitration, and per-lane oversubscription gates keyed on `cpu_is_lat[]` running-class residency |
 | 803 HZ / periodic tick / no dynticks kernel hacks | dropped: sched_ext does not need them |
 
 ## Options

@@ -34,12 +34,12 @@
  * with more nodes than that).
  *
  * The latency-critical class runs on its own pair of queues with the
- * same layout one id space over (the Q1 Fast Lane): a per-node queue
- * from BABY_Q1_NODE_DSQ_BASE and per-CPU warm seats from
- * BABY_Q1_CPU_DSQ_BASE. Keeping the class out of the bulk seats is
+ * same layout one id space over (the fast lane): a per-node queue
+ * from BABY_FL_NODE_DSQ_BASE and per-CPU warm seats from
+ * BABY_FL_CPU_DSQ_BASE. Keeping the class out of the bulk seats is
  * what lets the depth-0 wake preempt fire past an occupied bulk seat
  * instead of missing it, and a per-CPU dispatch quota bounds what the
- * Fast Lane can take from a contended CPU.
+ * fast lane can take from a contended CPU.
  */
 
 extern u64 nr_cpu_ids;
@@ -49,14 +49,14 @@ static __always_inline u64 cpu2dsq(s32 cpu)
 	return BABY_CPU_DSQ_BASE + cpu;
 }
 
-static __always_inline u64 q1_cpu2dsq(s32 cpu)
+static __always_inline u64 fl_cpu2dsq(s32 cpu)
 {
-	return BABY_Q1_CPU_DSQ_BASE + cpu;
+	return BABY_FL_CPU_DSQ_BASE + cpu;
 }
 
-static __always_inline u64 q1_node2dsq(s32 node)
+static __always_inline u64 fl_node2dsq(s32 node)
 {
-	return BABY_Q1_NODE_DSQ_BASE + node;
+	return BABY_FL_NODE_DSQ_BASE + node;
 }
 
 /*
@@ -227,11 +227,11 @@ extern volatile u64 nr_wait_wg_slow[BABY_WDEPTH_NR * BABY_WG_NR];
 extern volatile u64 nr_tick_preempts, nr_tick_preempts_warm;
 
 /*
- * Fast-Lane services under bulk pressure: the Q1 dispatches
- * ops.dispatch() served while the CPU's bulk queue held waiting work,
- * each one spending a unit of the CPU's Q1 quota, split by which
- * queue held them - the fast-lane node queue or the CPU's own
- * fast-lane warm seat.
+ * Fast-Lane services under bulk pressure: the dispatches
+ * ops.dispatch() served out of the fast lane while the CPU's bulk
+ * queue held waiting work, each one spending a unit of the CPU's
+ * fast-lane quota, split by which queue held them - the fast-lane
+ * node queue or the CPU's own fast-lane warm seat.
  */
 extern volatile u64 nr_depth1_pulls, nr_depth1_pulls_seat;
 

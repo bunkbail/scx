@@ -93,19 +93,20 @@ bool cpu_is_lat[BABY_MAX_CPUS];
 static u64 node_preempt_at;
 
 /*
- * Maximum consecutive Q1 (latency-critical) dispatches a CPU may serve
- * while its bulk queue holds waiting work. Once q1_streak[cpu] reaches
- * BABY_Q1_QUOTA, the next dispatch on that CPU serves the bulk queue
- * and resets the streak to 0, guaranteeing bulk tasks at least
- * 1 / (BABY_Q1_QUOTA + 1) of every contended CPU. The quota lives only
+ * Maximum consecutive fast-lane (latency-critical) dispatches a CPU
+ * may serve while its bulk queue holds waiting work. Once
+ * fl_streak[cpu] reaches BABY_FL_QUOTA, the next dispatch on that CPU
+ * serves the bulk queue and resets the streak to 0, guaranteeing bulk
+ * tasks at least 1 / (BABY_FL_QUOTA + 1) of every contended CPU. The
+ * quota lives only
  * in ops.dispatch(): wake and tick preemptions are self-bounded by the
  * displaced resident's SCX_DSQ_LOCAL occupancy and its fresh 200us
  * residency stamp, so counting them here would black the lane out
  * without any dispatch in between to reset it (the M1.0 lesson).
  */
-#define BABY_Q1_QUOTA	2
+#define BABY_FL_QUOTA	2
 
-static u8 q1_streak[BABY_MAX_CPUS];
+static u8 fl_streak[BABY_MAX_CPUS];
 
 /*
  * Allocate/re-allocate a new cpumask.
@@ -380,12 +381,12 @@ s32 BPF_STRUCT_OPS(baby_select_cpu, struct task_struct *p,
 		 * waiter. Starvation is self-bounded: the displaced
 		 * resident sits in SCX_DSQ_LOCAL (blocking a second
 		 * preempt via LOCAL_BUSY) and gets a fresh 200us
-		 * residency stamp when it resumes. The Q1 quota takes
+		 * residency stamp when it resumes. The fast-lane quota takes
 		 * no part here: the preempt happens between dispatches,
 		 * and counting it would black the lane out - the M1.0
 		 * black-out trap.
 		 */
-		if (scx_bpf_dsq_nr_queued(q1_cpu2dsq(prev_cpu))) {
+		if (scx_bpf_dsq_nr_queued(fl_cpu2dsq(prev_cpu))) {
 			tctx->wake_gate_miss = BABY_WG_M3_SEAT_BUSY;
 			return cpu;
 		}
@@ -410,7 +411,7 @@ s32 BPF_STRUCT_OPS(baby_select_cpu, struct task_struct *p,
 			 * The wakee's prev_cpu is running another lat-cri
 			 * task; balance_try_warm_seat() reads this stamp
 			 * and spreads the wakee to the nearest CPU with
-			 * an empty Q1 seat instead of stacking it here.
+			 * an empty fast-lane seat instead of stacking it here.
 			 */
 			return cpu;
 		}
@@ -443,7 +444,7 @@ s32 BPF_STRUCT_OPS(baby_select_cpu, struct task_struct *p,
 /*
  * Number of tasks waiting in the node queues. scx_bpf_dsq_nr_queued()
  * fails verification inside an RCU read side section, so callers probe
- * it outside any. The Q1 fast-lane node queue counts toward the
+ * it outside any. The fast-lane node queue counts toward the
  * backlog: it is work this node holds, whatever lane it waits in.
  */
 static u64 node_backlog(s32 cpu)
@@ -451,7 +452,7 @@ static u64 node_backlog(s32 cpu)
 	s32 node = __COMPAT_scx_bpf_cpu_node(cpu);
 
 	return scx_bpf_dsq_nr_queued(node) +
-	       scx_bpf_dsq_nr_queued(q1_node2dsq(node));
+	       scx_bpf_dsq_nr_queued(fl_node2dsq(node));
 }
 
 /*
@@ -525,7 +526,7 @@ void BPF_STRUCT_OPS(baby_enqueue, struct task_struct *p, u64 enq_flags)
 	 * that never wakes has no latency to protect.
 	 */
 	if ((enq_flags & SCX_ENQ_WAKEUP) &&
-	    !scx_bpf_dsq_nr_queued(q1_cpu2dsq(prev_cpu)) &&
+	    !scx_bpf_dsq_nr_queued(fl_cpu2dsq(prev_cpu)) &&
 	    !scx_bpf_dsq_nr_queued(cpu2dsq(prev_cpu)) &&
 	    (is_interactive(tctx) || is_foreground(tctx))) {
 		struct task_struct *curr = __COMPAT_scx_bpf_cpu_curr(prev_cpu);
@@ -581,7 +582,7 @@ void BPF_STRUCT_OPS(baby_enqueue, struct task_struct *p, u64 enq_flags)
 		slice = backlog_deep(backlog) && !tctx->tick_preempted
 			? 4 * deadline_ns : task_slice(tctx);
 
-		scx_bpf_dsq_insert_vtime(p, lat ? q1_node2dsq(node) : (u64)node,
+		scx_bpf_dsq_insert_vtime(p, lat ? fl_node2dsq(node) : (u64)node,
 					 slice, tctx->deadline, enq_flags);
 	}
 	stamp_wait(tctx, now, backlog, true);
@@ -599,13 +600,13 @@ void BPF_STRUCT_OPS(baby_enqueue, struct task_struct *p, u64 enq_flags)
 /*
  * Dispatch the earliest-deadline task to the CPU.
  *
- * The two lanes arbitrate per dispatch: the Q1 Fast Lane (the
+ * The two lanes arbitrate per dispatch: the fast lane (the
  * latency-critical warm seat and node queue) is served whenever it
  * holds work and the CPU's quota allows it, the bulk lane (the warm
  * seat and node queue of the other classes) otherwise. The quota is
- * the starvation bound - BABY_Q1_QUOTA Fast-Lane services between
+ * the starvation bound - BABY_FL_QUOTA fast-lane services between
  * bulk services, so a bulk task always keeps at least one in
- * BABY_Q1_QUOTA + 1 of a contended CPU - and serving the bulk lane
+ * BABY_FL_QUOTA + 1 of a contended CPU - and serving the bulk lane
  * resets the count.
  */
 void BPF_STRUCT_OPS(baby_dispatch, s32 cpu, struct task_struct *prev)
@@ -614,12 +615,12 @@ void BPF_STRUCT_OPS(baby_dispatch, s32 cpu, struct task_struct *prev)
 	bool need_running = prev && is_queued(prev);
 	s32 node = __COMPAT_scx_bpf_cpu_node(cpu);
 	u32 idx = (u32)cpu & (BABY_MAX_CPUS - 1);
-	u64 q1_seat_dsq = q1_cpu2dsq(cpu);
-	u64 q1_node_dsq = q1_node2dsq(node);
+	u64 fl_seat_dsq = fl_cpu2dsq(cpu);
+	u64 fl_node_dsq = fl_node2dsq(node);
 	u64 bulk_seat_dsq = cpu2dsq(cpu);
-	struct task_struct *q1_wq, *q1_q, *wq, *q;
-	u64 q1_wq_dl, q1_g_dl, wq_dl, g_dl, q1_dl, bulk_dl, best_dl;
-	bool has_q1, has_bulk, serve_q1;
+	struct task_struct *fl_wq, *fl_q, *wq, *q;
+	u64 fl_wq_dl, fl_g_dl, wq_dl, g_dl, fl_dl, bulk_dl, best_dl;
+	bool has_fl, has_bulk, serve_fl;
 
 	census_sample(cpu);
 
@@ -629,13 +630,13 @@ void BPF_STRUCT_OPS(baby_dispatch, s32 cpu, struct task_struct *prev)
 	 * pointers stay valid until the pulls below enter their own RCU
 	 * scope (the node-head note there).
 	 */
-	q1_wq = __COMPAT_scx_bpf_dsq_peek(q1_seat_dsq);
-	q1_q = __COMPAT_scx_bpf_dsq_peek(q1_node_dsq);
+	fl_wq = __COMPAT_scx_bpf_dsq_peek(fl_seat_dsq);
+	fl_q = __COMPAT_scx_bpf_dsq_peek(fl_node_dsq);
 	wq = __COMPAT_scx_bpf_dsq_peek(bulk_seat_dsq);
 	q = __COMPAT_scx_bpf_dsq_peek(node);
 
-	q1_wq_dl = q1_wq ? q1_wq->scx.dsq_vtime : ULLONG_MAX;
-	q1_g_dl = q1_q ? q1_q->scx.dsq_vtime : ULLONG_MAX;
+	fl_wq_dl = fl_wq ? fl_wq->scx.dsq_vtime : ULLONG_MAX;
+	fl_g_dl = fl_q ? fl_q->scx.dsq_vtime : ULLONG_MAX;
 	wq_dl = wq ? wq->scx.dsq_vtime : ULLONG_MAX;
 	g_dl = q ? q->scx.dsq_vtime : ULLONG_MAX;
 
@@ -646,11 +647,11 @@ void BPF_STRUCT_OPS(baby_dispatch, s32 cpu, struct task_struct *prev)
 	 * load probe). No vtime reaches ULLONG_MAX, so the sentinel
 	 * means an empty lane.
 	 */
-	q1_dl = MIN(q1_wq_dl, q1_g_dl);
+	fl_dl = MIN(fl_wq_dl, fl_g_dl);
 	bulk_dl = MIN(wq_dl, g_dl);
-	has_q1 = q1_dl != ULLONG_MAX;
+	has_fl = fl_dl != ULLONG_MAX;
 	has_bulk = bulk_dl != ULLONG_MAX;
-	serve_q1 = has_q1 && (!has_bulk || q1_streak[idx] < BABY_Q1_QUOTA);
+	serve_fl = has_fl && (!has_bulk || fl_streak[idx] < BABY_FL_QUOTA);
 
 	if (need_running && tctx && !tctx->yield_pending) {
 		/*
@@ -665,10 +666,10 @@ void BPF_STRUCT_OPS(baby_dispatch, s32 cpu, struct task_struct *prev)
 		 * the CPU out of turn when the Fast Lane is being served:
 		 * its claim is the quota's business, not the deadline's.
 		 */
-		if (serve_q1 && !is_lat_cri(tctx)) {
+		if (serve_fl && !is_lat_cri(tctx)) {
 			best_dl = 0;
-		} else if (serve_q1) {
-			best_dl = q1_dl;
+		} else if (serve_fl) {
+			best_dl = fl_dl;
 		} else {
 			best_dl = bulk_dl;
 		}
@@ -696,14 +697,14 @@ void BPF_STRUCT_OPS(baby_dispatch, s32 cpu, struct task_struct *prev)
 	 * with the out-of-turn pull counters; an uncontended serve is
 	 * just this CPU's own work and lands in the pull histogram.
 	 */
-	if (serve_q1) {
-		if (q1_g_dl < q1_wq_dl) {
-			s32 from = q1_q ? scx_bpf_task_cpu(q1_q) : -1;
+	if (serve_fl) {
+		if (fl_g_dl < fl_wq_dl) {
+			s32 from = fl_q ? scx_bpf_task_cpu(fl_q) : -1;
 
-			if (scx_bpf_dsq_move_to_local(q1_node_dsq, 0)) {
+			if (scx_bpf_dsq_move_to_local(fl_node_dsq, 0)) {
 				node_preempt_at = 0;
 				if (has_bulk) {
-					q1_streak[idx]++;
+					fl_streak[idx]++;
 					__sync_fetch_and_add(&nr_depth1_pulls,
 							     1);
 				} else if (stats_enabled) {
@@ -715,17 +716,17 @@ void BPF_STRUCT_OPS(baby_dispatch, s32 cpu, struct task_struct *prev)
 				return;
 			}
 		}
-		if (scx_bpf_dsq_move_to_local(q1_seat_dsq, 0)) {
+		if (scx_bpf_dsq_move_to_local(fl_seat_dsq, 0)) {
 			if (has_bulk) {
-				q1_streak[idx]++;
+				fl_streak[idx]++;
 				__sync_fetch_and_add(&nr_depth1_pulls_seat, 1);
 			}
 			return;
 		}
-		if (scx_bpf_dsq_move_to_local(q1_node_dsq, 0)) {
+		if (scx_bpf_dsq_move_to_local(fl_node_dsq, 0)) {
 			node_preempt_at = 0;
 			if (has_bulk) {
-				q1_streak[idx]++;
+				fl_streak[idx]++;
 				__sync_fetch_and_add(&nr_depth1_pulls, 1);
 			}
 			return;
@@ -733,9 +734,10 @@ void BPF_STRUCT_OPS(baby_dispatch, s32 cpu, struct task_struct *prev)
 	}
 
 	/*
-	 * Serve the bulk lane (either Q1 is empty, its move raced, or
-	 * q1_streak reached BABY_Q1_QUOTA). Serving a bulk task resets
-	 * the Q1 streak so the next Q1 arrival has its full quota again.
+	 * Serve the bulk lane (either the fast lane is empty, its move
+	 * raced, or fl_streak reached BABY_FL_QUOTA). Serving a bulk
+	 * task resets the fast-lane streak so the next fast-lane
+	 * arrival has its full quota again.
 	 * The arbitration is what keeps the warm queues honest - a
 	 * self-sustaining warm queue must not starve the overflow, so
 	 * the shared queue wins whenever its head is strictly earlier.
@@ -750,7 +752,7 @@ void BPF_STRUCT_OPS(baby_dispatch, s32 cpu, struct task_struct *prev)
 		s32 from = q ? scx_bpf_task_cpu(q) : -1;
 
 		if (scx_bpf_dsq_move_to_local(node, 0)) {
-			q1_streak[idx] = 0;
+			fl_streak[idx] = 0;
 			/*
 			 * The waiter this tick's claim was made for is
 			 * served (or another head took its place - either
@@ -765,16 +767,16 @@ void BPF_STRUCT_OPS(baby_dispatch, s32 cpu, struct task_struct *prev)
 			return;
 		}
 		if (scx_bpf_dsq_move_to_local(bulk_seat_dsq, 0)) {
-			q1_streak[idx] = 0;
+			fl_streak[idx] = 0;
 			return;
 		}
 	} else {
 		if (scx_bpf_dsq_move_to_local(bulk_seat_dsq, 0)) {
-			q1_streak[idx] = 0;
+			fl_streak[idx] = 0;
 			return;
 		}
 		if (scx_bpf_dsq_move_to_local(node, 0)) {
-			q1_streak[idx] = 0;
+			fl_streak[idx] = 0;
 			node_preempt_at = 0;
 			return;
 		}
@@ -782,12 +784,12 @@ void BPF_STRUCT_OPS(baby_dispatch, s32 cpu, struct task_struct *prev)
 
 	/*
 	 * Fallback: if all bulk moves failed (e.g. affinity mismatch on
-	 * the peeked head) while Q1 still had work held back by the
-	 * quota, drain Q1 rather than idling the CPU.
+	 * the peeked head) while the fast lane still had work held back
+	 * by the quota, drain the fast lane rather than idling the CPU.
 	 */
-	if (has_q1 && !serve_q1) {
-		if (scx_bpf_dsq_move_to_local(q1_seat_dsq, 0) ||
-		    scx_bpf_dsq_move_to_local(q1_node_dsq, 0))
+	if (has_fl && !serve_fl) {
+		if (scx_bpf_dsq_move_to_local(fl_seat_dsq, 0) ||
+		    scx_bpf_dsq_move_to_local(fl_node_dsq, 0))
 			return;
 	}
 
@@ -809,7 +811,7 @@ void BPF_STRUCT_OPS(baby_dispatch, s32 cpu, struct task_struct *prev)
 			tctx->tick_preempted = false;
 			tctx->yield_pending = false;
 			if (!is_lat_cri(tctx))
-				q1_streak[idx] = 0;
+				fl_streak[idx] = 0;
 		}
 		scx_bpf_task_set_slice(prev,
 				       tctx ? task_slice(tctx) : deadline_ns);
@@ -821,7 +823,7 @@ void BPF_STRUCT_OPS(baby_dispatch, s32 cpu, struct task_struct *prev)
 		 * see the comment on perf_req for why the idle path must
 		 * not churn the request either.
 		 */
-		q1_streak[idx] = 0;
+		fl_streak[idx] = 0;
 		cpuperf_on_idle(cpu);
 	}
 }
@@ -873,12 +875,13 @@ void BPF_STRUCT_OPS(baby_tick, struct task_struct *p)
 	 * The saturation deferred-preemption gate (comment at the top of
 	 * the file). The victim's residency is measured from its
 	 * ops.running() stamp; the waiter is recognized by a non-empty
-	 * Fast Lane: this CPU's own Q1 seat, or the Q1 node queue under
-	 * the same one-CPU-at-a-time stamp as before. The quota takes
-	 * no part in the cut - the tick fires between dispatches, and
-	 * counting it would black the lane out without a dispatch to
-	 * reset it (the M1.0 lesson); baby_dispatch() owns the quota
-	 * when it chooses which queue to pop after the slice ends.
+	 * fast lane: this CPU's own fast-lane seat, or the fast-lane
+	 * node queue under the same one-CPU-at-a-time stamp as before.
+	 * The quota takes no part in the cut - the tick fires between
+	 * dispatches, and counting it would black the lane out without
+	 * a dispatch to reset it (the M1.0 lesson); baby_dispatch()
+	 * owns the quota when it chooses which queue to pop after the
+	 * slice ends.
 	 */
 	if (!is_lat_cri(tctx)) {
 		s32 cpu = scx_bpf_task_cpu(p);
@@ -890,11 +893,11 @@ void BPF_STRUCT_OPS(baby_tick, struct task_struct *p)
 			bool cri = false;
 			bool warm = false;
 
-			if (scx_bpf_dsq_nr_queued(q1_cpu2dsq(cpu))) {
+			if (scx_bpf_dsq_nr_queued(fl_cpu2dsq(cpu))) {
 				cri = true;
 				warm = true;
 			} else if (scx_bpf_dsq_nr_queued(
-					   q1_node2dsq(node))) {
+					   fl_node2dsq(node))) {
 				u64 last = node_preempt_at;
 
 				if (now - last >=
@@ -1061,9 +1064,9 @@ bool BPF_STRUCT_OPS(baby_yield, struct task_struct *p)
 	node = __COMPAT_scx_bpf_cpu_node(cpu);
 
 	if (!scx_bpf_dsq_nr_queued(cpu2dsq(cpu)) &&
-	    !scx_bpf_dsq_nr_queued(q1_cpu2dsq(cpu)) &&
+	    !scx_bpf_dsq_nr_queued(fl_cpu2dsq(cpu)) &&
 	    !scx_bpf_dsq_nr_queued(node) &&
-	    !scx_bpf_dsq_nr_queued(q1_node2dsq(node)))
+	    !scx_bpf_dsq_nr_queued(fl_node2dsq(node)))
 		return false;
 
 	tctx->yield_pending = true;
@@ -1149,7 +1152,7 @@ static int rescue_timerfn(void *map, int *key, struct bpf_timer *timer)
 	if (__COMPAT_has_generic_reenq()) {
 		bpf_for(cpu, 0, nr_cpu_ids) {
 			rescue_one_dsq(cpu2dsq(cpu), now);
-			rescue_one_dsq(q1_cpu2dsq(cpu), now);
+			rescue_one_dsq(fl_cpu2dsq(cpu), now);
 		}
 	}
 
@@ -1170,7 +1173,7 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(baby_init)
 
 	/*
 	 * Create the warm queues and the per-node deadline-ordered
-	 * queues, both lanes: the bulk classes and the Q1 Fast Lane.
+	 * queues, both lanes: the bulk classes and the fast lane.
 	 */
 	bpf_for(cpu, 0, nr_cpu_ids) {
 		err = scx_bpf_create_dsq(cpu2dsq(cpu), -1);
@@ -1180,10 +1183,10 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(baby_init)
 			return err;
 		}
 
-		err = scx_bpf_create_dsq(q1_cpu2dsq(cpu), -1);
+		err = scx_bpf_create_dsq(fl_cpu2dsq(cpu), -1);
 		if (err) {
 			scx_bpf_error("failed to create DSQ %llu: %d",
-				      q1_cpu2dsq(cpu), err);
+				      fl_cpu2dsq(cpu), err);
 			return err;
 		}
 	}
@@ -1195,10 +1198,10 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(baby_init)
 			return err;
 		}
 
-		err = scx_bpf_create_dsq(q1_node2dsq(node), node);
+		err = scx_bpf_create_dsq(fl_node2dsq(node), node);
 		if (err) {
 			scx_bpf_error("failed to create DSQ %llu: %d",
-				      q1_node2dsq(node), err);
+				      fl_node2dsq(node), err);
 			return err;
 		}
 	}

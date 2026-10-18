@@ -48,6 +48,25 @@ so queue order IS placement. (The node DSQ; `scx_bpf_dsq_move_to_local()`
 in main.bpf.c.)
 _Avoid_: central queue, work stealing (it is not stealing)
 
+**Dual lanes**:
+The two queue paths dispatch arbitrates between: the bulk lane and
+the fast lane, under one per-CPU dispatch quota. Not the CPU slots
+of **Lane** above. (The `fl_*` DSQ helpers; `BABY_FL_QUOTA` in
+main.bpf.c.)
+
+**Bulk lane**:
+The node queues and warm seats serving every class but
+latency-critical; the lane the single-queue deadline design already
+had.
+
+**Fast lane**:
+The latency-critical class's own queues, one id space over from the
+bulk lane: a per-node queue beside every bulk node queue and a
+per-CPU seat beside every warm seat, served first while the quota
+allows. (`fl_cpu2dsq()`/`fl_node2dsq()` in baby.bpf.h.)
+_Avoid_: Q1, mlfq (the queue-level naming of the deeper hierarchy
+the design dropped; scx_mlfq is a different scheduler)
+
 **Homing** (_retired_):
 Assigning a task a specific CPU whose per-CPU queue it waits in; the
 pre-Phase-2 topology adr/0001 replaced.

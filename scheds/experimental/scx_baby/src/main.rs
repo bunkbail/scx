@@ -162,17 +162,17 @@ impl<'a> Scheduler<'a> {
         // Initialize CPU topology.
         let topo = Topology::new().context("failed to read CPU topology")?;
 
-        // Node DSQs take the ids below BABY_Q1_NODE_DSQ_BASE, the Q1
+        // Node DSQs take the ids below BABY_FL_NODE_DSQ_BASE, the
         // fast-lane node DSQs the ids from there to BABY_CPU_DSQ_BASE,
         // and the warm seats the ids from that up; a node count past
-        // the Q1 base would put both node id spaces on the same
+        // the fast-lane base would put both node id spaces on the same
         // numbers. No real machine under the CPU cap reaches this, but
         // the collision would be silent, so refuse it here.
         ensure!(
-            topo.nodes.len() < consts_BABY_Q1_NODE_DSQ_BASE as usize,
-            "too many NUMA nodes ({}) for the Q1 node DSQ id base {}",
+            topo.nodes.len() < consts_BABY_FL_NODE_DSQ_BASE as usize,
+            "too many NUMA nodes ({}) for the fast-lane node DSQ id base {}",
             topo.nodes.len(),
-            consts_BABY_Q1_NODE_DSQ_BASE
+            consts_BABY_FL_NODE_DSQ_BASE
         );
 
         info!(
