@@ -28,7 +28,7 @@ __hidden s32 pick_idle_cpu(struct task_struct *p, s32 prev_cpu,
 		return any_allowed_cpu(p, prev_cpu);
 	}
 
-	cpu = scx_bpf_select_cpu_and(p, prev_cpu, wake_flags, p->cpus_ptr, 0);
+	cpu = select_cpu_no_lp(p, prev_cpu, wake_flags);
 	if (cpu < 0)
 		return any_allowed_cpu(p, prev_cpu);
 
@@ -43,7 +43,7 @@ __hidden s32 pick_idle_cpu(struct task_struct *p, s32 prev_cpu,
  * Return true if the task is dispatched, false otherwise.
  */
 __hidden bool try_direct_dispatch(struct task_struct *p, struct task_ctx *tctx,
-			 s32 prev_cpu, u64 enq_flags, bool is_running)
+				 s32 prev_cpu, u64 enq_flags, bool is_running)
 {
 	bool is_idle = false;
 	s32 cpu = prev_cpu;
@@ -67,7 +67,6 @@ __hidden bool try_direct_dispatch(struct task_struct *p, struct task_ctx *tctx,
 		cpu = pick_idle_cpu(p, prev_cpu, 0, &is_idle);
 		if (!is_idle)
 			return false;
-		cpu = lp_guard_pick(p, tctx, cpu);
 	} else {
 		/*
 		 * A migration-disabled task can only use the CPU it is

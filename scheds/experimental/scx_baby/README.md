@@ -166,14 +166,15 @@ behind a batch slice. This is a two-lane split rather than a deeper
 hierarchy: the bulk lane keeps the deadline order, and no bulk class asks
 for a different one.
 
-Dispatch arbitrates the lanes with a per-CPU quota. While its bulk queue
-holds waiting work, a CPU serves at most `BABY_FL_QUOTA` (2) fast-lane tasks
-between bulk tasks, so bulk keeps at least a third of every contended CPU
-and the fast lane still empties instantly when bulk is idle. The quota
-lives only in `ops.dispatch()`: wake and tick preemptions are self-bounded
-by the displaced resident's local-queue occupancy and its fresh 200us
-residency stamp, and counting them would black the lane out with no
-dispatch in between to reset the streak.
+Dispatch arbitrates the lanes with a per-CPU time budget. The bucket
+accrues two thirds of wall time as fast-lane credit and holds at most four
+base slices; a fast-lane service spends the slice it is granted, so bulk
+keeps at least a third of every contended CPU however long the fast-lane
+slices are, and the fast lane still empties instantly when bulk is idle.
+Wake-path preempts charge the bucket when they hand the CPU over; tick
+preempts are charged by the dispatch that follows them. A task that sleeps
+early still spends its grant, so the bucket can under-serve the fast lane
+but never over-serve it.
 
 The oversubscription gates are per lane, keyed on state the queues cannot
 express. A per-CPU `cpu_is_lat[]` array, stamped in `ops.running()` and
@@ -201,18 +202,21 @@ condition because foreground tasks already earn the fourfold slice in
 ### Hybrid placement
 
 Below saturation (`nr_running` within two of the little-core count), the
-scheduler packs wakeups lowest-idle-first onto the little tier before the
-kernel's idle-CPU selection runs. Foreground, interactive and other light
+scheduler packs wakeups onto the little tier before the kernel's idle-CPU
+selection runs. A wholly idle physical core is preferred, and the previous
+CPU when it is in the tier, so the rest of the tier idles at its boost
+floor without cold migrations. Foreground, interactive and other light
 tasks stack there. A proven consumer with no wake history pins a big core;
 a proven consumer that is also foreground starts on the little tier and
 falls back to a big core when it is full. The gates are statically false on
 a single-tier machine, where the little mask is empty.
 
-The kernel's idle-CPU selector can also return an LP core, whose low clock
-and absent L3 the previous-CPU bias would then lock in for the task's
-lifetime. While the tier masks are present, the scheduler re-picks inside
-the tiers and keeps the LP only when both tiers are full or affinity allows
-nothing else.
+The kernel's idle-CPU selector is restricted to the non-LP mask while the
+tier masks are present: `scx_bpf_select_cpu_and()` clears the chosen CPU's
+idle bit and there is no helper that restores it, so an LP core picked and
+then abandoned would stay marked busy for good. The LP cores remain
+reachable through the full task mask when no non-LP CPU is idle, and that
+pick is used.
 
 ### Fairness
 
@@ -276,7 +280,7 @@ counters are diagnostic and do not feed the scheduling policy.
 | saturation service for latency-critical wakes (absent in the original) | `ops.tick()` cuts a batch victim's slice short when a latency-critical task waits at a head this CPU serves; the victim requeues on the base slice behind the waiter |
 | sleep-before-deadline `p->prio--` | per-task `boost` counter shifting the effective nice level, since sched_ext cannot change a task's static priority |
 | wake-frequency interactivity (absent in the original) | wake-rate EWMA from `ops.runnable()` and its peak hold |
-| latency-critical wakes queuing behind batch slices (absent in the original) | fast-lane queue pair with `BABY_FL_QUOTA` dispatch arbitration and per-lane oversubscription gates keyed on `cpu_is_lat[]` residency |
+| latency-critical wakes queuing behind batch slices (absent in the original) | fast-lane queue pair with a per-CPU time-budget arbitration and per-lane oversubscription gates keyed on `cpu_is_lat[]` residency |
 | hybrid light-work compaction (absent in the original) | `ops.select_cpu()`: below saturation, class-ordered packing onto the little tier, with a big-core pin for proven consumers |
 | 803 HZ / periodic tick / no dynticks kernel hacks | dropped: sched_ext does not need them |
 

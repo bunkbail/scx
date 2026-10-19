@@ -599,7 +599,7 @@ __hidden void class_init_task(struct task_ctx *tctx, struct task_struct *p, u64 
 __hidden s32 pick_idle_cpu(struct task_struct *p, s32 prev_cpu, u64 wake_flags,
 		  bool *is_idle);
 __hidden bool try_direct_dispatch(struct task_struct *p, struct task_ctx *tctx,
-			 s32 prev_cpu, u64 enq_flags, bool is_running);
+				 s32 prev_cpu, u64 enq_flags, bool is_running);
 
 /*
  * power.bpf.c: CPU performance scaling.
@@ -618,10 +618,10 @@ __hidden bool balance_try_warm_seat(struct task_struct *p, struct task_ctx *tctx
 			   u64 now);
 
 /*
- * main.bpf.c: the hybrid LP-island guard: re-pick a confirmed idle
- * pick that landed on an LP core inside the two tiers.
+ * main.bpf.c: the kernel idle-CPU selection restricted to the non-LP
+ * mask while the tier masks exist.
  */
-__hidden s32 lp_guard_pick(struct task_struct *p, struct task_ctx *tctx,
-			   s32 cpu);
+__hidden s32 select_cpu_no_lp(struct task_struct *p, s32 prev_cpu,
+			      u64 wake_flags);
 
 #endif /* __BABY_H */

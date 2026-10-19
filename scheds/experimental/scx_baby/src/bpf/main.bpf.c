@@ -106,17 +106,56 @@ u64 node_service_at[2][BABY_NODE_CLOCK_NR];
 u8 seat_used[2][BABY_MAX_CPUS];
 
 /*
- * Maximum consecutive fast-lane dispatches a CPU may serve while its
- * bulk queue holds waiting work. When fl_streak reaches the quota, the
- * next dispatch serves bulk and resets the streak, so bulk keeps at
- * least 1 / (BABY_FL_QUOTA + 1) of a contended CPU. The quota is
- * counted only in ops.dispatch(): wake and tick preemptions happen
- * between dispatches and are self-bounded, and counting them would
- * black the lane out without a dispatch to reset the streak.
+ * Fast-lane time budget, per CPU. The bucket accrues two thirds of
+ * wall time as fast-lane credit and holds at most four base slices; a
+ * fast-lane service spends the slice it is granted. Bulk therefore
+ * keeps at least a third of a contended CPU over time, where a
+ * dispatch count let a foreground fast-lane task spend four slices
+ * between two bulk slices. The budget is consulted only while bulk
+ * work waits; on an otherwise idle CPU the fast lane runs freely.
+ *
+ * The bucket is conservative: a task that sleeps early still spends
+ * its grant, so the fast lane can under-serve but never over-serves.
+ * Wake-path preempts charge the bucket at the point they hand the CPU
+ * over; tick preempts are charged by the dispatch that follows them.
  */
-#define BABY_FL_QUOTA	2
+static s64 fl_budget_ns[BABY_MAX_CPUS];
+static u64 fl_budget_at[BABY_MAX_CPUS];
 
-static u8 fl_streak[BABY_MAX_CPUS];
+static __always_inline void refill_fl_budget(u32 idx, u64 now)
+{
+	u64 elapsed = now - fl_budget_at[idx];
+	s64 credit;
+
+	if (!elapsed)
+		return;
+	/*
+	 * Cap the credit window: a CPU that has been idle for a long
+	 * time may start with a full bucket, not an unbounded one.
+	 */
+	if (elapsed > 100 * NSEC_PER_MSEC)
+		elapsed = 100 * NSEC_PER_MSEC;
+	credit = (s64)(elapsed * 2 / 3);
+	fl_budget_ns[idx] = MIN(fl_budget_ns[idx] + credit,
+				(s64)(4 * deadline_ns));
+	fl_budget_at[idx] = now;
+}
+
+/*
+ * Spend @grant against the bucket. The budget is signed on purpose:
+ * an over-spend must become debt that the next refills repay, or the
+ * fast lane would refill from its own runtime and never yield. The
+ * debt floor bounds how far one wake-preempt burst can push bulk
+ * ahead, not how long the fast lane may run.
+ */
+static __always_inline void charge_fl_budget(u32 idx, u64 grant)
+{
+	s64 cap = (s64)(4 * deadline_ns);
+
+	if (grant > (u64)cap)
+		grant = (u64)cap;
+	fl_budget_ns[idx] = MAX(fl_budget_ns[idx] - (s64)grant, -cap);
+}
 
 /*
  * Allocate/re-allocate a new cpumask.
@@ -155,93 +194,104 @@ static int init_cpumask(struct bpf_cpumask **cpumask)
 }
 
 /*
- * Pick the lowest-numbered idle CPU of the given tier. Stacking
+ * Pick the lowest-numbered idle CPU of the given tier, preferring a
+ * wholly idle physical core and then the previous CPU. Stacking
  * wakeups on the same few cores lets the rest of the tier idle at its
- * boost floor. The idle bit is claimed atomically; a lost race tries
+ * boost floor; the first pass keeps two heavy tasks from landing on the
+ * two threads of one physical core while other cores sit idle, and
+ * the previous-CPU preference avoids a cold migration to an equally
+ * shallow seat. The idle bit is claimed atomically; a lost race tries
  * the next bit of the tier instead of spilling to the kernel's
  * spread-first path.
  */
 static __always_inline s32 pick_idle_pref(struct task_struct *p,
+					  s32 prev_cpu,
 					  struct bpf_cpumask *pref)
 {
-	const struct cpumask *idle;
+	const struct cpumask *idle_smt, *idle;
 	s32 cpu = -1;
 	s32 i;
 
 	bpf_rcu_read_lock();
+	idle_smt = scx_bpf_get_idle_smtmask();
 	idle = scx_bpf_get_idle_cpumask();
-	if (pref && idle) {
-		bpf_for(i, 0, nr_cpu_ids) {
-			if (!bpf_cpumask_test_cpu(i, cast_mask(pref)) ||
-			    !bpf_cpumask_test_cpu(i, idle) ||
-			    !bpf_cpumask_test_cpu(i, p->cpus_ptr))
-				continue;
-			if (scx_bpf_test_and_clear_cpu_idle(i)) {
-				cpu = i;
-				break;
+	if (pref && idle_smt && idle) {
+		/*
+		 * Pass 1: a wholly idle physical core, previous CPU first.
+		 */
+		if (bpf_cpumask_test_cpu(prev_cpu, cast_mask(pref)) &&
+		    bpf_cpumask_test_cpu(prev_cpu, idle_smt) &&
+		    bpf_cpumask_test_cpu(prev_cpu, p->cpus_ptr) &&
+		    scx_bpf_test_and_clear_cpu_idle(prev_cpu))
+			cpu = prev_cpu;
+
+		if (cpu < 0) {
+			bpf_for(i, 0, nr_cpu_ids) {
+				if (!bpf_cpumask_test_cpu(i, cast_mask(pref)) ||
+				    !bpf_cpumask_test_cpu(i, idle_smt) ||
+				    !bpf_cpumask_test_cpu(i, p->cpus_ptr))
+					continue;
+				if (scx_bpf_test_and_clear_cpu_idle(i)) {
+					cpu = i;
+					break;
+				}
+			}
+		}
+
+		/*
+		 * Pass 2: any idle CPU in the tier, previous CPU first.
+		 */
+		if (cpu < 0) {
+			if (bpf_cpumask_test_cpu(prev_cpu, cast_mask(pref)) &&
+			    bpf_cpumask_test_cpu(prev_cpu, p->cpus_ptr) &&
+			    scx_bpf_test_and_clear_cpu_idle(prev_cpu))
+				cpu = prev_cpu;
+
+			if (cpu < 0) {
+				bpf_for(i, 0, nr_cpu_ids) {
+					if (!bpf_cpumask_test_cpu(i, cast_mask(pref)) ||
+					    !bpf_cpumask_test_cpu(i, idle) ||
+					    !bpf_cpumask_test_cpu(i, p->cpus_ptr))
+						continue;
+					if (scx_bpf_test_and_clear_cpu_idle(i)) {
+						cpu = i;
+						break;
+					}
+				}
 			}
 		}
 	}
-	scx_bpf_put_cpumask(idle);
+	if (idle_smt)
+		scx_bpf_put_cpumask(idle_smt);
+	if (idle)
+		scx_bpf_put_cpumask(idle);
 	bpf_rcu_read_unlock();
 	return cpu;
 }
 
 /*
- * Re-pick off a core outside both tiers, in practice an LP core the
- * kernel selector chose. Callers ask for the big tier first for a
- * heavy non-foreground consumer and the little tier first otherwise.
- * A task pinned to LP cores by affinity finds nothing in either tier
- * and keeps its pick.
+ * The kernel idle-CPU selection, restricted to the non-LP mask while
+ * the tiers exist. scx_bpf_select_cpu_and() clears the chosen CPU's
+ * kernel idle bit, and there is no helper that puts it back, so an LP
+ * core picked here and then abandoned would stay marked busy and never
+ * be picked again. The full task mask remains the fallback for a task
+ * whose affinity allows only LP cores, and the CPU it returns is used.
  */
-static __always_inline s32 pick_idle_tier(struct task_struct *p,
-					  bool big_first)
+__hidden s32 select_cpu_no_lp(struct task_struct *p, s32 prev_cpu,
+			      u64 wake_flags)
 {
-	s32 alt;
-
-	if (big_first)
-		alt = pick_idle_pref(p, big_cpumask);
-	else
-		alt = pick_idle_pref(p, little_cpumask);
-	if (alt >= 0)
-		return alt;
-	return big_first ? pick_idle_pref(p, little_cpumask)
-			 : pick_idle_pref(p, big_cpumask);
-}
-
-/*
- * The LP guard: the kernel selector can return an LP core, whose low
- * clock and absent L3 the previous-CPU bias would then keep for the
- * task's lifetime. While the tier masks exist, re-pick inside them and
- * keep the LP only when both tiers are full or affinity allows nothing
- * else. Callers apply this to a confirmed idle pick.
- */
-__hidden s32 lp_guard_pick(struct task_struct *p, struct task_ctx *tctx,
-			   s32 cpu)
-{
-	struct bpf_cpumask *l, *b;
-	bool on_tier;
-
-	if (!nr_little_cpus || !nr_big_cpus)
-		return cpu;
+	const struct cpumask *mask;
+	s32 cpu = -1;
 
 	bpf_rcu_read_lock();
-	l = little_cpumask;
-	b = big_cpumask;
-	on_tier = l && b &&
-		  (bpf_cpumask_test_cpu(cpu, cast_mask(l)) ||
-		   bpf_cpumask_test_cpu(cpu, cast_mask(b)));
+	mask = non_lp_cpumask ? cast_mask(non_lp_cpumask) : NULL;
+	if (mask && !bpf_cpumask_empty(mask))
+		cpu = scx_bpf_select_cpu_and(p, prev_cpu, wake_flags, mask, 0);
 	bpf_rcu_read_unlock();
 
-	if (!on_tier) {
-		bool big_first = tctx && is_heavy_proven(tctx) &&
-				 !is_foreground(tctx);
-		s32 alt = pick_idle_tier(p, big_first);
-
-		if (alt >= 0)
-			cpu = alt;
-	}
-
+	if (cpu < 0)
+		cpu = scx_bpf_select_cpu_and(p, prev_cpu, wake_flags,
+					     p->cpus_ptr, 0);
 	return cpu;
 }
 
@@ -296,10 +346,10 @@ s32 BPF_STRUCT_OPS(baby_select_cpu, struct task_struct *p,
 	    nr_running <= nr_little_cpus + 2) {
 		bool big_pin = is_heavy_proven(tctx) && !is_foreground(tctx);
 
-		cpu = big_pin ? pick_idle_pref(p, big_cpumask)
-			      : pick_idle_pref(p, little_cpumask);
+		cpu = big_pin ? pick_idle_pref(p, prev_cpu, big_cpumask)
+			      : pick_idle_pref(p, prev_cpu, little_cpumask);
 		if (cpu < 0 && !big_pin && is_heavy_proven(tctx))
-			cpu = pick_idle_pref(p, big_cpumask);
+			cpu = pick_idle_pref(p, prev_cpu, big_cpumask);
 		if (cpu >= 0) {
 			if (stats_enabled)
 				__sync_fetch_and_add(
@@ -315,8 +365,6 @@ s32 BPF_STRUCT_OPS(baby_select_cpu, struct task_struct *p,
 	}
 
 	cpu = pick_idle_cpu(p, prev_cpu, wake_flags, &is_idle);
-	if (is_idle)
-		cpu = lp_guard_pick(p, tctx, cpu);
 	if (is_idle) {
 		if (stats_enabled)
 			__sync_fetch_and_add(
@@ -412,6 +460,12 @@ s32 BPF_STRUCT_OPS(baby_select_cpu, struct task_struct *p,
 			return cpu;
 		}
 
+		/*
+		 * The preempt hands the fast lane the CPU between two
+		 * dispatches; charge it now so the budget sees the
+		 * service. The slice is the wakee's grant.
+		 */
+		charge_fl_budget(pcpu_idx, task_slice(tctx));
 		scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL_ON | prev_cpu,
 				   task_slice(tctx), SCX_ENQ_PREEMPT);
 		if (stats_enabled) {
@@ -587,9 +641,10 @@ void BPF_STRUCT_OPS(baby_enqueue, struct task_struct *p, u64 enq_flags)
  * Dispatch the earliest-deadline task to the CPU.
  *
  * The lanes arbitrate per dispatch: the fast lane is served whenever it
- * holds work and the CPU's quota allows it, the bulk lane otherwise.
- * Serving bulk resets the fast-lane streak, so bulk keeps at least one
- * in BABY_FL_QUOTA + 1 dispatches on a contended CPU.
+ * holds work and the CPU's time budget allows it, the bulk lane
+ * otherwise. The budget accrues two thirds of wall time, so bulk keeps
+ * at least a third of a contended CPU no matter how long the fast
+ * lane's slices are.
  */
 void BPF_STRUCT_OPS(baby_dispatch, s32 cpu, struct task_struct *prev)
 {
@@ -607,6 +662,7 @@ void BPF_STRUCT_OPS(baby_dispatch, s32 cpu, struct task_struct *prev)
 	bool has_fl, has_bulk, serve_fl;
 
 	census_sample(cpu);
+	refill_fl_budget(idx, now);
 
 	/*
 	 * One peek of each lane per dispatch: the sticky check and the
@@ -635,7 +691,8 @@ void BPF_STRUCT_OPS(baby_dispatch, s32 cpu, struct task_struct *prev)
 	bulk_dl = MIN(wq_dl, g_dl);
 	has_fl = fl_dl != ULLONG_MAX;
 	has_bulk = bulk_dl != ULLONG_MAX;
-	serve_fl = has_fl && (!has_bulk || fl_streak[idx] < BABY_FL_QUOTA);
+	serve_fl = has_fl &&
+		   (!has_bulk || fl_budget_ns[idx] >= (s64)deadline_ns);
 
 	if (need_running && tctx && !tctx->yield_pending) {
 		/*
@@ -646,7 +703,7 @@ void BPF_STRUCT_OPS(baby_dispatch, s32 cpu, struct task_struct *prev)
 		 * once its streak is spent and bulk work waits, the resident
 		 * rotates like any other task. A bulk task cannot keep the
 		 * CPU out of turn when the fast lane is served either; that
-		 * is the quota's business.
+		 * is the budget's business.
 		 */
 		if (!serve_fl && has_bulk && is_lat_cri(tctx)) {
 			best_dl = 0;
@@ -689,9 +746,13 @@ void BPF_STRUCT_OPS(baby_dispatch, s32 cpu, struct task_struct *prev)
 				 * slice here would be counted again by the
 				 * next tick.
 				 */
-				if (has_bulk && is_lat_cri(tctx))
-					fl_streak[idx]++;
-				scx_bpf_task_set_slice(prev, task_slice(tctx));
+				{
+					u64 grant = task_slice(tctx);
+
+					if (has_bulk && is_lat_cri(tctx))
+						charge_fl_budget(idx, grant);
+					scx_bpf_task_set_slice(prev, grant);
+				}
 				if (stats_enabled)
 					__sync_fetch_and_add(&nr_sticky, 1);
 				return;
@@ -713,7 +774,10 @@ void BPF_STRUCT_OPS(baby_dispatch, s32 cpu, struct task_struct *prev)
 				node_preempt_claim[nidx] = 0;
 				node_service_at[1][nidx] = now;
 				if (has_bulk) {
-					fl_streak[idx]++;
+					charge_fl_budget(
+						idx,
+						fl_q ? fl_q->scx.slice :
+						       deadline_ns);
 					if (stats_enabled)
 						__sync_fetch_and_add(
 							&nr_depth1_pulls, 1);
@@ -732,7 +796,10 @@ void BPF_STRUCT_OPS(baby_dispatch, s32 cpu, struct task_struct *prev)
 			    !scx_bpf_dsq_nr_queued(fl_seat_dsq))
 				seat_used[1][idx] = 0;
 			if (has_bulk) {
-				fl_streak[idx]++;
+				charge_fl_budget(
+					idx,
+					fl_wq ? fl_wq->scx.slice :
+						deadline_ns);
 				if (stats_enabled)
 					__sync_fetch_and_add(
 						&nr_depth1_pulls_seat, 1);
@@ -743,7 +810,9 @@ void BPF_STRUCT_OPS(baby_dispatch, s32 cpu, struct task_struct *prev)
 			node_preempt_claim[nidx] = 0;
 			node_service_at[1][nidx] = now;
 			if (has_bulk) {
-				fl_streak[idx]++;
+				charge_fl_budget(
+					idx,
+					fl_q ? fl_q->scx.slice : deadline_ns);
 				if (stats_enabled)
 					__sync_fetch_and_add(
 						&nr_depth1_pulls, 1);
@@ -754,9 +823,9 @@ void BPF_STRUCT_OPS(baby_dispatch, s32 cpu, struct task_struct *prev)
 
 	/*
 	 * Serve the bulk lane: the fast lane is empty, its move raced, or
-	 * the quota is spent. Serving bulk resets the fast-lane streak.
-	 * The shared queue wins when its head is strictly earlier, so a
-	 * self-sustaining warm queue cannot starve the overflow.
+	 * the budget is spent. The shared queue wins when its head is
+	 * strictly earlier, so a self-sustaining warm queue cannot starve
+	 * the overflow.
 	 */
 	if (g_dl < wq_dl) {
 		/*
@@ -767,7 +836,6 @@ void BPF_STRUCT_OPS(baby_dispatch, s32 cpu, struct task_struct *prev)
 		s32 from = q ? scx_bpf_task_cpu(q) : -1;
 
 		if (scx_bpf_dsq_move_to_local(node, 0)) {
-			fl_streak[idx] = 0;
 			node_service_at[0][nidx] = now;
 			if (stats_enabled)
 				__sync_fetch_and_add(
@@ -775,7 +843,6 @@ void BPF_STRUCT_OPS(baby_dispatch, s32 cpu, struct task_struct *prev)
 			return;
 		}
 		if (scx_bpf_dsq_move_to_local(bulk_seat_dsq, 0)) {
-			fl_streak[idx] = 0;
 			seat_service_at[0][idx] = now;
 			if (seat_used[0][idx] &&
 			    !scx_bpf_dsq_nr_queued(bulk_seat_dsq))
@@ -784,7 +851,6 @@ void BPF_STRUCT_OPS(baby_dispatch, s32 cpu, struct task_struct *prev)
 		}
 	} else {
 		if (scx_bpf_dsq_move_to_local(bulk_seat_dsq, 0)) {
-			fl_streak[idx] = 0;
 			seat_service_at[0][idx] = now;
 			if (seat_used[0][idx] &&
 			    !scx_bpf_dsq_nr_queued(bulk_seat_dsq))
@@ -792,7 +858,6 @@ void BPF_STRUCT_OPS(baby_dispatch, s32 cpu, struct task_struct *prev)
 			return;
 		}
 		if (scx_bpf_dsq_move_to_local(node, 0)) {
-			fl_streak[idx] = 0;
 			node_service_at[0][nidx] = now;
 			return;
 		}
@@ -801,11 +866,15 @@ void BPF_STRUCT_OPS(baby_dispatch, s32 cpu, struct task_struct *prev)
 	/*
 	 * Fallback: if all bulk moves failed (e.g. affinity mismatch on
 	 * the peeked head) while the fast lane still had work held back
-	 * by the quota, drain the fast lane rather than idling the CPU.
+	 * by the budget, drain the fast lane rather than idling the CPU.
+	 * The service is charged like any other: the bucket goes to zero,
+	 * and the refill makes bulk wait its turn afterwards.
 	 */
 	if (has_fl && !serve_fl) {
 		if (scx_bpf_dsq_move_to_local(fl_seat_dsq, 0)) {
 			seat_service_at[1][idx] = now;
+			charge_fl_budget(idx, fl_wq ? fl_wq->scx.slice :
+						      deadline_ns);
 			if (seat_used[1][idx] &&
 			    !scx_bpf_dsq_nr_queued(fl_seat_dsq))
 				seat_used[1][idx] = 0;
@@ -814,6 +883,8 @@ void BPF_STRUCT_OPS(baby_dispatch, s32 cpu, struct task_struct *prev)
 		if (scx_bpf_dsq_move_to_local(fl_node_dsq, 0)) {
 			node_preempt_claim[nidx] = 0;
 			node_service_at[1][nidx] = now;
+			charge_fl_budget(idx, fl_q ? fl_q->scx.slice :
+						     deadline_ns);
 			return;
 		}
 	}
@@ -823,10 +894,9 @@ void BPF_STRUCT_OPS(baby_dispatch, s32 cpu, struct task_struct *prev)
 		 * Nothing queued: keep the task running. Consume a pending
 		 * tick mark, since the queues the waiter was seen in
 		 * emptied under the mark and the cut never happened, and a
-		 * yield mark, since there was nothing to yield to. A bulk
-		 * task also restores the quota. This is another slice
-		 * grant that skips stopping/running, so charge the slice
-		 * and restamp the per-CPU state here.
+		 * yield mark, since there was nothing to yield to. This is
+		 * another slice grant that skips stopping/running, so
+		 * charge the slice and restamp the per-CPU state here.
 		 */
 		if (tctx) {
 			update_bursts(tctx, now);
@@ -837,8 +907,6 @@ void BPF_STRUCT_OPS(baby_dispatch, s32 cpu, struct task_struct *prev)
 			tctx->last_cpu = cpu;
 			cpu_running_at[idx] = now;
 			cpu_is_lat[idx] = is_lat_cri(tctx);
-			if (!is_lat_cri(tctx))
-				fl_streak[idx] = 0;
 		}
 		scx_bpf_task_set_slice(prev,
 				       tctx ? task_slice(tctx) : deadline_ns);
@@ -848,7 +916,6 @@ void BPF_STRUCT_OPS(baby_dispatch, s32 cpu, struct task_struct *prev)
 		 * write happens once, when the level changes; see the
 		 * comment on perf_req.
 		 */
-		fl_streak[idx] = 0;
 		cpuperf_on_idle(cpu);
 	}
 }

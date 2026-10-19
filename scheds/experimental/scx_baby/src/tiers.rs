@@ -28,22 +28,31 @@ pub enum TierSource {
 /// Classify the CPUs of a machine.
 ///
 /// The capacity branch needs the kernel's own per-CPU capacity
-/// (cpu_capacity): the tiers split when the weakest CPU falls below 85
-/// percent of the strongest, and the big set is exactly the CPUs at the
-/// top capacity.
+/// (cpu_capacity): the tiers split when the weakest CPU falls below 80
+/// percent of the strongest, and the big set is the top band at or
+/// above that bar. An exact top-capacity match would leave the normal
+/// P-cores of an ITMT part (980 against a favored 1024) in the little
+/// tier, and the middle tier of a three-tier ARM SoC in the little
+/// tier beside its real little cores.
 ///
 /// The core-type fallback exists for platforms whose sysfs does not
 /// expose capacities. It keeps a split the topology claims only when
-/// the per-CPU hardware maximum frequencies corroborate it under the
-/// same 85 percent bar. The corroboration is the fake-tier guard:
-/// amd_pstate preferred-core rankings spread more than 30 percent
-/// across architecturally identical Zen cores, which passes scx_utils's
-/// 1.3x big/little heuristic and would otherwise engage the hybrid
-/// gates with fake tiers - stacking light wakes on lower-ranked
-/// same-speed cores and hiding the preferred cores behind the heavy
-/// pin. Frequency spread on those parts is under 8 percent, so the
-/// guard rejects them; real hybrids separate P from E clocks by 20
-/// percent or more and pass.
+/// the per-CPU hardware maximum frequencies corroborate it under a 85
+/// percent bar. The corroboration is the fake-tier guard: amd_pstate
+/// preferred-core rankings spread more than 30 percent across
+/// architecturally identical Zen cores, which passes scx_utils's 1.3x
+/// big/little heuristic and would otherwise engage the hybrid gates
+/// with fake tiers - stacking light wakes on lower-ranked same-speed
+/// cores and hiding the preferred cores behind the heavy pin.
+/// Frequency spread on those parts is under 8 percent, so the guard
+/// rejects them; real hybrids separate P from E clocks by 20 percent or
+/// more and pass.
+///
+/// The LP split needs both a value below half of the little tier's top
+/// and below a third of the machine's top. The first bound is the old
+/// low-power-island test; the second keeps a real three-tier ARM
+/// little core (around 37 percent of the Prime clock) out of the LP
+/// set while an Intel LP-E island (around 32 percent) stays in it.
 ///
 /// On a machine without a usable split every CPU is published as a big
 /// core (or, when the topology claims nothing but little cores, as
@@ -58,17 +67,19 @@ pub fn classify(
     let capacities: Vec<Option<u32>> = ids.iter().map(|id| capacity(*id)).collect();
     let caps: Vec<u32> = capacities.iter().flatten().copied().collect();
     if let (Some(lo), Some(hi)) = (caps.iter().min(), caps.iter().max())
-        && lo * 100 < hi * 85
+        && lo * 100 < hi * 80
     {
         let max_cap = *hi;
         let big: Vec<usize> = ids
             .iter()
             .zip(&capacities)
-            .filter(|(_, cap)| **cap == Some(max_cap))
+            .filter(|(_, cap)| {
+                matches!(**cap, Some(c) if u64::from(c) * 100 >= u64::from(max_cap) * 80)
+            })
             .map(|(id, _)| *id)
             .collect();
         let rest: Vec<usize> = ids.iter().filter(|id| !big.contains(id)).copied().collect();
-        let (little, lp) = split_lps(&rest, capacity);
+        let (little, lp) = split_lps(&rest, capacity, max_cap);
         return (CoreClasses { big, little, lp }, TierSource::Capacity);
     }
 
@@ -82,13 +93,19 @@ pub fn classify(
         .filter(|id| is_big_core_type(**id) != Some(true))
         .copied()
         .collect();
-    let (little, lp) = split_lps(&rest, capacity);
+
+    let freqs: Vec<u32> = ids.iter().filter_map(|id| max_freq(*id)).collect();
+    let max_freq_cap = freqs.iter().copied().max().unwrap_or(0);
+    let (little, lp) = if max_freq_cap > 0 {
+        split_lps(&rest, max_freq, max_freq_cap)
+    } else {
+        split_lps(&rest, capacity, 0)
+    };
 
     if big.is_empty() || little.is_empty() {
         return (CoreClasses { big, little, lp }, TierSource::NoSplit);
     }
 
-    let freqs: Vec<u32> = ids.iter().filter_map(|id| max_freq(*id)).collect();
     let corroborated = matches!(
         (freqs.iter().min(), freqs.iter().max()),
         (Some(lo), Some(hi)) if u64::from(*lo) * 100 < u64::from(*hi) * 85
@@ -117,13 +134,23 @@ pub fn classify(
 /// worker. They are not lost to scheduling: the kernel's placement and
 /// the direct-dispatch scan still run work there when nothing else
 /// fits. Only the tier assignment skips them.
-fn split_lps(rest: &[usize], capacity: &impl Fn(usize) -> Option<u32>) -> (Vec<usize>, Vec<usize>) {
-    let little_cap = rest.iter().filter_map(|id| capacity(*id)).max();
+///
+/// A core needs both bounds to be an island: below half of the little
+/// tier's top, and below a third of the machine's top. The second bound
+/// keeps the real little tier of a three-tier ARM SoC (about 37 percent
+/// of the Prime clock) in the little set while the Intel LP-E island
+/// (about 32 percent) stays out.
+fn split_lps(
+    rest: &[usize],
+    cap: &impl Fn(usize) -> Option<u32>,
+    max_cap: u32,
+) -> (Vec<usize>, Vec<usize>) {
+    let little_cap = rest.iter().filter_map(|id| cap(*id)).max();
     let mut little = Vec::new();
     let mut lp = Vec::new();
     for id in rest {
-        match (capacity(*id), little_cap) {
-            (Some(cap), Some(max)) if cap * 2 < max => lp.push(*id),
+        match (cap(*id), little_cap) {
+            (Some(c), Some(top)) if c * 2 < top && c * 3 < max_cap => lp.push(*id),
             _ => little.push(*id),
         }
     }
@@ -244,17 +271,17 @@ mod tests {
     }
 
     #[test]
-    fn capacity_bar_is_strict_at_85_percent() {
-        // 0.85 of the top capacity exactly: no split, the fallback
+    fn capacity_bar_is_strict_at_80_percent() {
+        // 0.80 of the top capacity exactly: no split, the fallback
         // decides. Just under it: the capacity branch splits.
-        let uniform = vec![Some(1000u32), Some(1000), Some(850), Some(850)];
+        let uniform = vec![Some(1000u32), Some(1000), Some(800), Some(800)];
         let (ids, capacity, is_big, max_freq) =
             fixture(uniform, vec![Some(true); 4], vec![Some(5000000); 4]);
         let (classes, source) = classify(&ids, &capacity, &is_big, &max_freq);
         assert_eq!(source, TierSource::NoSplit);
         assert_eq!(classes.big, (0..4).collect::<Vec<usize>>());
 
-        let split = vec![Some(1000u32), Some(1000), Some(849), Some(849)];
+        let split = vec![Some(1000u32), Some(1000), Some(799), Some(799)];
         let (ids, capacity, is_big, max_freq) =
             fixture(split, vec![Some(true); 4], vec![Some(5000000); 4]);
         let (classes, source) = classify(&ids, &capacity, &is_big, &max_freq);
@@ -264,17 +291,59 @@ mod tests {
     }
 
     #[test]
-    fn lp_boundary_is_strict_at_half_the_little_capacity() {
-        // A rest CPU at exactly half the little tier's top capacity is
-        // a little core; one step below it is an LP island.
-        let at = vec![Some(1024u32), Some(800), Some(400), Some(400)];
+    fn intel_itmt_cores_form_one_big_band() {
+        // Favored P-core 1024, normal P-cores 980, E-cores 790, an
+        // L3-less LP island below all of them. The 80 percent band
+        // keeps both P classes big and leaves the E cores in little.
+        let caps = vec![Some(1024u32), Some(980), Some(790), Some(324)];
+        let (ids, capacity, is_big, max_freq) =
+            fixture(caps, vec![Some(true); 4], vec![Some(5000000); 4]);
+        let (classes, source) = classify(&ids, &capacity, &is_big, &max_freq);
+        assert_eq!(source, TierSource::Capacity);
+        assert_eq!(classes.big, vec![0, 1]);
+        assert_eq!(classes.little, vec![2]);
+        assert_eq!(classes.lp, vec![3]);
+    }
+
+    #[test]
+    fn arm_three_tier_keeps_its_little_tier() {
+        // Prime 1024, performance 820 (80.08 percent, inside the
+        // band), little 380. The old exact-top rule left the middle
+        // tier in little and then banished the real little tier as
+        // LP; the top band plus the dual LP bound keeps both.
+        let caps = vec![Some(1024u32), Some(820), Some(380)];
+        let (ids, capacity, is_big, max_freq) =
+            fixture(caps, vec![Some(true); 3], vec![Some(5000000); 3]);
+        let (classes, source) = classify(&ids, &capacity, &is_big, &max_freq);
+        assert_eq!(source, TierSource::Capacity);
+        assert_eq!(classes.big, vec![0, 1]);
+        assert_eq!(classes.little, vec![2]);
+        assert!(classes.lp.is_empty());
+
+        // A lower middle tier stays little beside the little cores,
+        // still out of the LP set by the one-third bound.
+        let caps = vec![Some(1024u32), Some(780), Some(380)];
+        let (ids, capacity, is_big, max_freq) =
+            fixture(caps, vec![Some(true); 3], vec![Some(5000000); 3]);
+        let (classes, source) = classify(&ids, &capacity, &is_big, &max_freq);
+        assert_eq!(source, TierSource::Capacity);
+        assert_eq!(classes.big, vec![0]);
+        assert_eq!(classes.little, vec![1, 2]);
+        assert!(classes.lp.is_empty());
+    }
+
+    #[test]
+    fn lp_needs_both_bounds() {
+        // Below half of the little tier but not below a third of the
+        // machine: a real little core. Below both: an LP island.
+        let at = vec![Some(1024u32), Some(800), Some(342), Some(342)];
         let (ids, capacity, is_big, max_freq) =
             fixture(at, vec![Some(true); 4], vec![Some(5000000); 4]);
         let (classes, _) = classify(&ids, &capacity, &is_big, &max_freq);
         assert!(classes.lp.is_empty());
         assert_eq!(classes.little, vec![1, 2, 3]);
 
-        let below = vec![Some(1024u32), Some(800), Some(399), Some(399)];
+        let below = vec![Some(1024u32), Some(800), Some(341), Some(341)];
         let (ids, capacity, is_big, max_freq) =
             fixture(below, vec![Some(true); 4], vec![Some(5000000); 4]);
         let (classes, _) = classify(&ids, &capacity, &is_big, &max_freq);
@@ -344,19 +413,28 @@ mod tests {
 
         let caps_of =
             |set: &[usize]| -> Vec<Option<u32>> { set.iter().map(|id| capacity(*id)).collect() };
-        if let Some(max_cap) = caps_of(&classes.big).into_iter().flatten().max() {
-            for cap in caps_of(&classes.big) {
-                assert_eq!(cap, Some(max_cap), "big cores share the top capacity");
-            }
-        }
+        // The exact-capacity invariants only hold when the capacity
+        // branch decided; a NoSplit machine publishes one tier and the
+        // capacities may vary inside it.
         if source == TierSource::Capacity {
+            let max_cap = caps_of(&ids)
+                .into_iter()
+                .flatten()
+                .max()
+                .expect("capacity split with no capacity");
+            for cap in caps_of(&classes.big) {
+                assert!(
+                    cap.is_some_and(|c| u64::from(c) * 100 >= u64::from(max_cap) * 80),
+                    "big cores sit in the top band"
+                );
+            }
             let little_cap = caps_of(&classes.little)
                 .into_iter()
                 .flatten()
                 .max()
                 .expect("capacity split with an empty little set");
             for cap in caps_of(&classes.lp) {
-                assert!(cap.is_some_and(|c| c * 2 < little_cap));
+                assert!(cap.is_some_and(|c| c * 2 < little_cap && c * 3 < max_cap));
             }
         }
     }
