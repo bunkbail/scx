@@ -366,6 +366,14 @@ struct task_ctx {
 	 * its due), and ops.running() clears it when the task next runs.
 	 */
 	bool tick_preempted;
+
+	/*
+	 * The CPU the task last entered ops.running() on. ops.stopping()
+	 * can run on the task's new CPU after a migration, so the
+	 * per-CPU state the run stamped must be cleared through the CPU
+	 * that stamped it, not through scx_bpf_task_cpu().
+	 */
+	s32 last_cpu;
 };
 
 /*

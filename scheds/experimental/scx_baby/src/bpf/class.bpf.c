@@ -251,6 +251,7 @@ __hidden void class_init_task(struct task_ctx *tctx, struct task_struct *p, u64 
 	tctx->start_time = now;
 	tctx->last_acc_at = now;
 	tctx->last_woke_at = now;
+	tctx->last_cpu = -1;
 	{
 		struct task_struct *parent = p->real_parent;
 		struct task_ctx *ptctx;

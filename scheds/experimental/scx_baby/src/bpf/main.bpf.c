@@ -453,16 +453,18 @@ void BPF_STRUCT_OPS(baby_enqueue, struct task_struct *p, u64 enq_flags)
 		 */
 		tctx->deadline = now + deadline_ns + deadline_ns +
 				 task_prio_factor(p, tctx);
-	} else if (!(enq_flags & (SCX_ENQ_LAST | SCX_ENQ_WAKEUP |
+	} else if (!is_running &&
+		   !(enq_flags & (SCX_ENQ_LAST | SCX_ENQ_WAKEUP |
 				  SCX_ENQ_REENQ))) {
 		/*
-		 * Migrated and freshly created tasks get a fresh deadline.
-		 * Woken tasks keep the deadline they had when they went to
-		 * sleep. A task that stopped but stayed runnable also
-		 * keeps its own; ops.stopping() renewed it if it was
-		 * reached. A task pushed back by cpu_release() keeps it
-		 * too: it was already waiting, and a fresh deadline would
-		 * move it behind later arrivals.
+		 * A migrated or freshly created task gets a fresh deadline.
+		 * A rotation requeue keeps the deadline ops.stopping()
+		 * left it with: renewed if it was reached, otherwise the
+		 * task's own, still-unexpired deadline, so a waiting
+		 * deadline ages across rotations. Woken tasks keep the
+		 * sleep-time deadline, a cpu_release() requeue keeps its
+		 * place, and SCX_ENQ_LAST is the same task re-entering
+		 * after an empty dispatch.
 		 */
 		tctx->deadline = calc_deadline(p, tctx, now);
 	}
@@ -612,13 +614,16 @@ void BPF_STRUCT_OPS(baby_dispatch, s32 cpu, struct task_struct *prev)
 		/*
 		 * Keep the current task only while its deadline beats the
 		 * earliest head of the lane that would run next; ties go to
-		 * the waiter. ops.stopping() renewed the deadline once it
-		 * was reached, so this is a sticky run in absolute
-		 * deadlines. A yielding task has given the round up. A bulk
-		 * task cannot keep the CPU out of turn when the fast lane
-		 * is served: that is the quota's business.
+		 * the waiter. A yielding task has given the round up. The
+		 * quota has the last word over a latency-critical resident:
+		 * once its streak is spent and bulk work waits, the resident
+		 * rotates like any other task. A bulk task cannot keep the
+		 * CPU out of turn when the fast lane is served either; that
+		 * is the quota's business.
 		 */
-		if (serve_fl && !is_lat_cri(tctx)) {
+		if (!serve_fl && has_bulk && is_lat_cri(tctx)) {
+			best_dl = 0;
+		} else if (serve_fl && !is_lat_cri(tctx)) {
 			best_dl = 0;
 		} else if (serve_fl) {
 			best_dl = fl_dl;
@@ -626,19 +631,44 @@ void BPF_STRUCT_OPS(baby_dispatch, s32 cpu, struct task_struct *prev)
 			best_dl = bulk_dl;
 		}
 
-		if (best_dl && (s64)(tctx->deadline - best_dl) < 0) {
+		if (best_dl) {
 			/*
-			 * The victim kept its CPU, so the tick's cut did
-			 * not happen: consume the mark here, where no
-			 * ops.running() will run to clear it, or its next
-			 * natural requeue would take the deep-backlog
-			 * rung it did not earn.
+			 * ops.dispatch() runs before ops.stopping(), so a
+			 * keep skips every callback that would renew the
+			 * deadline, charge the slice and restamp the
+			 * per-CPU state. Renew here exactly as stopping
+			 * would, then decide on the renewed deadline.
 			 */
-			tctx->tick_preempted = false;
-			scx_bpf_task_set_slice(prev, task_slice(tctx));
-			if (stats_enabled)
-				__sync_fetch_and_add(&nr_sticky, 1);
-			return;
+			if (reached_deadline(tctx, now))
+				tctx->deadline = calc_deadline(prev, tctx, now);
+
+			if ((s64)(tctx->deadline - best_dl) < 0) {
+				/*
+				 * The victim kept its CPU, so the tick's
+				 * cut did not happen: consume the mark
+				 * here, where no ops.running() will run to
+				 * clear it, or its next natural requeue
+				 * would take the deep-backlog rung it did
+				 * not earn.
+				 */
+				update_bursts(tctx, now);
+				tctx->tick_preempted = false;
+				tctx->last_cpu = cpu;
+				cpu_running_at[idx] = now;
+				cpu_is_lat[idx] = is_lat_cri(tctx);
+				/*
+				 * The cpuperf ledger is deliberately left
+				 * alone: ticks advance it, and charging the
+				 * slice here would be counted again by the
+				 * next tick.
+				 */
+				if (has_bulk && is_lat_cri(tctx))
+					fl_streak[idx]++;
+				scx_bpf_task_set_slice(prev, task_slice(tctx));
+				if (stats_enabled)
+					__sync_fetch_and_add(&nr_sticky, 1);
+				return;
+			}
 		}
 	}
 
@@ -765,11 +795,19 @@ void BPF_STRUCT_OPS(baby_dispatch, s32 cpu, struct task_struct *prev)
 		 * tick mark, since the queues the waiter was seen in
 		 * emptied under the mark and the cut never happened, and a
 		 * yield mark, since there was nothing to yield to. A bulk
-		 * task also restores the quota.
+		 * task also restores the quota. This is another slice
+		 * grant that skips stopping/running, so charge the slice
+		 * and restamp the per-CPU state here.
 		 */
 		if (tctx) {
+			update_bursts(tctx, now);
+			if (reached_deadline(tctx, now))
+				tctx->deadline = calc_deadline(prev, tctx, now);
 			tctx->tick_preempted = false;
 			tctx->yield_pending = false;
+			tctx->last_cpu = cpu;
+			cpu_running_at[idx] = now;
+			cpu_is_lat[idx] = is_lat_cri(tctx);
 			if (!is_lat_cri(tctx))
 				fl_streak[idx] = 0;
 		}
@@ -895,6 +933,7 @@ void BPF_STRUCT_OPS(baby_tick, struct task_struct *p)
 void BPF_STRUCT_OPS(baby_stopping, struct task_struct *p, bool runnable)
 {
 	struct task_ctx *tctx = try_lookup_task_ctx(p);
+	s32 last_cpu;
 	u64 now;
 
 	__sync_fetch_and_sub(&nr_running, 1);
@@ -902,8 +941,12 @@ void BPF_STRUCT_OPS(baby_stopping, struct task_struct *p, bool runnable)
 	/*
 	 * The CPU's running-class residency lapses with the resident;
 	 * ops.running() re-stamps it when the next task is served.
+	 * ops.stopping() can run after a migration, so the stamp to
+	 * clear is the CPU the task ran on, not its current one.
 	 */
-	cpu_is_lat[scx_bpf_task_cpu(p) & (BABY_MAX_CPUS - 1)] = false;
+	last_cpu = (tctx && tctx->last_cpu >= 0) ? tctx->last_cpu :
+						  scx_bpf_task_cpu(p);
+	cpu_is_lat[(u32)last_cpu & (BABY_MAX_CPUS - 1)] = false;
 
 	if (!tctx)
 		return;
@@ -940,7 +983,7 @@ void BPF_STRUCT_OPS(baby_stopping, struct task_struct *p, bool runnable)
 	/*
 	 * Update CPU runtime for the performance scaling.
 	 */
-	cpuperf_on_stopping(scx_bpf_task_cpu(p), now);
+	cpuperf_on_stopping(last_cpu, now);
 }
 
 /*
@@ -976,10 +1019,13 @@ void BPF_STRUCT_OPS(baby_running, struct task_struct *p)
 	 * gate and the relocation filter (see cpu_is_lat).
 	 */
 	{
-		u32 cpu_idx = scx_bpf_task_cpu(p) & (BABY_MAX_CPUS - 1);
+		s32 cpu = scx_bpf_task_cpu(p);
+		u32 cpu_idx = (u32)cpu & (BABY_MAX_CPUS - 1);
 
 		cpu_running_at[cpu_idx] = now;
 		cpu_is_lat[cpu_idx] = tctx && is_lat_cri(tctx);
+		if (tctx)
+			tctx->last_cpu = cpu;
 	}
 
 	if (!tctx)
