@@ -280,14 +280,19 @@ static __always_inline s32 pick_idle_pref(struct task_struct *p,
 __hidden s32 select_cpu_no_lp(struct task_struct *p, s32 prev_cpu,
 			      u64 wake_flags)
 {
-	const struct cpumask *mask;
+	struct bpf_cpumask *mask = non_lp_cpumask;
 	s32 cpu = -1;
 
-	bpf_rcu_read_lock();
-	mask = non_lp_cpumask ? cast_mask(non_lp_cpumask) : NULL;
-	if (mask && !bpf_cpumask_empty(mask))
-		cpu = scx_bpf_select_cpu_and(p, prev_cpu, wake_flags, mask, 0);
-	bpf_rcu_read_unlock();
+	/*
+	 * Load the mask once, as scx_beerland does: a re-load after the
+	 * helper could race an ops.init() replacement and give the
+	 * verifier a different trusted state. The scheduling callbacks
+	 * are non-sleepable, so the kptr read is already covered by the
+	 * verifier's RCU rules.
+	 */
+	if (mask && !bpf_cpumask_empty(cast_mask(mask)))
+		cpu = scx_bpf_select_cpu_and(p, prev_cpu, wake_flags,
+					     cast_mask(mask), 0);
 
 	if (cpu < 0)
 		cpu = scx_bpf_select_cpu_and(p, prev_cpu, wake_flags,
