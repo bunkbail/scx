@@ -651,7 +651,7 @@ pub struct Metrics {
     pub nr_sticky: u64,
     #[stat(desc = "Number of enqueues the oversubscription gate sent to the shared queue")]
     pub nr_coldspreads: u64,
-    #[stat(desc = "Runs by class: 0 neither, 1 interactive, 2 foreground, 3 both")]
+    #[stat(desc = "Runs by class: 0 bulk normal, 1 bulk heavy, 2 fast base, 3 fast fourfold")]
     pub nr_class: Vec<u64>,
     #[stat(desc = "Runs by lane: 0 bulk, 1 fast")]
     pub nr_lane: Vec<u64>,

@@ -69,8 +69,19 @@ static __always_inline u64 fl_node2dsq(s32 node)
 #define TO_COMPLETE		(5ULL * NSEC_PER_MSEC)
 #define RESCHED_DELTA		(25ULL * NSEC_PER_MSEC)
 
-/* Wakes per 100ms that separate the wake-rate classes from the rest. */
+/*
+ * Wakes per 100ms that separate the wake-rate classes from the rest.
+ *
+ * The latency-critical bar is 5: a 60Hz frame thread or a 59Hz request
+ * probe wakes about every 17ms, and the integer rate of that interval
+ * is 5. The foreground bar is 10: that class also earns the fourfold
+ * slice, so it stays a true 100Hz signal. Four consecutive samples at
+ * or above the latency bar arm the peak hold; four at or above the
+ * foreground bar are needed before the peak can reach 10.
+ */
+#define LAT_CRI_WAKE_FREQ	5
 #define FOREGROUND_WAKE_FREQ	10
+#define WAKE_SANE_MIN		4
 #define MIN_NICE		(-20)
 #define MAX_NICE		19
 #define MAX_RT_PRIO		100
@@ -315,27 +326,31 @@ struct task_ctx {
 	u64 last_woke_at;
 
 	/*
-	 * Peak hold of wakeup_freq. The EWMA is blended 50/50 until four
-	 * samples exist and 3:1 after that, and the peak rises only after
-	 * four consecutive samples at or above the class bar. The hold
-	 * then decays by 1/64 per wake only while above 64 (a shift of a
-	 * value below 64 is zero), so it falls from a spike to 63 and
-	 * stays there. 63 is far above every class bar (10): the
-	 * wake-rate classes latch once earned, by design. A real decay
-	 * would strip the class from a frame-paced thread the moment
-	 * overcommit throttles its frame rate, which is the state the
-	 * credit exists for.
+	 * Peak hold of wakeup_freq, the latency-critical credit. The
+	 * EWMA is blended 50/50 until four samples exist and 3:1 after
+	 * that, and the peak rises only after four consecutive samples
+	 * at or above the latency bar (5). The hold then decays by 1/64
+	 * per wake only while above 64 (a shift of a value below 64 is
+	 * zero), so it falls from a spike to 63 and stays there. 63 is
+	 * far above both class bars (5 and 10): the latency class
+	 * latches once earned, by design. A real decay would strip the
+	 * class from a frame-paced thread the moment overcommit throttles
+	 * its frame rate, which is the state the credit exists for.
 	 */
 	u32 peak_freq;
 
 	/*
-	 * Wake-frequency samples taken, and the current run of samples
-	 * at or above the class bar. The peak is only allowed to rise
-	 * after enough of both, so neither the first post-fork interval
-	 * nor one startup spike can latch a class.
+	 * Wake-frequency samples taken (warmup ends at WAKE_SANE_MIN),
+	 * the current run of samples at or above the latency bar, and
+	 * the current run at or above the foreground bar. The peak may
+	 * rise only once the latency run is armed; its candidate is
+	 * capped at 9 while the foreground run is not four, so a 50-60Hz
+	 * task hit by one or two spikes cannot cross the 10 bar and earn
+	 * the fourfold slice.
 	 */
 	u32 wake_samples;
 	u8 wake_sane;
+	u8 fg_sane;
 
 	/*
 	 * Number of interactive priority boosts the task has earned by
@@ -450,8 +465,8 @@ static __always_inline bool is_heavy_proven(const struct task_ctx *tctx)
  */
 static __always_inline bool is_lat_cri(const struct task_ctx *tctx)
 {
-	return tctx->wake_samples >= 4 &&
-	       tctx->peak_freq >= FOREGROUND_WAKE_FREQ;
+	return tctx->wake_samples >= WAKE_SANE_MIN &&
+	       tctx->peak_freq >= LAT_CRI_WAKE_FREQ;
 }
 
 /*
@@ -465,7 +480,7 @@ static __always_inline bool is_lat_cri(const struct task_ctx *tctx)
  */
 static __always_inline bool is_foreground(const struct task_ctx *tctx)
 {
-	return tctx->wake_samples >= 4 &&
+	return tctx->wake_samples >= WAKE_SANE_MIN &&
 	       tctx->peak_freq >= FOREGROUND_WAKE_FREQ &&
 	       tctx->prev_bursts + tctx->bursts > TIME_PERIOD / 20;
 }
@@ -474,13 +489,30 @@ static __always_inline bool is_foreground(const struct task_ctx *tctx)
  * Foreground tasks get a longer slice: their requests are memory-bound,
  * and interleaving them with hog slices on a busy core multiplies the
  * wall time of each request. Every foreground task is also
- * latency-critical (the wake-rate bars are the same; foreground only
- * adds the runtime floor), so a latency-critical check above the
- * foreground test would make the fourfold slice dead code.
+ * latency-critical (its 10-wake bar is above the latency bar of 5;
+ * foreground only adds the runtime floor), so a latency-critical check
+ * above the foreground test would make the fourfold slice dead code.
+ * There is no upper burst bound: a heavy waker that also does real work
+ * stays foreground, so the hybrid compaction still lets foreground beat
+ * the heavy pin.
  */
 static __always_inline u64 task_slice(const struct task_ctx *tctx)
 {
 	return is_foreground(tctx) ? 4 * deadline_ns : deadline_ns;
+}
+
+/*
+ * Class census value at run start: 0 bulk normal, 1 bulk heavy,
+ * 2 fast lane on the base slice, 3 fast lane on the fourfold slice.
+ * Foreground implies latency-critical, so testing latency first and
+ * foreground second keeps the fourfold class from being shadowed; class
+ * 2 plus class 3 is the fast-lane run count.
+ */
+static __always_inline u32 task_nr_class(const struct task_ctx *tctx)
+{
+	if (is_lat_cri(tctx))
+		return is_foreground(tctx) ? 3 : 2;
+	return is_heavy_proven(tctx) ? 1 : 0;
 }
 
 /*

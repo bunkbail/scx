@@ -134,18 +134,24 @@ transitions. Fork activation and affinity or priority changes are not
 wakes and do not sample the average.
 
 The wake-rate signal is a peak hold. The EWMA is blended 50/50 over the
-first four samples and 3:1 after that, both rounding up so a rate of 10
-wakes per 100ms can actually reach the bar of 10. The peak is armed only
-after four completed samples whose last four were at or above the bar, so
-a fork interval or a single startup spike cannot latch it. Once armed it
-decays only above 64 wakes per 100ms, while every class bar sits at 10. A
-task that has once earned a wake rate keeps its class for its lifetime. A
-real decay would strip the class from a frame-paced game thread the moment
-CPU overcommit throttles its frame rate, which is the state the credit
-exists for.
+first four samples and 3:1 after that, both rounding up so a rate at
+either class bar (5 and 10) can actually reach it. The peak is armed only
+after four completed samples whose last four were at or above the
+latency bar of 5, so a fork interval or a single startup spike cannot
+latch it. While the foreground run is shorter than four samples, the
+candidate is capped at 9, so one or two spikes cannot push a 50-60Hz task
+across the foreground bar of 10. Once armed the hold decays only above 64
+wakes per 100ms, while the latency bar sits at 5 and the foreground bar at
+10. A task that has once earned a wake rate keeps its class for its
+lifetime. A real decay would strip the class from a frame-paced game
+thread the moment CPU overcommit throttles its frame rate, which is the
+state the credit exists for.
 
-- **Latency-critical**: a smoothed wake rate of at least 10 wakes per
-  100ms sustained for four samples, whatever its burst size. Game render
+- **Latency-critical**: a smoothed wake rate of at least 5 wakes per
+  100ms (50Hz) sustained for four samples, whatever its burst size. A
+  60Hz frame thread and a 59Hz request probe wake about every 17ms, and
+  the integer rate of that interval is 5; at a bar of 10 their real wake
+  rate would leave the fast lane empty under overcommit. Game render
   threads, compositors and submission workers qualify; under overcommit a
   game thread is heavy too, so no burst bound can gate this. A task that
   never leaves runnable state never re-runs the EWMA, so a preempted batch
@@ -155,12 +161,15 @@ exists for.
 - **Interactive**: used some CPU in its previous window but less than a
   quarter of one, and has not crossed the same bar in its current window.
   UI blips and event loops. Eligible to preempt on wakeup.
-- **Foreground**: wakes at least 10 times per 100ms and does real work,
-  more than one twentieth of the window. A browser renderer or an audio
-  thread: too much CPU for the interactive class, but latency-bound all
-  the same. Eligible to preempt on wakeup and granted the fourfold slice.
-  Every foreground task is also latency-critical; foreground adds the
-  runtime floor.
+- **Foreground**: keeps a smoothed rate of at least 10 wakes per 100ms
+  for four consecutive samples and does real work, more than one
+  twentieth of the window. A browser renderer or an audio thread: too
+  much CPU for the interactive class, but latency-bound all the same.
+  Eligible to preempt on wakeup and granted the fourfold slice. There is
+  no upper burst bound: a heavy waker that also does real work stays
+  foreground, so the hybrid compaction still lets foreground beat the
+  heavy pin. Every foreground task is also latency-critical; foreground
+  adds the sustained 100Hz gate and the runtime floor.
 - **Heavy**: everything else, including fresh tasks. A task that used more
   than a quarter of the window is a proven consumer. It holds its CPU
   across slice boundaries through the sticky rule and asks for the boost

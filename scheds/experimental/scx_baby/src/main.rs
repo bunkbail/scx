@@ -666,57 +666,89 @@ mod tests {
         let mut avg = 0u64;
         let mut samples = 0u32;
         let mut sane = 0u32;
+        let mut fg_sane = 0u32;
         let mut peak = 0u32;
 
         for &raw in seq {
             avg = wake_rate_blend(avg, raw, samples);
-            if raw >= 10 {
-                sane = (sane + 1).min(255);
+            if samples < 4 {
+                samples += 1;
+            }
+            if raw >= 5 {
+                sane = (sane + 1).min(4);
             } else {
                 sane = 0;
             }
-            if raw > 0 {
-                samples = (samples + 1).min(255);
+            if raw >= 10 {
+                fg_sane = (fg_sane + 1).min(4);
+            } else {
+                fg_sane = 0;
             }
-            if samples >= 4 && sane >= 4 && avg >= peak as u64 {
-                peak = avg as u32;
-            } else if peak > 0 {
-                peak -= peak >> 6;
+            peak -= peak >> 6;
+            if sane >= 4 {
+                let mut cand = avg as u32;
+
+                // A 50-60Hz task hit by one or two spikes must not
+                // cross the foreground bar.
+                if fg_sane < 4 && cand >= 10 {
+                    cand = 9;
+                }
+                if cand > peak {
+                    peak = cand;
+                }
             }
         }
         peak
     }
 
     #[test]
-    fn rounded_blend_reaches_the_class_bar() {
-        // 100Hz: ten wakes per 100ms. A truncating 3:1 blend has a fixed
-        // point at 9 for this input; the round-up must reach 10.
+    fn rounded_blend_reaches_both_bars() {
+        // 100Hz reaches 10; a 50Hz sample of 5 reaches the latency bar
+        // of 5. A truncating 3:1 blend has a fixed point at 9 for the
+        // 100Hz input, so the round-up matters.
         assert_eq!(wake_rate_blend(9, 10, 4), 10);
         assert!(class_peak_after(&[10; 8]) >= 10);
+        assert!(class_peak_after(&[5; 8]) >= 5);
     }
 
     #[test]
-    fn slow_wakers_do_not_reach_the_bar() {
-        // 60Hz is six wakes per 100ms, below the bar, and stays there.
-        assert!(class_peak_after(&[6; 16]) < 10);
+    fn sixty_hz_is_latency_critical_but_not_foreground() {
+        // 60Hz is six wakes per 100ms: above the latency bar of 5 and
+        // below the foreground bar of 10.
+        let peak = class_peak_after(&[6; 16]);
+        assert!(peak >= 5 && peak < 10);
     }
 
     #[test]
-    fn one_startup_spike_cannot_latch_the_peak() {
+    fn one_startup_spike_cannot_earn_foreground() {
         // A single very short interval followed by a steady 60Hz cadence
-        // would carry a plain four-sample EWMA to 12; the sustained gate
-        // must reject it.
+        // would carry a plain four-sample EWMA to 12; the foreground
+        // run gate caps the candidate at 9.
         let mut seq = vec![100u64];
         seq.extend([6u64; 8]);
-        assert!(class_peak_after(&seq) < 10);
+        let peak = class_peak_after(&seq);
+        assert!(peak >= 5 && peak < 10);
     }
 
     #[test]
-    fn fast_wakers_latch_and_keep_the_class() {
-        let peak = class_peak_after(&[12; 8]);
-        assert!(peak >= 10);
-        // The hold does not decay below the bar, so the class latches.
-        assert!(class_peak_after(&[12, 12, 12, 12, 6, 6, 6, 6]) >= 10);
+    fn fast_wakers_earn_foreground_and_keep_latency() {
+        assert!(class_peak_after(&[12; 8]) >= 10);
+        // After a slowdown the latency hold stays above its bar even
+        // though the foreground bar is no longer met.
+        let peak = class_peak_after(&[12, 12, 12, 12, 6, 6, 6, 6]);
+        assert!(peak >= 5);
+    }
+
+    #[test]
+    fn woke_task_keeps_interactive_through_a_zero_window() {
+        // Mirror of is_interactive: a task with a zero previous burst
+        // stays interactive once it has four latency-bar wake samples.
+        fn interactive(prev: u64, curr: u64, sane: u32) -> bool {
+            (prev > 0 || sane >= 4) && prev < 50_000_000 && curr < 50_000_000
+        }
+        assert!(interactive(0, 10_000_000, 4));
+        assert!(!interactive(0, 10_000_000, 0));
+        assert!(!interactive(60_000_000, 10_000_000, 4));
     }
 
     #[test]
