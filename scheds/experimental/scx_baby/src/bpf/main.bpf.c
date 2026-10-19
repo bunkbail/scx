@@ -256,14 +256,22 @@ s32 BPF_STRUCT_OPS(baby_select_cpu, struct task_struct *p,
 	struct task_ctx *tctx = try_lookup_task_ctx(p);
 	bool is_idle = false;
 	s32 cpu;
+	u64 now = bpf_ktime_get_ns();
 
 	/*
 	 * The miss reason always describes the most recent wake. Reset it
 	 * at entry, before any early return; charge_wait() files it for a
 	 * wake that actually waits.
+	 *
+	 * The burst window is rolled here, before the tier decision:
+	 * ops.select_cpu() runs before ops.runnable(), so a task waking
+	 * from a sleep would otherwise be classified on the window that
+	 * ended during the sleep.
 	 */
-	if (tctx)
+	if (tctx) {
 		tctx->wake_gate_miss = BABY_WG_NO_GATE;
+		roll_burst_window(tctx, now);
+	}
 
 	/*
 	 * Don't trust the sync hint: a waker that keeps running after the
@@ -397,8 +405,8 @@ s32 BPF_STRUCT_OPS(baby_select_cpu, struct task_struct *p,
 		}
 
 		ran_at = cpu_running_at[pcpu_idx];
-		if (!ran_at || bpf_ktime_get_ns() - ran_at <
-				       BABY_TICK_PREEMPT_PROTECT_NS) {
+		if (!ran_at ||
+		    now - ran_at < BABY_TICK_PREEMPT_PROTECT_NS) {
 			tctx->wake_gate_miss = BABY_WG_M5_RESIDENCY;
 			return cpu;
 		}
@@ -1058,6 +1066,18 @@ void BPF_STRUCT_OPS(baby_running, struct task_struct *p)
 	tctx->last_acc_at = now;
 
 	charge_wait(tctx, now);
+
+	/*
+	 * Class census at the point of truth: the class the task runs
+	 * under and the lane it was dispatched from.
+	 */
+	if (stats_enabled) {
+		u32 cls = (is_interactive(tctx) ? 1 : 0) |
+			  (is_foreground(tctx) ? 2 : 0);
+
+		__sync_fetch_and_add(&nr_class[cls & (BABY_WCLS_NR - 1)], 1);
+		__sync_fetch_and_add(&nr_lane[is_lat_cri(tctx) ? 1 : 0], 1);
+	}
 
 	/*
 	 * Adjust the target CPU frequency before the task starts to run.

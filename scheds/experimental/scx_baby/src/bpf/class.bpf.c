@@ -77,17 +77,12 @@ calc_deadline(const struct task_struct *p, struct task_ctx *tctx, u64 now)
 }
 
 /*
- * Account @delta of runtime to the task's bursts, rolling the window over
- * once it exceeds TIME_PERIOD (original calc_bursts()).
+ * Account @delta of runtime to the task's bursts after rolling the
+ * window to @now (original calc_bursts()).
  */
 static void account_bursts(struct task_ctx *tctx, u64 delta, u64 now)
 {
-	if (now - tctx->start_time >= TIME_PERIOD) {
-		tctx->start_time = now;
-		tctx->prev_bursts = tctx->bursts;
-		tctx->bursts = 0ULL;
-	}
-
+	roll_burst_window(tctx, now);
 	tctx->bursts += delta;
 }
 
@@ -134,71 +129,123 @@ __hidden bool can_resched(const struct task_ctx *tctx)
 }
 
 /*
- * A task is interactive when it used little CPU in its previous burst
- * window and has run long enough to complete one. Interactive and
- * foreground tasks are the eligible wakers for wakeup preemption; the
- * class bit is also stamped into the wait instrument. The boost counter
- * feeds the deadline, not the placement: almost every desktop task
- * sleeps early often enough to earn boost, so it cannot separate
- * latency-sensitive tasks from hogs.
+ * A task is interactive when it used some CPU in its previous burst
+ * window but stayed under a quarter of one, and its current window has
+ * not already crossed the same bar. The lower bound matters: a task
+ * that was idle for a full window (prev_bursts == 0) is not
+ * interactive, and the upper bound on the current window stops a hog
+ * that has just started its first window from passing as one.
+ * Interactive and foreground tasks are the eligible wakers for wakeup
+ * preemption; the class bit is also stamped into the wait instrument.
+ * The boost counter feeds the deadline, not the placement: almost every
+ * desktop task sleeps early often enough to earn boost, so it cannot
+ * separate latency-sensitive tasks from hogs.
  */
 __hidden bool is_interactive(const struct task_ctx *tctx)
 {
-	return tctx->prev_bursts < TIME_PERIOD / 4 &&
-	       tctx->prev_bursts + tctx->bursts > 0;
+	return tctx->prev_bursts > 0 &&
+	       tctx->prev_bursts < TIME_PERIOD / 4 &&
+	       tctx->bursts < TIME_PERIOD / 4;
 }
 
 /*
- * The task has become runnable: stamp the class bits and the
- * arrival-type bit the wait instrument files waits under, then track
- * how often the task wakes. Frequent wakers with real work to do are
- * foreground tasks.
+ * The task has become runnable: stamp the arrival-type bit the wait
+ * instrument files waits under, then track how often the task wakes.
+ * Frequent wakers with real work to do are foreground tasks.
  */
 __hidden void class_on_runnable(struct task_ctx *tctx, u64 enq_flags, u64 now)
 {
-	u64 delta = now - tctx->last_woke_at;
-
-	/*
-	 * The class bits the wait instrument files waits under. Stamped
-	 * here, where the wake-path enqueue that follows sees this
-	 * call's fresh EWMAs; a slice-expiry requeue reuses the verdict
-	 * of the last runnable, which is one cycle old at worst.
-	 */
-	tctx->wait_cls = (is_interactive(tctx) ? 1 : 0) |
-			 (is_foreground(tctx) ? 2 : 0);
-
-	/*
-	 * The arrival-type bit the wait instrument files waits under:
-	 * SCX_ENQ_WAKEUP marks the handoff arrivals. Cleared in
-	 * ops.stopping(), so a re-entry of a task that has run - slice
-	 * expiry, preemption, an RT-lease reenqueue - files as rotation.
-	 */
 	tctx->arrival_is_wake = (enq_flags & SCX_ENQ_WAKEUP) ? 1 : 0;
 
-	if (!delta)
+	/*
+	 * Only a true sleep-to-wake transition samples the wake rate.
+	 * Fork activation, affinity changes and priority changes are not
+	 * wakes; counting a fork as one was what made the first post-fork
+	 * interval - a few microseconds - read as a saturated rate.
+	 */
+	if (!(enq_flags & SCX_ENQ_WAKEUP))
 		return;
-	tctx->last_woke_at = now;
 
 	/*
-	 * Wakes per 100ms, smoothed (EWMA) and capped: a task that wakes
-	 * every millisecond or faster saturates the counter. The peak
-	 * hold remembers the historical maximum and bleeds only while
-	 * the value sits above 64 (a shift of 6), so once a task has
-	 * earned a wake rate past a class bar it keeps the credit: a
-	 * frame-paced thread, throttled or not, does not fall out of
-	 * its class in a slow patch.
+	 * A wake that skipped ops.select_cpu() still needs the burst
+	 * window rolled before the tier decision below reads it.
 	 */
-	tctx->wakeup_freq = calc_avg(tctx->wakeup_freq,
-				     (100 * NSEC_PER_MSEC) / delta);
-	tctx->wakeup_freq = MIN(tctx->wakeup_freq, 100);
+	roll_burst_window(tctx, now);
 
-	if (tctx->wakeup_freq >= tctx->peak_freq)
-		tctx->peak_freq = (u32)tctx->wakeup_freq;
-	else
-		tctx->peak_freq -= tctx->peak_freq >> 6;
+	/*
+	 * The first wake seeds the interval clock: there is no interval
+	 * to measure yet, and the fork-time stamp is not one.
+	 */
+	if (!tctx->last_woke_at) {
+		tctx->last_woke_at = now;
+		return;
+	}
 
-	if (tctx->wake_samples < 255)
-		tctx->wake_samples++;
+	{
+		u64 delta = now - tctx->last_woke_at;
+		u64 raw;
+
+		tctx->last_woke_at = now;
+
+		if (!delta)
+			return;
+
+		/*
+		 * A wake after a second or more of sleep is not a sample
+		 * of a wake cadence: restart the average but keep the
+		 * peak. A task that has earned a class keeps it across a
+		 * long sleep; a task that has not starts its warmup over.
+		 */
+		if (delta >= NSEC_PER_SEC) {
+			tctx->wakeup_freq = 0;
+			tctx->wake_samples = 0;
+			tctx->wake_sane = 0;
+			return;
+		}
+
+		/*
+		 * Wakes per 100ms, capped before the average: clamping
+		 * after the blend lets one very short interval jump the
+		 * average from zero straight to the cap.
+		 */
+		raw = MIN((100 * NSEC_PER_MSEC) / delta, 100);
+
+		/*
+		 * Warm up at 50/50 and settle at the documented 3:1. Both
+		 * blends round up: a truncating 3:1 blend has a fixed
+		 * point below the sample, so a 100Hz waker's average
+		 * converges to 9 and never reaches the bar of 10.
+		 */
+		if (tctx->wake_samples < 4)
+			tctx->wakeup_freq =
+				(tctx->wakeup_freq + raw + 1) >> 1;
+		else
+			tctx->wakeup_freq =
+				(3 * tctx->wakeup_freq + raw + 3) >> 2;
+
+		/*
+		 * The peak is only allowed to rise on four completed
+		 * samples whose last four were at or above the bar, so a
+		 * startup spike followed by slow wakes cannot latch. The
+		 * hold still bleeds above 64 on every sample, including
+		 * the slow ones.
+		 */
+		if (raw >= FOREGROUND_WAKE_FREQ) {
+			if (tctx->wake_sane < 255)
+				tctx->wake_sane++;
+		} else {
+			tctx->wake_sane = 0;
+		}
+
+		if (raw && tctx->wake_samples < 255)
+			tctx->wake_samples++;
+
+		if (tctx->wake_samples >= 4 && tctx->wake_sane >= 4 &&
+		    tctx->wakeup_freq >= tctx->peak_freq)
+			tctx->peak_freq = (u32)tctx->wakeup_freq;
+		else if (tctx->peak_freq)
+			tctx->peak_freq -= tctx->peak_freq >> 6;
+	}
 }
 
 /*
@@ -250,8 +297,20 @@ __hidden void class_init_task(struct task_ctx *tctx, struct task_struct *p, u64 
 	tctx->deadline = calc_deadline(p, tctx, now);
 	tctx->start_time = now;
 	tctx->last_acc_at = now;
-	tctx->last_woke_at = now;
 	tctx->last_cpu = -1;
+
+	/*
+	 * No wake interval exists at fork. A zero stamp is the "first
+	 * wake seeds the clock" sentinel in ops.runnable(); seeding it
+	 * with @now makes the first post-fork interval a few
+	 * microseconds and saturates the average.
+	 */
+	tctx->last_woke_at = 0;
+	tctx->wakeup_freq = 0;
+	tctx->peak_freq = 0;
+	tctx->wake_samples = 0;
+	tctx->wake_sane = 0;
+	tctx->prev_bursts = 0;
 	{
 		struct task_struct *parent = p->real_parent;
 		struct task_ctx *ptctx;

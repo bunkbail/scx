@@ -30,6 +30,14 @@ __attribute__((aligned(64))) volatile u64 nr_direct_dispatches;
 volatile u64 nr_preemptions, nr_boosts, nr_sticky, nr_coldspreads;
 
 /*
+ * Class census at run start: the class composition and the lane of
+ * every dispatched task. "Measured, not declared" classification needs
+ * to be countable, or a latched class is invisible.
+ */
+volatile u64 nr_class[BABY_WCLS_NR];
+volatile u64 nr_lane[2];
+
+/*
  * Saturation preemption instrument: victims ops.tick() cut short
  * because a latency-critical task waited at a queue head, split by
  * where the waiter sat.
@@ -150,6 +158,15 @@ __hidden void stamp_wait(struct task_ctx *tctx, u64 now, u64 depth, bool shared)
 	tctx->wait_depth = (u8)MIN(depth, BABY_WDEPTH_NR - 1);
 	tctx->wait_shared = shared;
 	if (stats_enabled) {
+		/*
+		 * Stamp the class at the arrival, where the wake-rate
+		 * EWMAs and the burst window are current. Stamping it
+		 * from ops.runnable() filed a wake under the class it
+		 * held before that call's update, and filed a rotation
+		 * under the class of a wake that could be long past.
+		 */
+		tctx->wait_cls = (is_interactive(tctx) ? 1 : 0) |
+				 (is_foreground(tctx) ? 2 : 0);
 		if (shared)
 			__sync_fetch_and_add(&nr_arr_type[type * 2 + 1], 1);
 		else

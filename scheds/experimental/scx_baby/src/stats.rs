@@ -16,6 +16,14 @@ use scx_stats_derive::stat_doc;
 use serde::Deserialize;
 use serde::Serialize;
 
+/// Element-wise subtraction for the fixed-width census vectors.
+fn vec_sub(a: &[u64], b: &[u64]) -> Vec<u64> {
+    a.iter()
+        .zip(b.iter())
+        .map(|(x, y)| x.saturating_sub(*y))
+        .collect()
+}
+
 /// One placement-distance histogram: landings bucketed by the distance
 /// rank between the task's previous CPU and where it actually went
 /// (self, SMT sibling, same L2, same LLC, same node, beyond).
@@ -610,6 +618,10 @@ pub struct Metrics {
     pub nr_sticky: u64,
     #[stat(desc = "Number of enqueues the oversubscription gate sent to the shared queue")]
     pub nr_coldspreads: u64,
+    #[stat(desc = "Runs by class: 0 neither, 1 interactive, 2 foreground, 3 both")]
+    pub nr_class: Vec<u64>,
+    #[stat(desc = "Runs by lane: 0 bulk, 1 fast")]
+    pub nr_lane: Vec<u64>,
     #[stat(desc = "Victims cut short at ops.tick for a shared-queue waiter")]
     pub nr_tick_preempts: u64,
     #[stat(desc = "Victims cut short at ops.tick for a warm-seat waiter")]
@@ -681,6 +693,13 @@ impl Metrics {
             self.nr_sticky,
             self.nr_arr_seat,
             self.nr_coldspreads,
+        )?;
+        writeln!(
+            w,
+            "  class[{:?}] lane[bulk {} fast {}]",
+            self.nr_class,
+            self.nr_lane.first().copied().unwrap_or(0),
+            self.nr_lane.get(1).copied().unwrap_or(0),
         )?;
         write!(w, "  land: ")?;
         self.nr_land.format(w)?;
@@ -887,6 +906,8 @@ impl Metrics {
             nr_boosts: self.nr_boosts.saturating_sub(rhs.nr_boosts),
             nr_sticky: self.nr_sticky.saturating_sub(rhs.nr_sticky),
             nr_coldspreads: self.nr_coldspreads.saturating_sub(rhs.nr_coldspreads),
+            nr_class: vec_sub(&self.nr_class, &rhs.nr_class),
+            nr_lane: vec_sub(&self.nr_lane, &rhs.nr_lane),
             nr_tick_preempts: self.nr_tick_preempts.saturating_sub(rhs.nr_tick_preempts),
             nr_tick_preempts_warm: self
                 .nr_tick_preempts_warm

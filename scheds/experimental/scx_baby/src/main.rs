@@ -438,6 +438,8 @@ impl<'a> Scheduler<'a> {
             nr_boosts: bss_data.nr_boosts,
             nr_sticky: bss_data.nr_sticky,
             nr_coldspreads: bss_data.nr_coldspreads,
+            nr_class: bss_data.nr_class.to_vec(),
+            nr_lane: bss_data.nr_lane.to_vec(),
             nr_tick_preempts: bss_data.nr_tick_preempts,
             nr_tick_preempts_warm: bss_data.nr_tick_preempts_warm,
             nr_depth1_pulls: bss_data.nr_depth1_pulls,
@@ -599,6 +601,76 @@ mod tests {
 
         let ok = Opts::try_parse_from(["scx_baby", "-d", "500"]).unwrap();
         assert_eq!(ok.deadline_us, 500);
+    }
+
+    /// Test-only mirror of the wake-rate blend and peak gate in
+    /// class.bpf.c. The BPF side cannot be unit tested from userspace, so
+    /// this pins the arithmetic the class bars depend on: the 50/50
+    /// warmup, the round-up that lets a 10-sample rate reach 10, and the
+    /// sustained gate that rejects one startup spike.
+    fn wake_rate_blend(avg: u64, raw: u64, samples: u32) -> u64 {
+        if samples < 4 {
+            (avg + raw + 1) >> 1
+        } else {
+            (3 * avg + raw + 3) >> 2
+        }
+    }
+
+    fn class_peak_after(seq: &[u64]) -> u32 {
+        let mut avg = 0u64;
+        let mut samples = 0u32;
+        let mut sane = 0u32;
+        let mut peak = 0u32;
+
+        for &raw in seq {
+            avg = wake_rate_blend(avg, raw, samples);
+            if raw >= 10 {
+                sane = (sane + 1).min(255);
+            } else {
+                sane = 0;
+            }
+            if raw > 0 {
+                samples = (samples + 1).min(255);
+            }
+            if samples >= 4 && sane >= 4 && avg >= peak as u64 {
+                peak = avg as u32;
+            } else if peak > 0 {
+                peak -= peak >> 6;
+            }
+        }
+        peak
+    }
+
+    #[test]
+    fn rounded_blend_reaches_the_class_bar() {
+        // 100Hz: ten wakes per 100ms. A truncating 3:1 blend has a fixed
+        // point at 9 for this input; the round-up must reach 10.
+        assert_eq!(wake_rate_blend(9, 10, 4), 10);
+        assert!(class_peak_after(&[10; 8]) >= 10);
+    }
+
+    #[test]
+    fn slow_wakers_do_not_reach_the_bar() {
+        // 60Hz is six wakes per 100ms, below the bar, and stays there.
+        assert!(class_peak_after(&[6; 16]) < 10);
+    }
+
+    #[test]
+    fn one_startup_spike_cannot_latch_the_peak() {
+        // A single very short interval followed by a steady 60Hz cadence
+        // would carry a plain four-sample EWMA to 12; the sustained gate
+        // must reject it.
+        let mut seq = vec![100u64];
+        seq.extend([6u64; 8]);
+        assert!(class_peak_after(&seq) < 10);
+    }
+
+    #[test]
+    fn fast_wakers_latch_and_keep_the_class() {
+        let peak = class_peak_after(&[12; 8]);
+        assert!(peak >= 10);
+        // The hold does not decay below the bar, so the class latches.
+        assert!(class_peak_after(&[12, 12, 12, 12, 6, 6, 6, 6]) >= 10);
     }
 
     #[test]

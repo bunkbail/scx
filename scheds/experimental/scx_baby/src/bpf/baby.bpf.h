@@ -152,6 +152,13 @@ extern volatile u64 nr_preemptions, nr_boosts, nr_sticky;
 extern volatile u64 nr_coldspreads;
 
 /*
+ * Class census at run start (class composition and lane), behind the
+ * same --stats flag as the rest of the instrument.
+ */
+extern volatile u64 nr_class[BABY_WCLS_NR];
+extern volatile u64 nr_lane[2];
+
+/*
  * Where placements land, by distance rank.
  */
 extern volatile u64 nr_land[BABY_DIST_NR];
@@ -291,20 +298,21 @@ struct task_ctx {
 
 	/*
 	 * Wake frequency: an EWMA of how often the task wakes, in wakes
-	 * per 100ms (flash's update_freq()). High values mark foreground
-	 * workers: tasks that wake constantly with real work to do, as
-	 * opposed to CPU hogs that never wake and blips that use almost
-	 * no CPU.
+	 * per 100ms. High values mark foreground workers: tasks that wake
+	 * constantly with real work to do, as opposed to CPU hogs that
+	 * never wake and blips that use almost no CPU.
 	 */
 	u64 wakeup_freq;
 	u64 last_woke_at;
 
 	/*
-	 * Peak hold of wakeup_freq: renewed whenever the EWMA reaches it,
-	 * and decaying by 1/64 per wake only while above 64 (a shift of a
-	 * value below 64 is zero). The hold therefore falls from a spike
-	 * to 63 and stays there; 63 is far above every class bar (10), so
-	 * the wake-rate classes latch once earned, by design. A real decay
+	 * Peak hold of wakeup_freq. The EWMA is blended 50/50 until four
+	 * samples exist and 3:1 after that, and the peak rises only after
+	 * four consecutive samples at or above the class bar. The hold
+	 * then decays by 1/64 per wake only while above 64 (a shift of a
+	 * value below 64 is zero), so it falls from a spike to 63 and
+	 * stays there. 63 is far above every class bar (10): the
+	 * wake-rate classes latch once earned, by design. A real decay
 	 * would strip the class from a frame-paced thread the moment
 	 * overcommit throttles its frame rate, which is the state the
 	 * credit exists for.
@@ -312,12 +320,13 @@ struct task_ctx {
 	u32 peak_freq;
 
 	/*
-	 * Completed wake-frequency samples: foreground status requires a
-	 * few samples so that the EWMA of a freshly forked task (whose
-	 * first wakeup interval is tiny) cannot read as high frequency
-	 * from one sample.
+	 * Wake-frequency samples taken, and the current run of samples
+	 * at or above the class bar. The peak is only allowed to rise
+	 * after enough of both, so neither the first post-fork interval
+	 * nor one startup spike can latch a class.
 	 */
 	u32 wake_samples;
+	u8 wake_sane;
 
 	/*
 	 * Number of interactive priority boosts the task has earned by
@@ -375,6 +384,29 @@ struct task_ctx {
 	 */
 	s32 last_cpu;
 };
+
+/*
+ * Roll the 200ms burst window to the window @now falls in. A task that
+ * slept through at least two windows has no runtime in the last
+ * completed one, so its previous burst is zero; a shorter sleep keeps
+ * the runtime it did accumulate. Callers run this at every wake path
+ * (select_cpu, runnable) and at the runtime accounting, so a predicate
+ * never reads a window that ended during a sleep.
+ */
+static __always_inline void roll_burst_window(struct task_ctx *tctx, u64 now)
+{
+	u64 elapsed = now - tctx->start_time;
+
+	if (elapsed >= 2 * TIME_PERIOD) {
+		tctx->prev_bursts = 0;
+		tctx->bursts = 0;
+		tctx->start_time = now;
+	} else if (elapsed >= TIME_PERIOD) {
+		tctx->prev_bursts = tctx->bursts;
+		tctx->bursts = 0;
+		tctx->start_time += TIME_PERIOD;
+	}
+}
 
 /*
  * The class predicates are pure functions of the task context and the
