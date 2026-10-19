@@ -38,13 +38,17 @@ its lane.
 ### Deadline and time slice
 
 Every task owns a deadline, and a CPU always runs the earliest one it can
-reach. A deadline is `now + deadline_ns + prio_factor[nice]`, with
-`deadline_ns` at 1.18ms. The nice shift moves the deadline between -1.08ms
-(nice -20) and +1.26ms (nice +19), as in the original.
+reach. A deadline is `now + nice_offset`, with the base offset at 1.18ms.
+The original nice table is rescaled to the configured offset, so a nice
+-20 deadline sits at about 8.5 percent of the base and a nice +19 one at
+about 2.07 times it, and every offset stays in the future at the smallest
+accepted `-d`.
 
-A task that sleeps before consuming its deadline is treated as interactive:
-it earns a cumulative one-step boost of its effective nice level, floored
-at -20, which pulls its future deadlines earlier.
+A task that sleeps before consuming its deadline and is a `SCHED_NORMAL`
+task is treated as interactive: it earns a cumulative one-step boost of
+its effective nice level, floored at -20, which pulls its future deadlines
+earlier. `SCHED_IDLE` and `SCHED_BATCH` tasks keep their requested lower
+share.
 
 The deadline is also the base time slice. A foreground task gets four times
 the base slice, and an arrival that faces a deep backlog gets the same
@@ -81,7 +85,9 @@ task, an open warm seat would freeze whatever lane skew exists: overloaded
 lanes would rotate internally while CPUs whose task blocked would starve.
 The machine-wide sum is used rather than `nr_running` alone because the sum
 is conserved across the running-to-queued transitions that race the bare
-counter.
+counter. The two lanes are counted separately: each lane's clause uses that
+lane's shared backlog and seat depths, so fast-lane work cannot open a bulk
+seat and bulk work cannot open a fast-lane one.
 
 ### Dispatch and preemption
 
@@ -89,16 +95,18 @@ Dispatch serves the earliest deadline across the warm queue and the node
 queue of the lane being served, with the warm side winning ties. A running
 task keeps its CPU across a slice boundary only while its deadline still
 beats the head that would run next; ties go to the waiter. A task that
-yields gives up the rest of its round and requeues behind everything
-queued.
+yields gives up the rest of its round and requeues behind the tasks
+queued in its lane.
 
 Wakeup preemption fires only when the target CPU has no warm backlog and
 only for interactive or foreground wakers with an earlier deadline than the
 running task. A preemption into a deep queue would only trade places with
 work that is about to run anyway. It also needs the running task to pass
-the original burst tracker's `can_resched()`, so a proven CPU hog cannot be
-preempted even by an earlier deadline. The wakee is placed ahead of the
-victim on the victim's local queue.
+the original burst tracker's `can_resched()`, which protects a task only
+inside the window between its previous burst minus the 5ms completion slack
+and that previous burst; a proven CPU hog is always reschedulable. A
+latency-critical victim is shielded outright. The wakee is placed ahead of
+the victim on the victim's local queue.
 
 At saturation, a latency-critical waiter would otherwise wait a full slice
 behind a batch task. The tick cuts the holding task's slice short under
@@ -121,7 +129,9 @@ base slice rather than the deep-backlog rung it did not earn.
 
 Classes are driven by two runtime signals, never by the boost counter: a
 task's runtime history over 200ms windows, and a wake-frequency EWMA in
-wakes per 100ms sampled in `ops.runnable()`.
+wakes per 100ms sampled in `ops.runnable()` on true sleep-to-wake
+transitions. Fork activation and affinity or priority changes are not
+wakes and do not sample the average.
 
 The wake-rate signal is a peak hold. The EWMA is blended 50/50 over the
 first four samples and 3:1 after that, both rounding up so a rate of 10
@@ -180,11 +190,11 @@ The oversubscription gates are per lane, keyed on state the queues cannot
 express. A per-CPU `cpu_is_lat[]` array, stamped in `ops.running()` and
 cleared in `ops.stopping()`, records whether a CPU's resident is
 latency-critical. The bulk clause is the single-lane gate: running lanes,
-shared backlog and bulk warm seats, plus a latency-critical arrival's own
-seat depth, against the CPU count plus one. The fast-lane clause opens warm
-seats when the fast lane itself is oversubscribed: latency-critical
-residents plus shared backlog plus fast-lane warm seats past the same
-bound. An arrival is seated when either clause holds. Queue depth alone
+the bulk lane's shared backlog and bulk warm seats, plus a latency-critical
+arrival's own seat depth, against the CPU count plus one. The fast-lane
+clause opens warm seats when the fast lane itself is oversubscribed:
+latency-critical residents plus the fast lane's shared backlog plus
+fast-lane warm seats past the same bound. An arrival is seated when either clause holds. Queue depth alone
 cannot say whether a CPU runs a cuttable bulk resident: at full saturation
 the CPU-bound workers never queue, so bulk depth reads zero exactly where
 bulk residency is total.
@@ -210,6 +220,12 @@ tasks stack there. A proven consumer with no wake history pins a big core;
 a proven consumer that is also foreground starts on the little tier and
 falls back to a big core when it is full. The gates are statically false on
 a single-tier machine, where the little mask is empty.
+
+The tiers come from the kernel's per-CPU capacity: big is every CPU at or
+above 80 percent of the top capacity, little is the rest, and a core below
+both half of the little tier's top and a third of the machine's top is an
+LP island and joins neither. A core-type fallback corroborated by the
+clock spread covers platforms without capacity files.
 
 The kernel's idle-CPU selector is restricted to the non-LP mask while the
 tier masks are present: `scx_bpf_select_cpu_and()` clears the chosen CPU's
@@ -249,20 +265,23 @@ out the lease where no other CPU can see them. `ops.cpu_release()` pushes
 them back through enqueue when the lease ends, so they land on an idle core
 or in the deadline order.
 
-A warm queue can also outlive its CPU, stranded behind a lease or starved
-while affinity moved under it. The rescue timer re-enqueues the tasks of a
-queue whose head has waited more than a second, well before the kernel's
-five-second watchdog could force-unload the scheduler. It runs for both
-lanes.
+A queue can also outlive its CPU, stranded behind a lease or starved while
+affinity moved under it. The rescue timer re-enqueues a queue that has held
+work for more than a second without a successful pull, well before the
+kernel's five-second watchdog could force-unload the scheduler. It covers
+both lanes, every per-CPU seat and every node queue.
 
 ### Measurement instruments
 
 The `--stats` report decomposes oversubscription wait. Every arrival is
 stamped with the depth it waits at and charged when it runs, split by
-arrival type (wake handoff or rotation requeue) and by class. A dispatch
-census records the seat depth and shared backlog each lane sees, and the
-saturation preemption counters split victims by where the waiter sat. The
-counters are diagnostic and do not feed the scheduling policy.
+arrival type (wake handoff or rotation requeue), by class and by the reason
+the wake gate missed. A dispatch census records the seat depth and shared
+backlog each lane sees, a class and lane census counts every run start, and
+the saturation preemption counters split victims by where the waiter sat.
+The BPF maxima are reset after each snapshot, so a reported maximum belongs
+to its interval. The counters are diagnostic and do not feed the scheduling
+policy.
 
 ## Mapping to the original scheduler
 
@@ -272,7 +291,7 @@ counters are diagnostic and do not feed the scheduling policy.
 | `update_curr()` burst accounting and deadline renewal | `ops.stopping()` / `ops.tick()` |
 | `hrtick_start_fair()` micro-preemption | slice-end comparison in `ops.dispatch()`: the running task continues only while its deadline beats the head that would run next |
 | `check_preempt_wakeup()` | deadline comparison against the previous CPU's current task, gated on an empty warm queue and an interactive or foreground waker; the wakee is placed ahead of the victim on its local queue |
-| `yield_task_fair()` YIELD_MARK | `ops.yield()`: the task is pushed behind everything queued in the current round |
+| `yield_task_fair()` YIELD_MARK | `ops.yield()`: the task is pushed behind the tasks queued in its lane in the current round |
 | `select_task_rq_fair()` least-loaded CPU | `ops.select_cpu()`: the kernel's idle-CPU selection with direct dispatch |
 | `newidle_balance()` / `trigger_load_balance()` (CPU0 scans all CPUs every tick and migrates one task, by count only) | deleted: idle CPUs pull the queue head; a task that stopped on a loaded core re-scans for an idle CPU; the warm-seat scan evens seat depth under the oversubscription gate, depth first with cache distance breaking ties |
 | RT/DL lease stranding | `ops.cpu_release()` requeues local tasks through enqueue; the rescue timer re-enqueues a starved warm queue |
@@ -288,7 +307,8 @@ counters are diagnostic and do not feed the scheduling policy.
 
 - `-d, --deadline-us <US>`: deadline offset and base time slice in
   microseconds, default 1180 (the original `DEADLINE_NS`), accepted range
-  100 to 100000.
+  100 to 100000. Above 10000 the tick is the only preemption source for a
+  full slice; the scheduler warns.
 - `-p, --perf <LEVEL>`: CPU frequency performance level, -2 to 1024. Level
   0 is the minimum and 1024 the maximum. The default -1 scales each CPU's
   level from its utilization; -2 leaves the platform's cpufreq setup

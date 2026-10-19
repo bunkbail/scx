@@ -159,10 +159,10 @@ Tasks that voluntarily sleep before consuming their deadline are
 treated as interactive: their effective nice level is boosted by one
 step (down to -20), which pulls their future deadlines earlier.
 
-CPU hogs are throttled by a burst tracker that accounts the runtime a
-task accumulates over a 200ms window: a task whose bursts keep growing
-behind the previous window cannot preempt other tasks even when its
-deadline is earlier.
+CPU hogs are accounted by a burst tracker over a 200ms window. The
+wake-path preemption will not displace a task inside the narrow band
+where its current window is about to complete the previous one; a
+proven hog is always reschedulable by an earlier deadline.
 
 The deadline scheme, the burst throttle and the sleep-before-deadline
 boost descend from Hamad Al Marri's Baby CPU Scheduler, deadline
@@ -177,9 +177,11 @@ struct Opts {
 
     /// Deadline offset in microseconds: every task is assigned
     /// deadline = now + deadline offset (default 1180us, the original
-    /// DEADLINE_NS). This is also the time slice of each task. The
+    /// DEADLINE_NS). This is also the base time slice of each task. The
     /// scheduler is a deadline machine, so a value near zero collapses
-    /// every slice to nothing; accepted range is 100 to 100000.
+    /// every slice to nothing; accepted range is 100 to 100000. Above
+    /// 10000 the tick is the only preemption source for a full slice,
+    /// and the scheduler warns.
     #[clap(
         short = 'd',
         long,
@@ -358,10 +360,11 @@ impl<'a> Scheduler<'a> {
 
         // Set scheduler flags.
         //
-        // SCX_OPS_ENQ_LAST keeps a task that expires its time slice while
-        // staying runnable in the deadline order: the task competes for
-        // the CPU again by its deadline, like the original scheduler does
-        // across its deadline renewals.
+        // SCX_OPS_ENQ_LAST stops the kernel from automatically keeping
+        // prev and refilling it with the 20ms SCX_SLICE_DFL when
+        // ops.dispatch() leaves the local DSQ empty. The task instead
+        // re-enters ops.enqueue() with SCX_ENQ_LAST and keeps its
+        // deadline.
         skel.struct_ops.baby_ops_mut().flags = *compat::SCX_OPS_ENQ_LAST
             | *compat::SCX_OPS_ENQ_EXITING
             | *compat::SCX_OPS_ENQ_MIGRATION_DISABLED;
@@ -429,10 +432,30 @@ impl<'a> Scheduler<'a> {
         Ok(())
     }
 
-    fn get_metrics(&self) -> Metrics {
+    fn get_metrics(&mut self) -> Metrics {
+        let metrics = self.read_metrics();
+
+        /*
+         * Reset the BPF maxima after the read, so the next snapshot
+         * reports its own interval maximum rather than the all-time
+         * high-water mark. A BPF update racing the reset can lose one
+         * sample; the report is diagnostic and the counts are not.
+         */
+        let bss_data = self.skel.maps.bss_data.as_mut().unwrap();
+        bss_data.nr_wait_max.fill(0);
+        bss_data.nr_wait_cls_max.fill(0);
+        bss_data.nr_wait_type_max.fill(0);
+        bss_data.nr_wait_lcri_max.fill(0);
+        bss_data.nr_wait_wg_max.fill(0);
+
+        metrics
+    }
+
+    fn read_metrics(&self) -> Metrics {
         let bss_data = self.skel.maps.bss_data.as_ref().unwrap();
         Metrics {
             nr_running: bss_data.nr_running,
+            stats_enabled: self.skel.maps.rodata_data.as_ref().unwrap().stats_enabled as u64,
             nr_direct_dispatches: bss_data.nr_direct_dispatches,
             nr_preemptions: bss_data.nr_preemptions,
             nr_boosts: bss_data.nr_boosts,
@@ -550,6 +573,13 @@ fn main() -> Result<()> {
         simplelog::ColorChoice::Auto,
     )?;
 
+    if opts.deadline_us > 10_000 {
+        warn!(
+            "-d {}us is above 10ms: the tick is the only preemption source for a full slice",
+            opts.deadline_us
+        );
+    }
+
     let shutdown = Arc::new(AtomicBool::new(false));
     let shutdown_clone = shutdown.clone();
     ctrlc::set_handler(move || {
@@ -557,7 +587,12 @@ fn main() -> Result<()> {
     })
     .context("Error setting Ctrl-C handler")?;
 
+    let mut monitor = None;
     if let Some(intv) = opts.monitor.or(opts.stats) {
+        ensure!(
+            intv.is_finite() && intv > 0.0,
+            "--stats/--monitor interval must be a positive number of seconds"
+        );
         let shutdown_copy = shutdown.clone();
         let jh = std::thread::spawn(move || {
             match stats::monitor(Duration::from_secs_f64(intv), shutdown_copy) {
@@ -576,6 +611,7 @@ fn main() -> Result<()> {
             let _ = jh.join();
             return Ok(());
         }
+        monitor = Some(jh);
     }
 
     let mut open_object = MaybeUninit::uninit();
@@ -584,6 +620,16 @@ fn main() -> Result<()> {
         if !sched.run(shutdown.clone())?.should_restart() {
             break;
         }
+    }
+
+    /*
+     * Stop the monitor with the scheduler. Without this the thread
+     * outlives run(), across every hotplug restart, and keeps asking a
+     * skeleton that is about to be dropped for metrics.
+     */
+    shutdown.store(true, Ordering::Relaxed);
+    if let Some(jh) = monitor {
+        let _ = jh.join();
     }
 
     Ok(())

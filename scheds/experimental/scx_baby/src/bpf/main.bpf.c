@@ -390,10 +390,10 @@ s32 BPF_STRUCT_OPS(baby_select_cpu, struct task_struct *p,
 		 *
 		 * SCX_ENQ_PREEMPT puts the wakee at the head of the local
 		 * DSQ, zeroes the victim's slice and reschedules. The
-		 * victim keeps its remaining slice at the local DSQ head
-		 * through SCX_ENQ_HEAD; ops.enqueue() is not called for
-		 * it, so the deep-backlog slice and the tick_preempted
-		 * mark do not apply.
+		 * victim is requeued at the local DSQ head through
+		 * SCX_ENQ_HEAD; ops.enqueue() is not called for it, so the
+		 * deep-backlog rung and the tick_preempted mark do not
+		 * apply to it.
 		 */
 		struct task_struct *curr;
 		struct task_ctx *cctx;
@@ -499,6 +499,15 @@ void BPF_STRUCT_OPS(baby_enqueue, struct task_struct *p, u64 enq_flags)
 	tctx->last_acc_at = now;
 
 	/*
+	 * The two lanes are counted separately: a fast-lane backlog must
+	 * not open a bulk seat or grant a bulk arrival the deep rung, and
+	 * a bulk backlog must not open a fast-lane seat. The probe cannot
+	 * run inside an RCU read-side section; enqueue is outside one.
+	 */
+	bulk_backlog = scx_bpf_dsq_nr_queued(node);
+	fl_backlog = scx_bpf_dsq_nr_queued(fl_node2dsq(node));
+
+	/*
 	 * Consume the yield mark on every enqueue: a mark that survived
 	 * into an unrelated enqueue would push the wrong arrival behind
 	 * the round. The push applies only to the rotation requeue that
@@ -513,10 +522,13 @@ void BPF_STRUCT_OPS(baby_enqueue, struct task_struct *p, u64 enq_flags)
 		/*
 		 * yield_task_fair() marks the deadline so the task is
 		 * picked last in the current round; push it behind every
-		 * task queued in this round.
+		 * task queued in its lane in this round. A fixed two-slice
+		 * push skipped at most two of them.
 		 */
-		tctx->deadline = now + deadline_ns + deadline_ns +
-				 task_prio_factor(p, tctx);
+		u64 lane_backlog = is_lat_cri(tctx) ? fl_backlog :
+						      bulk_backlog;
+
+		tctx->deadline = now + (lane_backlog + 1) * deadline_ns;
 	} else if (!is_running &&
 		   !(enq_flags & (SCX_ENQ_LAST | SCX_ENQ_WAKEUP |
 				  SCX_ENQ_REENQ))) {
@@ -532,15 +544,6 @@ void BPF_STRUCT_OPS(baby_enqueue, struct task_struct *p, u64 enq_flags)
 		 */
 		tctx->deadline = calc_deadline(p, tctx, now);
 	}
-
-	/*
-	 * The two lanes are counted separately: a fast-lane backlog must
-	 * not open a bulk seat or grant a bulk arrival the deep rung, and
-	 * a bulk backlog must not open a fast-lane seat. The probe cannot
-	 * run inside an RCU read-side section; enqueue is outside one.
-	 */
-	bulk_backlog = scx_bpf_dsq_nr_queued(node);
-	fl_backlog = scx_bpf_dsq_nr_queued(fl_node2dsq(node));
 
 	/*
 	 * check_preempt_wakeup(): preempt the previous CPU's task when the

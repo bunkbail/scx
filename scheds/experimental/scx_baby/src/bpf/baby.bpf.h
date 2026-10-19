@@ -582,8 +582,6 @@ __hidden void census_sample(s32 cpu);
 __hidden void update_bursts(struct task_ctx *tctx, u64 now);
 __hidden bool can_resched(const struct task_ctx *tctx);
 __hidden bool is_interactive(const struct task_ctx *tctx);
-__hidden s64 task_prio_factor(const struct task_struct *p,
-		     const struct task_ctx *tctx);
 __hidden u64 calc_deadline(const struct task_struct *p, struct task_ctx *tctx,
 		  u64 now);
 __hidden void class_on_runnable(struct task_ctx *tctx, u64 enq_flags, u64 now);

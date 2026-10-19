@@ -9,12 +9,27 @@ use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
+use crate::consts_BABY_CENSUS_NR;
+use crate::consts_BABY_DIST_NR;
+use crate::consts_BABY_WCLS_NR;
+use crate::consts_BABY_WDEPTH_NR;
+use crate::consts_BABY_WG_NR;
+use crate::consts_BABY_WTYPE_NR;
 use anyhow::Result;
 use scx_stats::prelude::*;
 use scx_stats_derive::Stats;
 use scx_stats_derive::stat_doc;
 use serde::Deserialize;
 use serde::Serialize;
+
+/// Instrument widths, taken from the BPF-side enum so the Rust side
+/// cannot drift from the arrays it reads.
+const DIST: usize = consts_BABY_DIST_NR as usize;
+const WDEPTH: usize = consts_BABY_WDEPTH_NR as usize;
+const WCLS: usize = consts_BABY_WCLS_NR as usize;
+const WTYPE: usize = consts_BABY_WTYPE_NR as usize;
+const WG: usize = consts_BABY_WG_NR as usize;
+const CENSUS: usize = consts_BABY_CENSUS_NR as usize;
 
 /// Element-wise subtraction for the fixed-width census vectors.
 fn vec_sub(a: &[u64], b: &[u64]) -> Vec<u64> {
@@ -47,7 +62,7 @@ pub struct Ranks {
 
 impl Ranks {
     /// Read the histogram out of a BPF-side array indexed by rank.
-    pub fn of(a: &[u64; 8]) -> Self {
+    pub fn of(a: &[u64; DIST]) -> Self {
         Ranks {
             r_self: a[0],
             r_sib: a[1],
@@ -111,7 +126,7 @@ pub struct WaitB {
 }
 
 impl WaitB {
-    pub fn of(a: &[u64; 4]) -> Self {
+    pub fn of(a: &[u64; WDEPTH]) -> Self {
         WaitB {
             b0: a[0],
             b1: a[1],
@@ -193,39 +208,44 @@ pub struct WaitCls {
 }
 
 impl WaitCls {
-    pub fn of(a_n: &[u64; 16], a_ns: &[u64; 16], a_max: &[u64; 16], a_slow: &[u64; 16]) -> Self {
-        let mut fg_slow = Vec::with_capacity(4);
-        let mut other_slow = Vec::with_capacity(4);
-        for b in 0..4 {
-            fg_slow.push(a_slow[2 * 4 + b] + a_slow[3 * 4 + b]);
-            other_slow.push(a_slow[b] + a_slow[4 + b]);
+    pub fn of(
+        a_n: &[u64; WDEPTH * WCLS],
+        a_ns: &[u64; WDEPTH * WCLS],
+        a_max: &[u64; WDEPTH * WCLS],
+        a_slow: &[u64; WDEPTH * WCLS],
+    ) -> Self {
+        let mut fg_slow = Vec::with_capacity(WDEPTH);
+        let mut other_slow = Vec::with_capacity(WDEPTH);
+        for b in 0..WDEPTH {
+            fg_slow.push(a_slow[2 * WDEPTH + b] + a_slow[3 * WDEPTH + b]);
+            other_slow.push(a_slow[b] + a_slow[WDEPTH + b]);
         }
         WaitCls {
-            fg_b0: a_n[2 * 4] + a_n[3 * 4],
-            fg_b1: a_n[2 * 4 + 1] + a_n[3 * 4 + 1],
-            fg_b2: a_n[2 * 4 + 2] + a_n[3 * 4 + 2],
-            fg_b3: a_n[2 * 4 + 3] + a_n[3 * 4 + 3],
-            fg_ns_b0: a_ns[2 * 4] + a_ns[3 * 4],
-            fg_ns_b1: a_ns[2 * 4 + 1] + a_ns[3 * 4 + 1],
-            fg_ns_b2: a_ns[2 * 4 + 2] + a_ns[3 * 4 + 2],
-            fg_ns_b3: a_ns[2 * 4 + 3] + a_ns[3 * 4 + 3],
-            fg_max_b0: a_max[2 * 4].max(a_max[3 * 4]),
-            fg_max_b1: a_max[2 * 4 + 1].max(a_max[3 * 4 + 1]),
-            fg_max_b2: a_max[2 * 4 + 2].max(a_max[3 * 4 + 2]),
-            fg_max_b3: a_max[2 * 4 + 3].max(a_max[3 * 4 + 3]),
+            fg_b0: a_n[2 * WDEPTH] + a_n[3 * WDEPTH],
+            fg_b1: a_n[2 * WDEPTH + 1] + a_n[3 * WDEPTH + 1],
+            fg_b2: a_n[2 * WDEPTH + 2] + a_n[3 * WDEPTH + 2],
+            fg_b3: a_n[2 * WDEPTH + 3] + a_n[3 * WDEPTH + 3],
+            fg_ns_b0: a_ns[2 * WDEPTH] + a_ns[3 * WDEPTH],
+            fg_ns_b1: a_ns[2 * WDEPTH + 1] + a_ns[3 * WDEPTH + 1],
+            fg_ns_b2: a_ns[2 * WDEPTH + 2] + a_ns[3 * WDEPTH + 2],
+            fg_ns_b3: a_ns[2 * WDEPTH + 3] + a_ns[3 * WDEPTH + 3],
+            fg_max_b0: a_max[2 * WDEPTH].max(a_max[3 * WDEPTH]),
+            fg_max_b1: a_max[2 * WDEPTH + 1].max(a_max[3 * WDEPTH + 1]),
+            fg_max_b2: a_max[2 * WDEPTH + 2].max(a_max[3 * WDEPTH + 2]),
+            fg_max_b3: a_max[2 * WDEPTH + 3].max(a_max[3 * WDEPTH + 3]),
             fg_slow,
-            other_b0: a_n[0] + a_n[4],
-            other_b1: a_n[1] + a_n[5],
-            other_b2: a_n[2] + a_n[6],
-            other_b3: a_n[3] + a_n[7],
-            other_ns_b0: a_ns[0] + a_ns[4],
-            other_ns_b1: a_ns[1] + a_ns[5],
-            other_ns_b2: a_ns[2] + a_ns[6],
-            other_ns_b3: a_ns[3] + a_ns[7],
-            other_max_b0: a_max[0].max(a_max[4]),
-            other_max_b1: a_max[1].max(a_max[5]),
-            other_max_b2: a_max[2].max(a_max[6]),
-            other_max_b3: a_max[3].max(a_max[7]),
+            other_b0: a_n[0] + a_n[WDEPTH],
+            other_b1: a_n[1] + a_n[WDEPTH + 1],
+            other_b2: a_n[2] + a_n[WDEPTH + 2],
+            other_b3: a_n[3] + a_n[WDEPTH + 3],
+            other_ns_b0: a_ns[0] + a_ns[WDEPTH],
+            other_ns_b1: a_ns[1] + a_ns[WDEPTH + 1],
+            other_ns_b2: a_ns[2] + a_ns[WDEPTH + 2],
+            other_ns_b3: a_ns[3] + a_ns[WDEPTH + 3],
+            other_max_b0: a_max[0].max(a_max[WDEPTH]),
+            other_max_b1: a_max[1].max(a_max[WDEPTH + 1]),
+            other_max_b2: a_max[2].max(a_max[WDEPTH + 2]),
+            other_max_b3: a_max[3].max(a_max[WDEPTH + 3]),
             other_slow,
         }
     }
@@ -246,10 +266,12 @@ impl WaitCls {
             fg_ns_b1: self.fg_ns_b1.saturating_sub(rhs.fg_ns_b1),
             fg_ns_b2: self.fg_ns_b2.saturating_sub(rhs.fg_ns_b2),
             fg_ns_b3: self.fg_ns_b3.saturating_sub(rhs.fg_ns_b3),
-            fg_max_b0: self.fg_max_b0.max(rhs.fg_max_b0),
-            fg_max_b1: self.fg_max_b1.max(rhs.fg_max_b1),
-            fg_max_b2: self.fg_max_b2.max(rhs.fg_max_b2),
-            fg_max_b3: self.fg_max_b3.max(rhs.fg_max_b3),
+            // The BPF maxima are reset after every snapshot, so the
+            // current snapshot's value is this interval's maximum.
+            fg_max_b0: self.fg_max_b0,
+            fg_max_b1: self.fg_max_b1,
+            fg_max_b2: self.fg_max_b2,
+            fg_max_b3: self.fg_max_b3,
             fg_slow: vsub(&self.fg_slow, &rhs.fg_slow),
             other_b0: self.other_b0.saturating_sub(rhs.other_b0),
             other_b1: self.other_b1.saturating_sub(rhs.other_b1),
@@ -259,10 +281,10 @@ impl WaitCls {
             other_ns_b1: self.other_ns_b1.saturating_sub(rhs.other_ns_b1),
             other_ns_b2: self.other_ns_b2.saturating_sub(rhs.other_ns_b2),
             other_ns_b3: self.other_ns_b3.saturating_sub(rhs.other_ns_b3),
-            other_max_b0: self.other_max_b0.max(rhs.other_max_b0),
-            other_max_b1: self.other_max_b1.max(rhs.other_max_b1),
-            other_max_b2: self.other_max_b2.max(rhs.other_max_b2),
-            other_max_b3: self.other_max_b3.max(rhs.other_max_b3),
+            other_max_b0: self.other_max_b0,
+            other_max_b1: self.other_max_b1,
+            other_max_b2: self.other_max_b2,
+            other_max_b3: self.other_max_b3,
             other_slow: vsub(&self.other_slow, &rhs.other_slow),
         }
     }
@@ -333,26 +355,31 @@ pub struct WaitType {
 }
 
 impl WaitType {
-    pub fn of(a_n: &[u64; 8], a_ns: &[u64; 8], a_max: &[u64; 8], a_slow: &[u64; 8]) -> Self {
-        let mut wk_slow = Vec::with_capacity(4);
-        let mut rot_slow = Vec::with_capacity(4);
-        for b in 0..4 {
-            wk_slow.push(a_slow[4 + b]);
+    pub fn of(
+        a_n: &[u64; WDEPTH * WTYPE],
+        a_ns: &[u64; WDEPTH * WTYPE],
+        a_max: &[u64; WDEPTH * WTYPE],
+        a_slow: &[u64; WDEPTH * WTYPE],
+    ) -> Self {
+        let mut wk_slow = Vec::with_capacity(WDEPTH);
+        let mut rot_slow = Vec::with_capacity(WDEPTH);
+        for b in 0..WDEPTH {
+            wk_slow.push(a_slow[WDEPTH + b]);
             rot_slow.push(a_slow[b]);
         }
         WaitType {
-            wk_b0: a_n[4],
-            wk_b1: a_n[5],
-            wk_b2: a_n[6],
-            wk_b3: a_n[7],
-            wk_ns_b0: a_ns[4],
-            wk_ns_b1: a_ns[5],
-            wk_ns_b2: a_ns[6],
-            wk_ns_b3: a_ns[7],
-            wk_max_b0: a_max[4],
-            wk_max_b1: a_max[5],
-            wk_max_b2: a_max[6],
-            wk_max_b3: a_max[7],
+            wk_b0: a_n[WDEPTH],
+            wk_b1: a_n[WDEPTH + 1],
+            wk_b2: a_n[WDEPTH + 2],
+            wk_b3: a_n[WDEPTH + 3],
+            wk_ns_b0: a_ns[WDEPTH],
+            wk_ns_b1: a_ns[WDEPTH + 1],
+            wk_ns_b2: a_ns[WDEPTH + 2],
+            wk_ns_b3: a_ns[WDEPTH + 3],
+            wk_max_b0: a_max[WDEPTH],
+            wk_max_b1: a_max[WDEPTH + 1],
+            wk_max_b2: a_max[WDEPTH + 2],
+            wk_max_b3: a_max[WDEPTH + 3],
             wk_slow,
             rot_b0: a_n[0],
             rot_b1: a_n[1],
@@ -386,10 +413,10 @@ impl WaitType {
             wk_ns_b1: self.wk_ns_b1.saturating_sub(rhs.wk_ns_b1),
             wk_ns_b2: self.wk_ns_b2.saturating_sub(rhs.wk_ns_b2),
             wk_ns_b3: self.wk_ns_b3.saturating_sub(rhs.wk_ns_b3),
-            wk_max_b0: self.wk_max_b0.max(rhs.wk_max_b0),
-            wk_max_b1: self.wk_max_b1.max(rhs.wk_max_b1),
-            wk_max_b2: self.wk_max_b2.max(rhs.wk_max_b2),
-            wk_max_b3: self.wk_max_b3.max(rhs.wk_max_b3),
+            wk_max_b0: self.wk_max_b0,
+            wk_max_b1: self.wk_max_b1,
+            wk_max_b2: self.wk_max_b2,
+            wk_max_b3: self.wk_max_b3,
             wk_slow: vsub(&self.wk_slow, &rhs.wk_slow),
             rot_b0: self.rot_b0.saturating_sub(rhs.rot_b0),
             rot_b1: self.rot_b1.saturating_sub(rhs.rot_b1),
@@ -399,10 +426,10 @@ impl WaitType {
             rot_ns_b1: self.rot_ns_b1.saturating_sub(rhs.rot_ns_b1),
             rot_ns_b2: self.rot_ns_b2.saturating_sub(rhs.rot_ns_b2),
             rot_ns_b3: self.rot_ns_b3.saturating_sub(rhs.rot_ns_b3),
-            rot_max_b0: self.rot_max_b0.max(rhs.rot_max_b0),
-            rot_max_b1: self.rot_max_b1.max(rhs.rot_max_b1),
-            rot_max_b2: self.rot_max_b2.max(rhs.rot_max_b2),
-            rot_max_b3: self.rot_max_b3.max(rhs.rot_max_b3),
+            rot_max_b0: self.rot_max_b0,
+            rot_max_b1: self.rot_max_b1,
+            rot_max_b2: self.rot_max_b2,
+            rot_max_b3: self.rot_max_b3,
             rot_slow: vsub(&self.rot_slow, &rhs.rot_slow),
         }
     }
@@ -436,11 +463,16 @@ pub struct WaitLCRI {
 }
 
 impl WaitLCRI {
-    pub fn of(a_n: &[u64; 8], a_ns: &[u64; 8], a_max: &[u64; 8], a_slow: &[u64; 8]) -> Self {
-        let (other_n, lat_n) = a_n.split_at(4);
-        let (other_ns, lat_ns) = a_ns.split_at(4);
-        let (other_max, lat_max) = a_max.split_at(4);
-        let (other_slow, lat_slow) = a_slow.split_at(4);
+    pub fn of(
+        a_n: &[u64; WDEPTH * 2],
+        a_ns: &[u64; WDEPTH * 2],
+        a_max: &[u64; WDEPTH * 2],
+        a_slow: &[u64; WDEPTH * 2],
+    ) -> Self {
+        let (other_n, lat_n) = a_n.split_at(WDEPTH);
+        let (other_ns, lat_ns) = a_ns.split_at(WDEPTH);
+        let (other_max, lat_max) = a_max.split_at(WDEPTH);
+        let (other_slow, lat_slow) = a_slow.split_at(WDEPTH);
         WaitLCRI {
             lat_n: lat_n.to_vec(),
             lat_ns: lat_ns.to_vec(),
@@ -460,17 +492,14 @@ impl WaitLCRI {
                 .map(|(x, y)| x.saturating_sub(*y))
                 .collect()
         };
-        let vmax = |a: &Vec<u64>, b: &Vec<u64>| -> Vec<u64> {
-            a.iter().zip(b.iter()).map(|(x, y)| (*x).max(*y)).collect()
-        };
         WaitLCRI {
             lat_n: vsub(&self.lat_n, &rhs.lat_n),
             lat_ns: vsub(&self.lat_ns, &rhs.lat_ns),
-            lat_max: vmax(&self.lat_max, &rhs.lat_max),
+            lat_max: self.lat_max.clone(),
             lat_slow: vsub(&self.lat_slow, &rhs.lat_slow),
             other_n: vsub(&self.other_n, &rhs.other_n),
             other_ns: vsub(&self.other_ns, &rhs.other_ns),
-            other_max: vmax(&self.other_max, &rhs.other_max),
+            other_max: self.other_max.clone(),
             other_slow: vsub(&self.other_slow, &rhs.other_slow),
         }
     }
@@ -499,7 +528,12 @@ pub struct WaitGateMiss {
 }
 
 impl WaitGateMiss {
-    pub fn of(a_n: &[u64; 40], a_ns: &[u64; 40], a_max: &[u64; 40], a_slow: &[u64; 40]) -> Self {
+    pub fn of(
+        a_n: &[u64; WDEPTH * WG],
+        a_ns: &[u64; WDEPTH * WG],
+        a_max: &[u64; WDEPTH * WG],
+        a_slow: &[u64; WDEPTH * WG],
+    ) -> Self {
         WaitGateMiss {
             n: a_n.to_vec(),
             ns: a_ns.to_vec(),
@@ -515,21 +549,18 @@ impl WaitGateMiss {
                 .map(|(x, y)| x.saturating_sub(*y))
                 .collect()
         };
-        let vmax = |a: &Vec<u64>, b: &Vec<u64>| -> Vec<u64> {
-            a.iter().zip(b.iter()).map(|(x, y)| (*x).max(*y)).collect()
-        };
         WaitGateMiss {
             n: vsub(&self.n, &rhs.n),
             ns: vsub(&self.ns, &rhs.ns),
-            max: vmax(&self.max, &rhs.max),
+            max: self.max.clone(),
             slow: vsub(&self.slow, &rhs.slow),
         }
     }
 
     /// Per-depth row views into the flat depth-major arrays.
     fn row(&self, depth: usize) -> (&[u64], &[u64], &[u64], &[u64]) {
-        let lo = depth * 10;
-        let hi = lo + 10;
+        let lo = depth * WG;
+        let hi = lo + WG;
         (
             &self.n[lo..hi],
             &self.ns[lo..hi],
@@ -554,7 +585,7 @@ pub struct Census {
 }
 
 impl Census {
-    pub fn of(seat: &[u64; 8], shared: &[u64; 8]) -> Self {
+    pub fn of(seat: &[u64; CENSUS], shared: &[u64; CENSUS]) -> Self {
         Census {
             seat: seat.to_vec(),
             shared: shared.to_vec(),
@@ -584,14 +615,14 @@ impl Census {
             }
         };
         write!(w, "seat[")?;
-        for i in 0..8 {
+        for i in 0..CENSUS {
             if i > 0 {
                 write!(w, " ")?;
             }
             write!(w, "{}", pct(&self.seat, i))?;
         }
         write!(w, "] shared[")?;
-        for i in 0..8 {
+        for i in 0..CENSUS {
             if i > 0 {
                 write!(w, " ")?;
             }
@@ -608,9 +639,11 @@ impl Census {
 pub struct Metrics {
     #[stat(desc = "Number of running tasks")]
     pub nr_running: u64,
+    #[stat(desc = "1 when the scheduler was started with --stats")]
+    pub stats_enabled: u64,
     #[stat(desc = "Number of direct dispatches to an idle CPU")]
     pub nr_direct_dispatches: u64,
-    #[stat(desc = "Number of preemption kicks sent to a CPU")]
+    #[stat(desc = "Wake-path preemptions admitted by ops.enqueue()")]
     pub nr_preemptions: u64,
     #[stat(desc = "Number of interactive priority boosts granted")]
     pub nr_boosts: u64,
@@ -626,13 +659,13 @@ pub struct Metrics {
     pub nr_tick_preempts: u64,
     #[stat(desc = "Victims cut short at ops.tick for a warm-seat waiter")]
     pub nr_tick_preempts_warm: u64,
-    #[stat(desc = "Lat-cri waiters served past a non-lat-cri node-queue head")]
+    #[stat(desc = "Fast-lane node-queue pulls while bulk work waited")]
     pub nr_depth1_pulls: u64,
-    #[stat(desc = "Lat-cri waiters served past a non-lat-cri warm-seat head")]
+    #[stat(desc = "Fast-lane warm-seat pulls while bulk work waited")]
     pub nr_depth1_pulls_seat: u64,
     #[stat(desc = "Lat-cri wakees preempting a running non-lat-cri victim at wake")]
     pub nr_wake_preempts: u64,
-    #[stat(desc = "Landings by distance at the point of truth (dispatch)")]
+    #[stat(desc = "Direct dispatches to an idle CPU, by distance")]
     pub nr_land: Ranks,
     #[stat(desc = "ops.select_cpu() idle picks by distance")]
     pub nr_wake_land: Ranks,
@@ -640,7 +673,7 @@ pub struct Metrics {
     pub nr_seat_self: u64,
     #[stat(desc = "Warm seats rebalanced to another CPU, by distance")]
     pub nr_seat_move: Ranks,
-    #[stat(desc = "Shared-queue pulls by distance")]
+    #[stat(desc = "Bulk shared-queue pulls, by distance")]
     pub nr_pull_land: Ranks,
     #[stat(desc = "Waiting arrivals parked in a warm seat")]
     pub nr_arr_seat: u64,
@@ -676,6 +709,12 @@ pub struct Metrics {
 
 impl Metrics {
     fn format<W: Write>(&self, w: &mut W) -> Result<()> {
+        if self.stats_enabled == 0 {
+            writeln!(
+                w,
+                "  stats instrument off: this scheduler instance was started without --stats"
+            )?;
+        }
         writeln!(
             w,
             "[{}] tasks -> r: {:>2} | dispatch -> d: {:<5} s: {:<5} | preempt: {:<5} tick: {:<4}+{:<4} | d1pull: {:<4}+{:<4} | wkpre: {:<5} | boost: {:<4} | sticky: {:<5} | warm: {:<5} | cold: {:<5}",
@@ -718,13 +757,14 @@ impl Metrics {
                 "-".into()
             }
         };
-        // The BPF maxima are all-time high-water marks: report one
-        // only for an interval that actually had waits.
+        // The BPF maxima are reset after every snapshot, so a value is
+        // this interval's maximum; suppress it when the interval had no
+        // waits.
         let smax = |m: u64, n: u64| -> String { if n > 0 { m.to_string() } else { "-".into() } };
         let (wn, wns, wmax, wsl) = (&self.wait_n, &self.wait_ns, &self.wait_max, &self.wait_slow);
         writeln!(
             w,
-            "  wait n[{} {} {} {}] mean[{} {} {} {}] max[{} {} {} {}] slow5ms[{} {} {} {}] arr(seat {} shared {})",
+            "  wait n[{} {} {} {}] mean_us[{} {} {} {}] max_ns[{} {} {} {}] slow5ms[{} {} {} {}] arr(seat {} shared {})",
             wn.b0,
             wn.b1,
             wn.b2,
@@ -754,7 +794,7 @@ impl Metrics {
         };
         writeln!(
             w,
-            "  waitfg n[{} {} {} {}] mean[{} {} {} {}] max[{} {} {} {}] slow5ms[{} {} {} {}]",
+            "  waitfg n[{} {} {} {}] mean_us[{} {} {} {}] max_ns[{} {} {} {}] slow5ms[{} {} {} {}]",
             wc.fg_b0,
             wc.fg_b1,
             wc.fg_b2,
@@ -774,7 +814,7 @@ impl Metrics {
         )?;
         writeln!(
             w,
-            "  waitot n[{} {} {} {}] mean[{} {} {} {}] max[{} {} {} {}] slow5ms[{} {} {} {}]",
+            "  waitot n[{} {} {} {}] mean_us[{} {} {} {}] max_ns[{} {} {} {}] slow5ms[{} {} {} {}]",
             wc.other_b0,
             wc.other_b1,
             wc.other_b2,
@@ -795,7 +835,7 @@ impl Metrics {
         let wt = &self.wait_type;
         writeln!(
             w,
-            "  waitwk n[{} {} {} {}] mean[{} {} {} {}] max[{} {} {} {}] slow5ms[{} {} {} {}] arr(seat {} shared {})",
+            "  waitwk n[{} {} {} {}] mean_us[{} {} {} {}] max_ns[{} {} {} {}] slow5ms[{} {} {} {}] arr(seat {} shared {})",
             wt.wk_b0,
             wt.wk_b1,
             wt.wk_b2,
@@ -817,7 +857,7 @@ impl Metrics {
         )?;
         writeln!(
             w,
-            "  waitrot n[{} {} {} {}] mean[{} {} {} {}] max[{} {} {} {}] slow5ms[{} {} {} {}] arr(seat {} shared {})",
+            "  waitrot n[{} {} {} {}] mean_us[{} {} {} {}] max_ns[{} {} {} {}] slow5ms[{} {} {} {}] arr(seat {} shared {})",
             wt.rot_b0,
             wt.rot_b1,
             wt.rot_b2,
@@ -864,7 +904,7 @@ impl Metrics {
         };
         writeln!(
             w,
-            "  wlcri lat n[{:?}] mean[{:?}] max[{:?}] slow5ms[{:?}]",
+            "  wlcri lat n[{:?}] mean_us[{:?}] max_ns[{:?}] slow5ms[{:?}]",
             wl.lat_n,
             vmean(&wl.lat_ns, &wl.lat_n),
             vmaxs(&wl.lat_max, &wl.lat_n),
@@ -872,18 +912,23 @@ impl Metrics {
         )?;
         writeln!(
             w,
-            "  wlcri other n[{:?}] mean[{:?}] max[{:?}] slow5ms[{:?}]",
+            "  wlcri other n[{:?}] mean_us[{:?}] max_ns[{:?}] slow5ms[{:?}]",
             wl.other_n,
             vmean(&wl.other_ns, &wl.other_n),
             vmaxs(&wl.other_max, &wl.other_n),
             wl.other_slow,
         )?;
         let wg = &self.wait_wg;
-        for (depth, tag) in [(0usize, "d0"), (1usize, "d1")] {
+        for (depth, tag) in [
+            (0usize, "d0"),
+            (1usize, "d1"),
+            (2usize, "d2"),
+            (3usize, "d3"),
+        ] {
             let (n, ns, max, slow) = wg.row(depth);
             writeln!(
                 w,
-                "  wg {} n[{:?}] mean[{:?}] max[{:?}] slow5ms[{:?}]",
+                "  wg {} n[{:?}] mean_us[{:?}] max_ns[{:?}] slow5ms[{:?}]",
                 tag,
                 n,
                 vmean(ns, n),
@@ -899,6 +944,7 @@ impl Metrics {
     fn delta(&self, rhs: &Self) -> Self {
         Self {
             nr_running: self.nr_running,
+            stats_enabled: self.stats_enabled,
             nr_direct_dispatches: self
                 .nr_direct_dispatches
                 .saturating_sub(rhs.nr_direct_dispatches),
@@ -926,12 +972,7 @@ impl Metrics {
             nr_arr_shared: self.nr_arr_shared.saturating_sub(rhs.nr_arr_shared),
             wait_n: self.wait_n.sub(&rhs.wait_n),
             wait_ns: self.wait_ns.sub(&rhs.wait_ns),
-            wait_max: WaitB {
-                b0: self.wait_max.b0.max(rhs.wait_max.b0),
-                b1: self.wait_max.b1.max(rhs.wait_max.b1),
-                b2: self.wait_max.b2.max(rhs.wait_max.b2),
-                b3: self.wait_max.b3.max(rhs.wait_max.b3),
-            },
+            wait_max: self.wait_max,
             wait_slow: self.wait_slow.sub(&rhs.wait_slow),
             wait_cls: self.wait_cls.sub(&rhs.wait_cls),
             wait_type: self.wait_type.sub(&rhs.wait_type),
@@ -976,4 +1017,36 @@ pub fn monitor(intv: Duration, shutdown: Arc<AtomicBool>) -> Result<()> {
         || shutdown.load(Ordering::Relaxed),
         |metrics| metrics.format(&mut std::io::stdout()),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn interval_max_is_the_current_snapshot() {
+        // The BPF maxima are reset after every snapshot, so the delta
+        // must report the current value, not the larger of the two.
+        let cur = Metrics {
+            wait_n: WaitB {
+                b0: 1,
+                ..Default::default()
+            },
+            wait_max: WaitB {
+                b0: 42,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let prev = Metrics {
+            wait_max: WaitB {
+                b0: 999,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let delta = cur.delta(&prev);
+        assert_eq!(delta.wait_n.b0, 1);
+        assert_eq!(delta.wait_max.b0, 42);
+    }
 }

@@ -59,15 +59,6 @@ task_deadline_offset(const struct task_struct *p, const struct task_ctx *tctx)
 }
 
 /*
- * Return the offset relative to the base deadline, for the yield push.
- */
-__hidden s64 task_prio_factor(const struct task_struct *p,
-		     const struct task_ctx *tctx)
-{
-	return (s64)task_deadline_offset(p, tctx) - (s64)deadline_ns;
-}
-
-/*
  * Return a fresh deadline for the task.
  */
 __hidden u64
