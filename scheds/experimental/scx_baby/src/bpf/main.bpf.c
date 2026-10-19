@@ -81,6 +81,17 @@ bool cpu_is_lat[BABY_MAX_CPUS];
 static u64 node_preempt_at;
 
 /*
+ * Per-queue service clocks for the starve rescue, indexed by lane
+ * (0 bulk, 1 fast lane). A queue that has held work for a second
+ * without a successful pull is re-enqueued. The clock is seeded when
+ * the queue becomes non-empty and advanced on every successful pull,
+ * so a continuously served queue never looks starved and a newly
+ * populated one does not inherit the clock of the queue's birth.
+ */
+u64 seat_service_at[2][BABY_MAX_CPUS];
+u64 node_service_at[2][BABY_NODE_CLOCK_NR];
+
+/*
  * Maximum consecutive fast-lane dispatches a CPU may serve while its
  * bulk queue holds waiting work. When fl_streak reaches the quota, the
  * next dispatch serves bulk and resets the streak, so bulk keeps at
@@ -518,12 +529,21 @@ void BPF_STRUCT_OPS(baby_enqueue, struct task_struct *p, u64 enq_flags)
 	{
 		s32 node = __COMPAT_scx_bpf_cpu_node(prev_cpu);
 		bool lat = is_lat_cri(tctx);
+		u64 dsq = lat ? fl_node2dsq(node) : (u64)node;
+
+		/*
+		 * Seed the rescue clock when the lane's shared queue was
+		 * empty; a queue that is already served does not need it.
+		 */
+		if (!scx_bpf_dsq_nr_queued(dsq))
+			node_service_at[lat & 1][node &
+						 (BABY_NODE_CLOCK_NR - 1)] = now;
 
 		slice = backlog_deep(backlog) && !tctx->tick_preempted
 			? 4 * deadline_ns : task_slice(tctx);
 
-		scx_bpf_dsq_insert_vtime(p, lat ? fl_node2dsq(node) : (u64)node,
-					 slice, tctx->deadline, enq_flags);
+		scx_bpf_dsq_insert_vtime(p, dsq, slice, tctx->deadline,
+					 enq_flags);
 	}
 	stamp_wait(tctx, now, backlog, true);
 
@@ -554,6 +574,7 @@ void BPF_STRUCT_OPS(baby_dispatch, s32 cpu, struct task_struct *prev)
 	u64 bulk_seat_dsq = cpu2dsq(cpu);
 	struct task_struct *fl_wq, *fl_q, *wq, *q;
 	u64 fl_wq_dl, fl_g_dl, wq_dl, g_dl, fl_dl, bulk_dl, best_dl;
+	u64 now = bpf_ktime_get_ns();
 	bool has_fl, has_bulk, serve_fl;
 
 	census_sample(cpu);
@@ -561,12 +582,14 @@ void BPF_STRUCT_OPS(baby_dispatch, s32 cpu, struct task_struct *prev)
 	/*
 	 * One peek of each lane per dispatch: the sticky check and the
 	 * arbitration read the same heads, and the peeked pointers stay
-	 * valid until the pulls enter their own RCU scope.
+	 * valid until the pulls enter their own RCU scope. The shared
+	 * heads are filtered by this CPU's affinity: a head it cannot
+	 * pull must not read as the lane's next deadline here.
 	 */
 	fl_wq = __COMPAT_scx_bpf_dsq_peek(fl_seat_dsq);
-	fl_q = __COMPAT_scx_bpf_dsq_peek(fl_node_dsq);
+	fl_q = dsq_peek_allowed(fl_node_dsq, cpu);
 	wq = __COMPAT_scx_bpf_dsq_peek(bulk_seat_dsq);
-	q = __COMPAT_scx_bpf_dsq_peek(node);
+	q = dsq_peek_allowed(node, cpu);
 
 	fl_wq_dl = fl_wq ? fl_wq->scx.dsq_vtime : ULLONG_MAX;
 	fl_g_dl = fl_q ? fl_q->scx.dsq_vtime : ULLONG_MAX;
@@ -631,6 +654,8 @@ void BPF_STRUCT_OPS(baby_dispatch, s32 cpu, struct task_struct *prev)
 
 			if (scx_bpf_dsq_move_to_local(fl_node_dsq, 0)) {
 				node_preempt_at = 0;
+				node_service_at[1][node &
+						  (BABY_NODE_CLOCK_NR - 1)] = now;
 				if (has_bulk) {
 					fl_streak[idx]++;
 					if (stats_enabled)
@@ -646,6 +671,7 @@ void BPF_STRUCT_OPS(baby_dispatch, s32 cpu, struct task_struct *prev)
 			}
 		}
 		if (scx_bpf_dsq_move_to_local(fl_seat_dsq, 0)) {
+			seat_service_at[1][idx] = now;
 			if (has_bulk) {
 				fl_streak[idx]++;
 				if (stats_enabled)
@@ -656,6 +682,7 @@ void BPF_STRUCT_OPS(baby_dispatch, s32 cpu, struct task_struct *prev)
 		}
 		if (scx_bpf_dsq_move_to_local(fl_node_dsq, 0)) {
 			node_preempt_at = 0;
+			node_service_at[1][node & (BABY_NODE_CLOCK_NR - 1)] = now;
 			if (has_bulk) {
 				fl_streak[idx]++;
 				if (stats_enabled)
@@ -682,6 +709,7 @@ void BPF_STRUCT_OPS(baby_dispatch, s32 cpu, struct task_struct *prev)
 
 		if (scx_bpf_dsq_move_to_local(node, 0)) {
 			fl_streak[idx] = 0;
+			node_service_at[0][node & (BABY_NODE_CLOCK_NR - 1)] = now;
 			/*
 			 * The waiter this claim was made for is served, or
 			 * another head took its place; either way the next
@@ -697,15 +725,18 @@ void BPF_STRUCT_OPS(baby_dispatch, s32 cpu, struct task_struct *prev)
 		}
 		if (scx_bpf_dsq_move_to_local(bulk_seat_dsq, 0)) {
 			fl_streak[idx] = 0;
+			seat_service_at[0][idx] = now;
 			return;
 		}
 	} else {
 		if (scx_bpf_dsq_move_to_local(bulk_seat_dsq, 0)) {
 			fl_streak[idx] = 0;
+			seat_service_at[0][idx] = now;
 			return;
 		}
 		if (scx_bpf_dsq_move_to_local(node, 0)) {
 			fl_streak[idx] = 0;
+			node_service_at[0][node & (BABY_NODE_CLOCK_NR - 1)] = now;
 			node_preempt_at = 0;
 			return;
 		}
@@ -717,9 +748,15 @@ void BPF_STRUCT_OPS(baby_dispatch, s32 cpu, struct task_struct *prev)
 	 * by the quota, drain the fast lane rather than idling the CPU.
 	 */
 	if (has_fl && !serve_fl) {
-		if (scx_bpf_dsq_move_to_local(fl_seat_dsq, 0) ||
-		    scx_bpf_dsq_move_to_local(fl_node_dsq, 0))
+		if (scx_bpf_dsq_move_to_local(fl_seat_dsq, 0)) {
+			seat_service_at[1][idx] = now;
 			return;
+		}
+		if (scx_bpf_dsq_move_to_local(fl_node_dsq, 0)) {
+			node_service_at[1][node &
+					  (BABY_NODE_CLOCK_NR - 1)] = now;
+			return;
+		}
 	}
 
 	if (need_running) {
@@ -811,15 +848,27 @@ void BPF_STRUCT_OPS(baby_tick, struct task_struct *p)
 			if (scx_bpf_dsq_nr_queued(fl_cpu2dsq(cpu))) {
 				cri = true;
 				warm = true;
-			} else if (scx_bpf_dsq_nr_queued(
-					   fl_node2dsq(node))) {
-				u64 last = node_preempt_at;
+			} else {
+				/*
+				 * Only a head this CPU can pull justifies
+				 * cutting its resident: a pinned waiter
+				 * would otherwise have every CPU on the
+				 * node preempt for work none of them can
+				 * serve.
+				 */
+				struct task_struct *head =
+					dsq_peek_allowed(fl_node2dsq(node), cpu);
 
-				if (now - last >=
-				    BABY_TICK_PREEMPT_FALLBACK_NS &&
-				    __sync_bool_compare_and_swap(
-					    &node_preempt_at, last, now))
-					cri = true;
+				if (head) {
+					u64 last = node_preempt_at;
+
+					if (now - last >=
+					    BABY_TICK_PREEMPT_FALLBACK_NS &&
+					    __sync_bool_compare_and_swap(
+						    &node_preempt_at, last,
+						    now))
+						cri = true;
+				}
 			}
 
 			if (cri) {
@@ -961,10 +1010,12 @@ void BPF_STRUCT_OPS(baby_running, struct task_struct *p)
 
 /*
  * sched_yield(): give up the CPU for the rest of this round, like the
- * original YIELD_MARK. With nothing queued there is nothing to yield to.
- * The kernel leaves the slice alone when ops.yield is defined, so zero
- * it here; only then does the task re-enter through enqueue, where the
- * mark is consumed.
+ * original YIELD_MARK. With nothing this CPU can run there is nothing
+ * to yield to: a queued head its affinity excludes is not a successor,
+ * and honouring the yield for it would cost the caller its slice and
+ * re-pick the caller. The kernel leaves the slice alone when ops.yield
+ * is defined, so zero it here; only then does the task re-enter
+ * through enqueue, where the mark is consumed.
  */
 bool BPF_STRUCT_OPS(baby_yield, struct task_struct *p)
 {
@@ -977,10 +1028,10 @@ bool BPF_STRUCT_OPS(baby_yield, struct task_struct *p)
 	cpu = scx_bpf_task_cpu(p);
 	node = __COMPAT_scx_bpf_cpu_node(cpu);
 
-	if (!scx_bpf_dsq_nr_queued(cpu2dsq(cpu)) &&
-	    !scx_bpf_dsq_nr_queued(fl_cpu2dsq(cpu)) &&
-	    !scx_bpf_dsq_nr_queued(node) &&
-	    !scx_bpf_dsq_nr_queued(fl_node2dsq(node)))
+	if (!dsq_peek_allowed(cpu2dsq(cpu), cpu) &&
+	    !dsq_peek_allowed(fl_cpu2dsq(cpu), cpu) &&
+	    !dsq_peek_allowed(node, cpu) &&
+	    !dsq_peek_allowed(fl_node2dsq(node), cpu))
 		return false;
 
 	tctx->yield_pending = true;
@@ -1006,12 +1057,12 @@ s32 BPF_STRUCT_OPS(baby_init_task, struct task_struct *p,
 }
 
 /*
- * A warm queue that no CPU can serve, behind an RT lease or with
- * affinity moved under it, strands its tasks where the rest of the
- * machine cannot see them. A head that has waited this long is overdue
- * by far more than a warm wait; re-enqueue the queue. The kernel
- * watchdog unloads the scheduler five seconds after a queued task stops
- * being consumable, so this fires well before that.
+ * A queue that no CPU can serve, behind an RT lease or with affinity
+ * moved under it, strands its tasks where the rest of the machine
+ * cannot see them. A queue that has held work this long without a
+ * successful pull is overdue by far more than a warm wait; re-enqueue
+ * it. The kernel watchdog unloads the scheduler five seconds after a
+ * queued task stops being consumable, so this fires well before that.
  */
 #define STARVE_RESCUE_NS	1000000000ull
 
@@ -1027,43 +1078,48 @@ struct {
 } rescue_timer SEC(".maps");
 
 /*
- * One queue's rescue: a head that has waited past the starve window is
- * re-enqueued. Both lanes get this per CPU; a stranded fast-lane seat
- * is as invisible to the rest of the machine as a stranded bulk one.
+ * One queue's rescue: a queue that has held work past the starve
+ * window without a successful pull is re-enqueued. The service clock
+ * is the queue's own, not the head task's arrival stamp: the seats and
+ * node queues are ordered by deadline, so a newly arrived sleeper
+ * with an older preserved deadline can sort ahead of a task that has
+ * waited longer, and a head-based check would mask the stranded task.
+ *
+ * The clock is seeded when the queue becomes non-empty and written on
+ * every successful pull, so a queue that is being served never looks
+ * starved. A zero clock means the queue was never populated through
+ * the seeded paths; wait for the first insertion rather than rescue a
+ * queue that has merely existed since boot.
  */
-static void rescue_one_dsq(u64 dsq, u64 now)
+static void rescue_one_dsq(u64 dsq, u64 last_service, u64 now)
 {
-	struct task_struct *head;
-	struct task_ctx *hctx;
-
-	if (!scx_bpf_dsq_nr_queued(dsq))
-		return;
-
-	head = __COMPAT_scx_bpf_dsq_peek(dsq);
-	if (!head)
-		return;
-
-	hctx = try_lookup_task_ctx(head);
-	/*
-	 * wait_stamp is the arrival clock at this queue: re-stamped at
-	 * every insertion and untouched while the task waits. last_acc_at
-	 * is reset by every requeue and cannot serve that purpose.
-	 */
-	if (hctx && hctx->wait_stamp &&
-	    now - hctx->wait_stamp > STARVE_RESCUE_NS)
+	if (__COMPAT_has_generic_reenq() && last_service &&
+	    now - last_service > STARVE_RESCUE_NS &&
+	    scx_bpf_dsq_nr_queued(dsq))
 		scx_bpf_dsq_reenq___compat(dsq, 0);
 }
 
 static int rescue_timerfn(void *map, int *key, struct bpf_timer *timer)
 {
 	u64 now = bpf_ktime_get_ns();
-	s32 cpu;
+	s32 node, cpu;
 	int err;
 
 	if (__COMPAT_has_generic_reenq()) {
 		bpf_for(cpu, 0, nr_cpu_ids) {
-			rescue_one_dsq(cpu2dsq(cpu), now);
-			rescue_one_dsq(fl_cpu2dsq(cpu), now);
+			u32 idx = (u32)cpu & (BABY_MAX_CPUS - 1);
+
+			rescue_one_dsq(cpu2dsq(cpu), seat_service_at[0][idx],
+				       now);
+			rescue_one_dsq(fl_cpu2dsq(cpu), seat_service_at[1][idx],
+				       now);
+		}
+		bpf_for(node, 0, nr_node_ids) {
+			u32 idx = (u32)node & (BABY_NODE_CLOCK_NR - 1);
+
+			rescue_one_dsq(node, node_service_at[0][idx], now);
+			rescue_one_dsq(fl_node2dsq(node),
+				       node_service_at[1][idx], now);
 		}
 	}
 

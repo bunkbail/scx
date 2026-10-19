@@ -136,6 +136,14 @@ __hidden bool balance_try_warm_seat(struct task_struct *p, struct task_ctx *tctx
 			}
 
 			dsq = lat ? fl_cpu2dsq(target) : cpu2dsq(target);
+			/*
+			 * Seed the rescue clock when the target seat was
+			 * empty; a seat that is being served needs none.
+			 */
+			if (!target_nr)
+				seat_service_at[lat ? 1 : 0]
+					       [(u32)target &
+						(BABY_MAX_CPUS - 1)] = now;
 			scx_bpf_dsq_insert_vtime(p, dsq, slice,
 						 tctx->deadline, 0);
 			stamp_wait(tctx, now, target_nr, false);

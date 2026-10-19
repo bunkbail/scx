@@ -25,12 +25,12 @@ __hidden s32 pick_idle_cpu(struct task_struct *p, s32 prev_cpu,
 			return scx_bpf_select_cpu_dfl(p, prev_cpu, wake_flags,
 						      is_idle);
 
-		return prev_cpu;
+		return any_allowed_cpu(p, prev_cpu);
 	}
 
 	cpu = scx_bpf_select_cpu_and(p, prev_cpu, wake_flags, p->cpus_ptr, 0);
 	if (cpu < 0)
-		return prev_cpu;
+		return any_allowed_cpu(p, prev_cpu);
 
 	*is_idle = true;
 
@@ -69,8 +69,21 @@ __hidden bool try_direct_dispatch(struct task_struct *p, struct task_ctx *tctx,
 			return false;
 		cpu = lp_guard_pick(p, tctx, cpu);
 	} else {
-		if (!scx_bpf_test_and_clear_cpu_idle(prev_cpu))
+		/*
+		 * A migration-disabled task can only use the CPU it is
+		 * on. A single-CPU task may have had its affinity moved
+		 * to another CPU since it last ran, so prev_cpu is not
+		 * necessarily its lane.
+		 */
+		s32 only = is_migration_disabled(p) ?
+				   prev_cpu :
+				   (s32)bpf_cpumask_first(p->cpus_ptr);
+
+		if ((u32)only >= nr_cpu_ids ||
+		    !bpf_cpumask_test_cpu(only, p->cpus_ptr) ||
+		    !scx_bpf_test_and_clear_cpu_idle(only))
 			return false;
+		cpu = only;
 	}
 
 	if (stats_enabled) {

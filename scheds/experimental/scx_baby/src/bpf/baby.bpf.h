@@ -131,6 +131,17 @@ _Static_assert(BABY_FL_NODE_DSQ_BASE + BABY_MAX_NODES <= BABY_CPU_DSQ_BASE,
 extern bool cpu_is_lat[BABY_MAX_CPUS];
 
 /*
+ * Per-queue service clocks for the starve rescue (see main.bpf.c). They
+ * are shared with the seat insertion path in balance.bpf.c. The node
+ * table is padded to a power of two so the node id can be masked, and
+ * the init-time bound check keeps every real node id inside it.
+ */
+#define BABY_NODE_CLOCK_NR	64
+
+extern u64 seat_service_at[2][BABY_MAX_CPUS];
+extern u64 node_service_at[2][BABY_NODE_CLOCK_NR];
+
+/*
  * Scheduling statistics. nr_running owns a cache line: it is a
  * control-plane input read on the hot paths, and the diagnostic
  * counters must not share its line (see stats.bpf.c).
@@ -442,11 +453,45 @@ static __always_inline bool is_queued(const struct task_struct *p)
 }
 
 /*
- * Return true if @p can only run on a single CPU, false otherwise.
+ * Return true if the task can only run on a single CPU, false otherwise.
  */
 static __always_inline bool is_pcpu_task(const struct task_struct *p)
 {
 	return p->nr_cpus_allowed == 1 || is_migration_disabled(p);
+}
+
+/*
+ * The CPU a task must fall back to when no idle CPU was found. A
+ * previous CPU outside the task's affinity mask is not a placement: a
+ * node queue keyed on it would be unreachable from every CPU that can
+ * run the task. Return an allowed CPU instead, preferring the previous
+ * one when it still is.
+ */
+static __always_inline s32 any_allowed_cpu(const struct task_struct *p,
+					   s32 prev_cpu)
+{
+	u32 cpu;
+
+	if (bpf_cpumask_test_cpu(prev_cpu, p->cpus_ptr))
+		return prev_cpu;
+
+	cpu = bpf_cpumask_any_distribute(p->cpus_ptr);
+	return cpu < nr_cpu_ids ? (s32)cpu : prev_cpu;
+}
+
+/*
+ * Peek a shared queue for @cpu and hide a head the CPU cannot run.
+ * An affinity-restricted head otherwise poisons the lane for every CPU
+ * that can reach it: dispatch treats it as the lane's next deadline,
+ * and the tick preempts bulk work for a waiter the CPU cannot pull.
+ */
+static __always_inline struct task_struct *dsq_peek_allowed(u64 dsq, s32 cpu)
+{
+	struct task_struct *p = __COMPAT_scx_bpf_dsq_peek(dsq);
+
+	if (!p || !bpf_cpumask_test_cpu(cpu, p->cpus_ptr))
+		return NULL;
+	return p;
 }
 
 /*
