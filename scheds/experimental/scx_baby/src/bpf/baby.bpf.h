@@ -68,6 +68,9 @@ static __always_inline u64 fl_node2dsq(s32 node)
 #define TIME_PERIOD		(200ULL * NSEC_PER_MSEC)
 #define TO_COMPLETE		(5ULL * NSEC_PER_MSEC)
 #define RESCHED_DELTA		(25ULL * NSEC_PER_MSEC)
+
+/* Wakes per 100ms that separate the wake-rate classes from the rest. */
+#define FOREGROUND_WAKE_FREQ	10
 #define MIN_NICE		(-20)
 #define MAX_NICE		19
 #define MAX_RT_PRIO		100
@@ -355,6 +358,72 @@ struct task_ctx {
 };
 
 /*
+ * The class predicates are pure functions of the task context and the
+ * rodata deadline, so they live in the header as inlines: clang can
+ * fold the combinations its callers test, and no cross-module call
+ * frame is emitted on paths that only ask one of them. The
+ * multi-branch helpers (can_resched, task_nice, update_bursts) stay in
+ * class.bpf.c; see the verifier notes there before moving them.
+ */
+/*
+ * A proven CPU consumer used more than a quarter of the window across
+ * its current and previous windows. Covering both keeps the status on
+ * a task that shares a contended core and rolls windows with a
+ * fraction of the core each. On a hybrid platform a proven consumer
+ * with no wake history pins a big core.
+ */
+static __always_inline bool is_heavy_proven(const struct task_ctx *tctx)
+{
+	return tctx->prev_bursts + tctx->bursts > TIME_PERIOD / 4;
+}
+
+/*
+ * A task is latency-critical when it wakes frequently enough to prove
+ * it, whatever its burst size: game render threads, compositors and
+ * submission workers wake per frame or per request, and under CPU
+ * overcommit a game thread is heavy_proven too, so no burst bound can
+ * gate this. There is no runtime floor: a task that wakes often but
+ * consumes almost nothing still has latency to protect. A task that
+ * never leaves runnable state (preempted, slice-expired) never re-runs
+ * the wake-rate EWMA, so a preempted batch victim cannot pass as a
+ * waker.
+ */
+static __always_inline bool is_lat_cri(const struct task_ctx *tctx)
+{
+	return tctx->wake_samples >= 4 &&
+	       tctx->peak_freq >= FOREGROUND_WAKE_FREQ;
+}
+
+/*
+ * A task is foreground when it wakes frequently and does real work: a
+ * browser renderer or an audio thread wakes dozens of times per window
+ * with sizable bursts, a CPU hog never wakes, and a UI blip barely
+ * uses the CPU. Foreground earns the fourfold slice, waker eligibility
+ * and precedence over the heavy pin in the compaction, so light
+ * workers that cross the heavy bar with their mutex spins keep the
+ * little-tier packing.
+ */
+static __always_inline bool is_foreground(const struct task_ctx *tctx)
+{
+	return tctx->wake_samples >= 4 &&
+	       tctx->peak_freq >= FOREGROUND_WAKE_FREQ &&
+	       tctx->prev_bursts + tctx->bursts > TIME_PERIOD / 20;
+}
+
+/*
+ * Foreground tasks get a longer slice: their requests are memory-bound,
+ * and interleaving them with hog slices on a busy core multiplies the
+ * wall time of each request. Every foreground task is also
+ * latency-critical (the wake-rate bars are the same; foreground only
+ * adds the runtime floor), so a latency-critical check above the
+ * foreground test would make the fourfold slice dead code.
+ */
+static __always_inline u64 task_slice(const struct task_ctx *tctx)
+{
+	return is_foreground(tctx) ? 4 * deadline_ns : deadline_ns;
+}
+
+/*
  * The node queue holds two or more waiting tasks: the task will rotate
  * behind them anyway, and every extra rotation costs a full switch, so
  * the callers grant four times the deadline as the slice.
@@ -419,10 +488,6 @@ __hidden void census_sample(s32 cpu);
 __hidden void update_bursts(struct task_ctx *tctx, u64 now);
 __hidden bool can_resched(const struct task_ctx *tctx);
 __hidden bool is_interactive(const struct task_ctx *tctx);
-__hidden bool is_heavy_proven(const struct task_ctx *tctx);
-__hidden bool is_foreground(const struct task_ctx *tctx);
-__hidden bool is_lat_cri(const struct task_ctx *tctx);
-__hidden u64 task_slice(const struct task_ctx *tctx);
 __hidden s64 task_prio_factor(const struct task_struct *p,
 		     const struct task_ctx *tctx);
 __hidden u64 calc_deadline(const struct task_struct *p, struct task_ctx *tctx,
