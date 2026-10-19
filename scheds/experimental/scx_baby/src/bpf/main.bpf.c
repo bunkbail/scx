@@ -103,6 +103,7 @@ static u64 node_preempt_claim[BABY_NODE_CLOCK_NR];
  */
 u64 seat_service_at[2][BABY_MAX_CPUS];
 u64 node_service_at[2][BABY_NODE_CLOCK_NR];
+u8 seat_used[2][BABY_MAX_CPUS];
 
 /*
  * Maximum consecutive fast-lane dispatches a CPU may serve while its
@@ -727,6 +728,9 @@ void BPF_STRUCT_OPS(baby_dispatch, s32 cpu, struct task_struct *prev)
 		}
 		if (scx_bpf_dsq_move_to_local(fl_seat_dsq, 0)) {
 			seat_service_at[1][idx] = now;
+			if (seat_used[1][idx] &&
+			    !scx_bpf_dsq_nr_queued(fl_seat_dsq))
+				seat_used[1][idx] = 0;
 			if (has_bulk) {
 				fl_streak[idx]++;
 				if (stats_enabled)
@@ -773,12 +777,18 @@ void BPF_STRUCT_OPS(baby_dispatch, s32 cpu, struct task_struct *prev)
 		if (scx_bpf_dsq_move_to_local(bulk_seat_dsq, 0)) {
 			fl_streak[idx] = 0;
 			seat_service_at[0][idx] = now;
+			if (seat_used[0][idx] &&
+			    !scx_bpf_dsq_nr_queued(bulk_seat_dsq))
+				seat_used[0][idx] = 0;
 			return;
 		}
 	} else {
 		if (scx_bpf_dsq_move_to_local(bulk_seat_dsq, 0)) {
 			fl_streak[idx] = 0;
 			seat_service_at[0][idx] = now;
+			if (seat_used[0][idx] &&
+			    !scx_bpf_dsq_nr_queued(bulk_seat_dsq))
+				seat_used[0][idx] = 0;
 			return;
 		}
 		if (scx_bpf_dsq_move_to_local(node, 0)) {
@@ -796,6 +806,9 @@ void BPF_STRUCT_OPS(baby_dispatch, s32 cpu, struct task_struct *prev)
 	if (has_fl && !serve_fl) {
 		if (scx_bpf_dsq_move_to_local(fl_seat_dsq, 0)) {
 			seat_service_at[1][idx] = now;
+			if (seat_used[1][idx] &&
+			    !scx_bpf_dsq_nr_queued(fl_seat_dsq))
+				seat_used[1][idx] = 0;
 			return;
 		}
 		if (scx_bpf_dsq_move_to_local(fl_node_dsq, 0)) {
@@ -1174,12 +1187,15 @@ struct {
  * the seeded paths; wait for the first insertion rather than rescue a
  * queue that has merely existed since boot.
  */
-static void rescue_one_dsq(u64 dsq, u64 last_service, u64 now)
+static bool rescue_one_dsq(u64 dsq, u64 last_service, u64 now)
 {
 	if (__COMPAT_has_generic_reenq() && last_service &&
 	    now - last_service > STARVE_RESCUE_NS &&
-	    scx_bpf_dsq_nr_queued(dsq))
+	    scx_bpf_dsq_nr_queued(dsq)) {
 		scx_bpf_dsq_reenq___compat(dsq, 0);
+		return true;
+	}
+	return false;
 }
 
 static int rescue_timerfn(void *map, int *key, struct bpf_timer *timer)
@@ -1192,10 +1208,12 @@ static int rescue_timerfn(void *map, int *key, struct bpf_timer *timer)
 		bpf_for(cpu, 0, nr_cpu_ids) {
 			u32 idx = (u32)cpu & (BABY_MAX_CPUS - 1);
 
-			rescue_one_dsq(cpu2dsq(cpu), seat_service_at[0][idx],
-				       now);
-			rescue_one_dsq(fl_cpu2dsq(cpu), seat_service_at[1][idx],
-				       now);
+			if (rescue_one_dsq(cpu2dsq(cpu),
+					   seat_service_at[0][idx], now))
+				seat_used[0][idx] = 0;
+			if (rescue_one_dsq(fl_cpu2dsq(cpu),
+					   seat_service_at[1][idx], now))
+				seat_used[1][idx] = 0;
 		}
 		bpf_for(node, 0, nr_node_ids) {
 			u32 idx = (u32)node & (BABY_NODE_CLOCK_NR - 1);

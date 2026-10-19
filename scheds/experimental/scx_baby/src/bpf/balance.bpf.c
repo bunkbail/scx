@@ -59,10 +59,19 @@ __hidden bool balance_try_warm_seat(struct task_struct *p, struct task_ctx *tctx
 		s32 best = target;
 
 		bpf_for(i, 0, nr_cpu_ids) {
-			u64 b_nr = scx_bpf_dsq_nr_queued(cpu2dsq(i));
-			u64 q_nr = scx_bpf_dsq_nr_queued(fl_cpu2dsq(i));
+			u32 ci = (u32)i & (BABY_MAX_CPUS - 1);
+			/*
+			 * Probe only seats the occupancy hint marks as
+			 * possibly non-empty. At saturation most seats
+			 * are empty, and the two queue-depth kfuncs per
+			 * CPU were the scan's cost.
+			 */
+			u64 b_nr = seat_used[0][ci] ?
+					   scx_bpf_dsq_nr_queued(cpu2dsq(i)) : 0;
+			u64 q_nr = seat_used[1][ci] ?
+					   scx_bpf_dsq_nr_queued(fl_cpu2dsq(i)) : 0;
 			u64 nr = lat ? q_nr : b_nr;
-			bool i_lat = cpu_is_lat[i & (BABY_MAX_CPUS - 1)];
+			bool i_lat = cpu_is_lat[ci];
 
 			b_warm += b_nr;
 			q_warm += q_nr;
@@ -141,14 +150,20 @@ __hidden bool balance_try_warm_seat(struct task_struct *p, struct task_ctx *tctx
 				4 * deadline_ns : task_slice(tctx);
 
 			dsq = lat ? fl_cpu2dsq(target) : cpu2dsq(target);
-			/*
+						/*
 			 * Seed the rescue clock when the target seat was
 			 * empty; a seat that is being served needs none.
+			 * Mark the seat for the scan's occupancy hint on
+			 * every insertion, idempotently.
 			 */
-			if (!target_nr)
-				seat_service_at[lat ? 1 : 0]
-					       [(u32)target &
-						(BABY_MAX_CPUS - 1)] = now;
+			{
+				u32 tidx = (u32)target & (BABY_MAX_CPUS - 1);
+				u32 lane = lat ? 1 : 0;
+
+				if (!target_nr)
+					seat_service_at[lane][tidx] = now;
+				seat_used[lane][tidx] = 1;
+			}
 			scx_bpf_dsq_insert_vtime(p, dsq, slice,
 						 tctx->deadline, 0);
 			stamp_wait(tctx, now, target_nr, false);

@@ -142,6 +142,15 @@ extern u64 seat_service_at[2][BABY_MAX_CPUS];
 extern u64 node_service_at[2][BABY_NODE_CLOCK_NR];
 
 /*
+ * Per-CPU warm-seat occupancy hints, indexed by lane (0 bulk, 1 fast).
+ * A seat is probed only while its hint is set, so an empty seat costs
+ * no queue-depth kfunc in the warm-seat scan. The hint is deliberately
+ * conservative: a racing pull can clear it while an insertion lands,
+ * which costs that arrival one missed probe, never a stranded task.
+ */
+extern u8 seat_used[2][BABY_MAX_CPUS];
+
+/*
  * Scheduling statistics. nr_running owns a cache line: it is a
  * control-plane input read on the hot paths, and the diagnostic
  * counters must not share its line (see stats.bpf.c).
