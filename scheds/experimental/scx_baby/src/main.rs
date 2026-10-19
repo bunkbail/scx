@@ -47,8 +47,64 @@ use scx_utils::try_set_rlimit_infinity;
 use scx_utils::uei_exited;
 use scx_utils::uei_report;
 use stats::Metrics;
+use tiers::CoreClasses;
 
 const SCHEDULER_NAME: &str = "scx_baby";
+
+/// Highest possible NUMA node id plus one, from sysfs. The topology's
+/// node map only holds nodes with online CPUs, while the BPF side
+/// creates a DSQ for every possible node id.
+fn possible_node_ids() -> Result<usize> {
+    let text = std::fs::read_to_string("/sys/devices/system/node/possible")
+        .context("reading /sys/devices/system/node/possible")?;
+    let mut max: Option<usize> = None;
+    for part in text.trim().split(',') {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        let end = part.rsplit('-').next().unwrap().trim();
+        let end: usize = end
+            .parse()
+            .with_context(|| format!("parsing NUMA node range {part:?}"))?;
+        max = Some(max.map_or(end, |m| m.max(end)));
+    }
+    max.map(|m| m + 1).context("empty possible NUMA node list")
+}
+
+/// Classify the cores from the topology and the sysfs capacity and
+/// frequency ladders. Pure over its inputs, so the tier counts can be
+/// written as rodata before load.
+fn classify_cores(topo: &Topology) -> (CoreClasses, tiers::TierSource) {
+    // The kernel's own per-CPU capacity, exported by hybrid and ARM
+    // parts.
+    let capacity = |id: usize| {
+        std::fs::read_to_string(format!("/sys/devices/system/cpu/cpu{id}/cpu_capacity"))
+            .ok()
+            .and_then(|s| s.trim().parse::<u32>().ok())
+    };
+    // The core types as scx_utils derived them from its capacity
+    // ladder; the input of the fallback branch.
+    let is_big_core_type = |id: usize| {
+        topo.all_cpus
+            .get(&id)
+            .map(|cpu| matches!(cpu.core_type, CoreType::Big { .. }))
+    };
+    // The hardware maximum frequency: the corroboration input that
+    // keeps a claimed core-type split from being a ranking artifact
+    // (see tiers::classify).
+    let max_freq = |id: usize| {
+        std::fs::read_to_string(format!(
+            "/sys/devices/system/cpu/cpu{id}/cpufreq/cpuinfo_max_freq"
+        ))
+        .ok()
+        .and_then(|s| s.trim().parse::<u32>().ok())
+        .filter(|freq| *freq > 0)
+    };
+
+    let ids: Vec<usize> = topo.all_cpus.keys().copied().collect();
+    tiers::classify(&ids, &capacity, &is_big_core_type, &max_freq)
+}
 
 #[derive(Debug, clap::Parser)]
 #[command(
@@ -160,17 +216,30 @@ impl<'a> Scheduler<'a> {
         // Initialize CPU topology.
         let topo = Topology::new().context("failed to read CPU topology")?;
 
-        // Node DSQs take the ids below BABY_FL_NODE_DSQ_BASE, the
-        // fast-lane node DSQs the ids from there to BABY_CPU_DSQ_BASE,
-        // and the warm seats the ids from that up; a node count past
-        // the fast-lane base would put both node id spaces on the same
-        // numbers. No real machine under the CPU cap reaches this, but
-        // the collision would be silent, so refuse it here.
+        // The BPF side iterates every possible node id, including
+        // memory-only nodes the topology does not list, so the bound is
+        // the kernel's possible-node range, not the online node count.
+        let nr_node_ids = possible_node_ids().context("failed to read possible NUMA nodes")?;
         ensure!(
-            topo.nodes.len() < consts_BABY_FL_NODE_DSQ_BASE as usize,
-            "too many NUMA nodes ({}) for the fast-lane node DSQ id base {}",
-            topo.nodes.len(),
-            consts_BABY_FL_NODE_DSQ_BASE
+            nr_node_ids <= consts_BABY_MAX_NODES as usize,
+            "too many NUMA node ids ({}) for the {} node DSQs the id layout holds",
+            nr_node_ids,
+            consts_BABY_MAX_NODES
+        );
+        ensure!(
+            *NR_CPU_IDS <= consts_BABY_MAX_CPUS as usize,
+            "scx_baby supports at most {} CPU IDs, this host has {}",
+            consts_BABY_MAX_CPUS,
+            *NR_CPU_IDS
+        );
+
+        // The tier split is pure over its sysfs inputs, so classify it
+        // before load: the counts are rodata the verifier reads, and
+        // only the cpumasks need the loaded program.
+        let (classes, tier_source) = classify_cores(&topo);
+        info!(
+            "core classes ({tier_source:?}): big={:?} little={:?} lp={:?}",
+            classes.big, classes.little, classes.lp
         );
 
         info!(
@@ -209,6 +278,13 @@ impl<'a> Scheduler<'a> {
         // starve-rescue timer reads them.
         rodata.stats_enabled = opts.stats.is_some();
 
+        // Topology counts are rodata: the verifier folds every bound
+        // check and prunes the hybrid arms when a tier is empty.
+        rodata.nr_cpu_ids = *NR_CPU_IDS as u64;
+        rodata.nr_node_ids = nr_node_ids as u64;
+        rodata.nr_big_cpus = classes.big.len() as u64;
+        rodata.nr_little_cpus = classes.little.len() as u64;
+
         // Publish the cache-topology distance tables. The BPF side
         // compares ids for equality, and 0 means "unfilled" there, so
         // every id is stored offset by one: an id of 0 becomes 1, and
@@ -216,13 +292,6 @@ impl<'a> Scheduler<'a> {
         // to a filled one. Entries are indexed by CPU id, so an
         // offline CPU leaves its entry unfilled instead of shifting
         // the table under the following CPUs.
-        if *NR_CPU_IDS > rodata.topo_node.len() {
-            anyhow::bail!(
-                "scx_baby supports at most {} CPUs, this host has {} CPU IDs",
-                rodata.topo_node.len(),
-                *NR_CPU_IDS
-            );
-        }
         for cpu in topo.all_cpus.values() {
             rodata.topo_node[cpu.id] = cpu.node_id as u32 + 1;
             rodata.topo_llc[cpu.id] = cpu.llc_id as u32 + 1;
@@ -255,7 +324,7 @@ impl<'a> Scheduler<'a> {
                 n => n.to_string(),
             }
         );
-        skel.maps.bss_data.as_mut().unwrap().cpuperf_lvl = opts.perf_lvl;
+        rodata.cpuperf_lvl = opts.perf_lvl;
 
         // Set scheduler flags.
         //
@@ -274,8 +343,8 @@ impl<'a> Scheduler<'a> {
         // Load the BPF program for validation.
         let mut skel = scx_ops_load!(skel, baby_ops, uei)?;
 
-        // Classify the cores and publish the big/little CPU sets.
-        Self::init_core_classes(&mut skel, &topo)?;
+        // Publish the tier masks; the counts went in as rodata above.
+        Self::publish_core_classes(&mut skel, &classes)?;
 
         // Attach the scheduler.
         let struct_ops = Some(scx_ops_attach!(skel, baby_ops)?);
@@ -288,61 +357,24 @@ impl<'a> Scheduler<'a> {
         })
     }
 
-    // Publish the core-type split for the BPF side. Placement is the
-    // deadline order; these sets only matter on a hybrid platform,
-    // where the BPF wake path packs light work onto the little tier
-    // and a proven consumer with no wake history pins a big core. On
-    // a platform without a usable tier split every CPU lands in one
-    // tier and the hybrid gates are statically false.
-    fn init_core_classes(skel: &mut BpfSkel<'_>, topo: &Topology) -> Result<()> {
-        // The kernel's own per-CPU capacity, exported by hybrid and
-        // ARM parts.
-        let capacity = |id: usize| {
-            std::fs::read_to_string(format!("/sys/devices/system/cpu/cpu{id}/cpu_capacity"))
-                .ok()
-                .and_then(|s| s.trim().parse::<u32>().ok())
-        };
-        // The core types as scx_utils derived them from its capacity
-        // ladder; the input of the fallback branch.
-        let is_big_core_type = |id: usize| {
-            topo.all_cpus
-                .get(&id)
-                .map(|cpu| matches!(cpu.core_type, CoreType::Big { .. }))
-        };
-        // The hardware maximum frequency: the corroboration input that
-        // keeps a claimed core-type split from being a ranking
-        // artifact (see tiers::classify).
-        let max_freq = |id: usize| {
-            std::fs::read_to_string(format!(
-                "/sys/devices/system/cpu/cpu{id}/cpufreq/cpuinfo_max_freq"
-            ))
-            .ok()
-            .and_then(|s| s.trim().parse::<u32>().ok())
-            .filter(|freq| *freq > 0)
-        };
-
-        let ids: Vec<usize> = topo.all_cpus.keys().copied().collect();
-        let (classes, source) = tiers::classify(&ids, &capacity, &is_big_core_type, &max_freq);
-        info!(
-            "core classes ({source:?}): big={:?} little={:?} lp={:?}",
-            classes.big, classes.little, classes.lp
-        );
-
-        for id in &ids {
-            if !classes.big.contains(id) && classes.lp.contains(id) {
-                continue;
-            }
-            Self::enable_core_class(skel, *id, classes.big.contains(id))?;
+    fn publish_core_classes(skel: &mut BpfSkel<'_>, classes: &CoreClasses) -> Result<()> {
+        for id in &classes.big {
+            Self::enable_core_class(skel, *id, core_tier_CORE_TIER_BIG)?;
         }
-
+        for id in &classes.little {
+            Self::enable_core_class(skel, *id, core_tier_CORE_TIER_LITTLE)?;
+        }
+        for id in &classes.lp {
+            Self::enable_core_class(skel, *id, core_tier_CORE_TIER_LP)?;
+        }
         Ok(())
     }
 
-    fn enable_core_class(skel: &mut BpfSkel<'_>, cpu: usize, big: bool) -> Result<()> {
+    fn enable_core_class(skel: &mut BpfSkel<'_>, cpu: usize, tier: u32) -> Result<()> {
         let prog = &mut skel.progs.enable_core_class;
         let mut args = core_arg {
             cpu_id: cpu as i32,
-            big: big as i32,
+            tier: tier as i32,
         };
         let input = ProgramInput {
             context_in: Some(unsafe {
@@ -372,11 +404,9 @@ impl<'a> Scheduler<'a> {
         Metrics {
             nr_running: bss_data.nr_running,
             nr_direct_dispatches: bss_data.nr_direct_dispatches,
-            nr_shared_dispatches: bss_data.nr_shared_dispatches,
             nr_preemptions: bss_data.nr_preemptions,
             nr_boosts: bss_data.nr_boosts,
             nr_sticky: bss_data.nr_sticky,
-            nr_warmseats: bss_data.nr_warmseats,
             nr_coldspreads: bss_data.nr_coldspreads,
             nr_tick_preempts: bss_data.nr_tick_preempts,
             nr_tick_preempts_warm: bss_data.nr_tick_preempts_warm,
@@ -388,8 +418,10 @@ impl<'a> Scheduler<'a> {
             nr_seat_self: bss_data.nr_seat_self,
             nr_seat_move: Ranks::of(&bss_data.nr_seat_move),
             nr_pull_land: Ranks::of(&bss_data.nr_pull_land),
-            nr_arr_seat: bss_data.nr_arr_seat,
-            nr_arr_shared: bss_data.nr_arr_shared,
+            // The per-type arrival array is the single source: a seat
+            // arrival is type * 2, a shared arrival type * 2 + 1.
+            nr_arr_seat: bss_data.nr_arr_type[0] + bss_data.nr_arr_type[2],
+            nr_arr_shared: bss_data.nr_arr_type[1] + bss_data.nr_arr_type[3],
             wait_n: WaitB::of(&bss_data.nr_wait_n),
             wait_ns: WaitB::of(&bss_data.nr_wait_ns),
             wait_max: WaitB::of(&bss_data.nr_wait_max),
@@ -551,13 +583,10 @@ mod tests {
     }
 
     // Load only, never attach: the synthetic shapes drive no live
-    // scheduler. The BPF loops stay bounded by the host's CPU count -
-    // what varies here is the rodata the distance tables feed, so this
-    // pins the loader against tier-table and distance regressions
-    // across shapes, not against loop width; a 128-CPU runner is
-    // needed for the latter. The hybrid-gate arms need no synthetic
-    // tier counts to verify: the BSS counters are unknown scalars to
-    // the verifier, so every load proves both sides of every gate.
+    // scheduler. The topology counts are rodata, so the BPF loops and
+    // bounds checks are verified against the synthetic width too, and
+    // both hybrid-gate arms are exercised by publishing a tier split
+    // for every shape.
     #[test]
     #[ignore = "requires BPF load capabilities and a sched_ext kernel"]
     fn verifier_load_synthetic_topologies() -> anyhow::Result<()> {
@@ -572,6 +601,10 @@ mod tests {
             let mut skel = scx_ops_open!(builder, &mut object, baby_ops, None)?;
             let ro = skel.maps.rodata_data.as_mut().unwrap();
             ro.deadline_ns = 1180 * 1000;
+            ro.nr_cpu_ids = nr_cpus as u64;
+            ro.nr_node_ids = 2;
+            ro.nr_big_cpus = (nr_cpus / 2) as u64;
+            ro.nr_little_cpus = (nr_cpus - nr_cpus / 2) as u64;
             for cpu in 0..nr_cpus.min(ro.topo_node.len()) {
                 // Two node-ish halves, eight LLCs, per-pair L2 groups
                 // and SMT pairs - a denser distance ladder than any

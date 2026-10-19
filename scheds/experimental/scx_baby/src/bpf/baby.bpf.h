@@ -34,7 +34,14 @@
  * what the fast lane can take from a contended CPU.
  */
 
-extern u64 nr_cpu_ids;
+/*
+ * Topology constants, published by userspace before load. They are
+ * rodata: the verifier can fold every bound check and prune the hybrid
+ * arms on a machine without a tier split. ops.init() asserts that they
+ * match the kernel's own counts.
+ */
+extern const volatile u64 nr_cpu_ids;
+extern const volatile u64 nr_node_ids;
 
 static __always_inline u64 cpu2dsq(s32 cpu)
 {
@@ -93,21 +100,23 @@ extern const volatile bool stats_enabled;
  * beyond. It is an order, not a price - the placement decisions only ever
  * compare two candidates' ranks against each other.
  */
-#define BABY_MAX_CPUS		128
-
 #define BABY_DIST_SELF		0
 #define BABY_DIST_SIBLING	1
 #define BABY_DIST_L2		2
 #define BABY_DIST_LLC		3
 #define BABY_DIST_NODE		4
 #define BABY_DIST_BEYOND	5
-#define BABY_DIST_NR		8
 
 extern const volatile u32 topo_node[BABY_MAX_CPUS];
 extern const volatile u32 topo_llc[BABY_MAX_CPUS];
 extern const volatile u32 topo_l2[BABY_MAX_CPUS];
 extern const volatile u32 topo_core[BABY_MAX_CPUS];
-extern u64 nr_little_cpus, nr_big_cpus;
+extern const volatile u64 nr_little_cpus, nr_big_cpus;
+
+_Static_assert(BABY_CPU_DSQ_BASE + BABY_MAX_CPUS <= BABY_FL_CPU_DSQ_BASE,
+	       "per-CPU DSQ id space overlaps the fast-lane seats");
+_Static_assert(BABY_FL_NODE_DSQ_BASE + BABY_MAX_NODES <= BABY_CPU_DSQ_BASE,
+	       "per-node DSQ id space overlaps the bulk seats");
 
 /*
  * Per-CPU running-class residency, stamped in ops.running() and cleared
@@ -124,9 +133,8 @@ extern bool cpu_is_lat[BABY_MAX_CPUS];
  * counters must not share its line (see stats.bpf.c).
  */
 extern volatile u64 nr_running __attribute__((aligned(64)));
-extern volatile u64 nr_direct_dispatches __attribute__((aligned(64))),
-	nr_shared_dispatches;
-extern volatile u64 nr_preemptions, nr_boosts, nr_sticky, nr_warmseats;
+extern volatile u64 nr_direct_dispatches;
+extern volatile u64 nr_preemptions, nr_boosts, nr_sticky;
 extern volatile u64 nr_coldspreads;
 
 /*
@@ -142,20 +150,15 @@ extern volatile u64 nr_pull_land[BABY_DIST_NR];
  * Wait-at-depth instrument: the wait a task actually served, filed by the
  * depth it waited behind (0, 1, 2, 3+).
  */
-#define BABY_WDEPTH_NR	4
-
 extern volatile u64 nr_wait_n[BABY_WDEPTH_NR];
 extern volatile u64 nr_wait_ns[BABY_WDEPTH_NR];
 extern volatile u64 nr_wait_max[BABY_WDEPTH_NR];
 extern volatile u64 nr_wait_slow[BABY_WDEPTH_NR];
-extern volatile u64 nr_arr_seat, nr_arr_shared;
 
 /*
  * The same charge, split by class: class-major, entry
  * class * BABY_WDEPTH_NR + depth.
  */
-#define BABY_WCLS_NR	4
-
 extern volatile u64 nr_wait_cls_n[BABY_WDEPTH_NR * BABY_WCLS_NR];
 extern volatile u64 nr_wait_cls_ns[BABY_WDEPTH_NR * BABY_WCLS_NR];
 extern volatile u64 nr_wait_cls_max[BABY_WDEPTH_NR * BABY_WCLS_NR];
@@ -165,8 +168,6 @@ extern volatile u64 nr_wait_cls_slow[BABY_WDEPTH_NR * BABY_WCLS_NR];
  * The same charge, split by arrival type: type-major, entry
  * type * BABY_WDEPTH_NR + depth.
  */
-#define BABY_WTYPE_NR	2
-
 extern volatile u64 nr_wait_type_n[BABY_WDEPTH_NR * BABY_WTYPE_NR];
 extern volatile u64 nr_wait_type_ns[BABY_WDEPTH_NR * BABY_WTYPE_NR];
 extern volatile u64 nr_wait_type_max[BABY_WDEPTH_NR * BABY_WTYPE_NR];
@@ -191,8 +192,6 @@ extern volatile u64 nr_wait_lcri_slow[BABY_WDEPTH_NR * 2];
  * classes partition the wlcri lat bucket: per depth, the reason sums
  * equal the wlcri lat counts and ns.
  */
-#define BABY_WG_NR	10
-
 #define BABY_WG_NON_WAKE	0	/* rotation requeue, not a wake */
 #define BABY_WG_NO_GATE		1	/* no wake-gate contact this cycle */
 #define BABY_WG_M1_NOT_LAT	2	/* wakee not lat-cri at gate time */
@@ -241,8 +240,6 @@ extern volatile u64 nr_arr_type[2 * 2];
  * work - the depth left in its warm seat and the shared backlog the
  * rotation turns on.
  */
-#define BABY_CENSUS_NR	8
-
 extern volatile u64 nr_census_seat[BABY_CENSUS_NR];
 extern volatile u64 nr_census_shared[BABY_CENSUS_NR];
 

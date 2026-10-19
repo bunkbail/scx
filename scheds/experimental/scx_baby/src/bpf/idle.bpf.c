@@ -73,10 +73,11 @@ __hidden bool try_direct_dispatch(struct task_struct *p, struct task_ctx *tctx,
 			return false;
 	}
 
-	if (stats_enabled)
+	if (stats_enabled) {
 		__sync_fetch_and_add(&nr_land[cpu_dist(prev_cpu, cpu)], 1);
+		__sync_fetch_and_add(&nr_direct_dispatches, 1);
+	}
 	scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL_ON | cpu, task_slice(tctx), 0);
-	__sync_fetch_and_add(&nr_direct_dispatches, 1);
 
 	if (cpu != prev_cpu || !is_running)
 		scx_bpf_kick_cpu(cpu, SCX_KICK_IDLE);

@@ -272,7 +272,8 @@ __hidden void class_boost_on_sleep(struct task_struct *p, struct task_ctx *tctx,
 	if (!runnable && !reached_deadline(tctx, now) &&
 	    task_nice(p, tctx) > MIN_NICE) {
 		tctx->boost++;
-		__sync_fetch_and_add(&nr_boosts, 1);
+		if (stats_enabled)
+			__sync_fetch_and_add(&nr_boosts, 1);
 	}
 }
 

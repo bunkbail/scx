@@ -29,6 +29,16 @@ private(BABY) struct bpf_cpumask __kptr *big_cpumask;
 private(BABY) struct bpf_cpumask __kptr *little_cpumask;
 
 /*
+ * Every CPU outside the LP islands: the mask the kernel selector may
+ * pick from. scx_bpf_select_cpu_and() clears the chosen CPU's kernel
+ * idle bit, and there is no helper to put it back, so an idle CPU this
+ * scheduler does not dispatch to must never be picked in the first
+ * place. The full task mask remains the fallback for a task whose
+ * affinity allows only LP cores.
+ */
+private(BABY) struct bpf_cpumask __kptr *non_lp_cpumask;
+
+/*
  * Saturation preemption: at full saturation a latency-critical waiter
  * parks behind a batch task for a full slice. The tick cuts the holder
  * short instead, under these gates:
@@ -265,7 +275,8 @@ s32 BPF_STRUCT_OPS(baby_select_cpu, struct task_struct *p,
 					1);
 			scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL,
 					   task_slice(tctx), 0);
-			__sync_fetch_and_add(&nr_direct_dispatches, 1);
+			if (stats_enabled)
+				__sync_fetch_and_add(&nr_direct_dispatches, 1);
 			return cpu;
 		}
 	}
@@ -279,7 +290,8 @@ s32 BPF_STRUCT_OPS(baby_select_cpu, struct task_struct *p,
 				&nr_wake_land[cpu_dist(prev_cpu, cpu)], 1);
 		scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL,
 				   tctx ? task_slice(tctx) : deadline_ns, 0);
-		__sync_fetch_and_add(&nr_direct_dispatches, 1);
+		if (stats_enabled)
+			__sync_fetch_and_add(&nr_direct_dispatches, 1);
 	} else if (wake_flags & (SCX_WAKE_TTWU | SCX_WAKE_FORK)) {
 		/*
 		 * No idle CPU: the depth-0 wake-path preempt, the
@@ -369,11 +381,12 @@ s32 BPF_STRUCT_OPS(baby_select_cpu, struct task_struct *p,
 
 		scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL_ON | prev_cpu,
 				   task_slice(tctx), SCX_ENQ_PREEMPT);
-		__sync_fetch_and_add(&nr_wake_preempts, 1);
-		if (stats_enabled)
+		if (stats_enabled) {
+			__sync_fetch_and_add(&nr_wake_preempts, 1);
 			__sync_fetch_and_add(
 				&nr_wake_land[cpu_dist(prev_cpu, prev_cpu)],
 				1);
+		}
 
 		return prev_cpu;
 	}
@@ -473,7 +486,8 @@ void BPF_STRUCT_OPS(baby_enqueue, struct task_struct *p, u64 enq_flags)
 						   SCX_DSQ_LOCAL_ON | prev_cpu,
 						   task_slice(tctx),
 						   enq_flags | SCX_ENQ_PREEMPT);
-				__sync_fetch_and_add(&nr_preemptions, 1);
+				if (stats_enabled)
+					__sync_fetch_and_add(&nr_preemptions, 1);
 				return;
 			}
 		}
@@ -512,8 +526,6 @@ void BPF_STRUCT_OPS(baby_enqueue, struct task_struct *p, u64 enq_flags)
 					 slice, tctx->deadline, enq_flags);
 	}
 	stamp_wait(tctx, now, backlog, true);
-	__sync_fetch_and_add(&nr_arr_shared, 1);
-	__sync_fetch_and_add(&nr_shared_dispatches, 1);
 
 	/*
 	 * The task is placed without the wake side effect of
@@ -601,7 +613,8 @@ void BPF_STRUCT_OPS(baby_dispatch, s32 cpu, struct task_struct *prev)
 			 */
 			tctx->tick_preempted = false;
 			scx_bpf_task_set_slice(prev, task_slice(tctx));
-			__sync_fetch_and_add(&nr_sticky, 1);
+			if (stats_enabled)
+				__sync_fetch_and_add(&nr_sticky, 1);
 			return;
 		}
 	}
@@ -620,8 +633,9 @@ void BPF_STRUCT_OPS(baby_dispatch, s32 cpu, struct task_struct *prev)
 				node_preempt_at = 0;
 				if (has_bulk) {
 					fl_streak[idx]++;
-					__sync_fetch_and_add(&nr_depth1_pulls,
-							     1);
+					if (stats_enabled)
+						__sync_fetch_and_add(
+							&nr_depth1_pulls, 1);
 				} else if (stats_enabled) {
 					__sync_fetch_and_add(
 						&nr_pull_land[cpu_dist(cpu,
@@ -634,7 +648,9 @@ void BPF_STRUCT_OPS(baby_dispatch, s32 cpu, struct task_struct *prev)
 		if (scx_bpf_dsq_move_to_local(fl_seat_dsq, 0)) {
 			if (has_bulk) {
 				fl_streak[idx]++;
-				__sync_fetch_and_add(&nr_depth1_pulls_seat, 1);
+				if (stats_enabled)
+					__sync_fetch_and_add(
+						&nr_depth1_pulls_seat, 1);
 			}
 			return;
 		}
@@ -642,7 +658,9 @@ void BPF_STRUCT_OPS(baby_dispatch, s32 cpu, struct task_struct *prev)
 			node_preempt_at = 0;
 			if (has_bulk) {
 				fl_streak[idx]++;
-				__sync_fetch_and_add(&nr_depth1_pulls, 1);
+				if (stats_enabled)
+					__sync_fetch_and_add(
+						&nr_depth1_pulls, 1);
 			}
 			return;
 		}
@@ -807,12 +825,15 @@ void BPF_STRUCT_OPS(baby_tick, struct task_struct *p)
 			if (cri) {
 				p->scx.slice = 0;
 				tctx->tick_preempted = true;
-				if (warm)
-					__sync_fetch_and_add(
-						&nr_tick_preempts_warm, 1);
-				else
-					__sync_fetch_and_add(&nr_tick_preempts,
-							     1);
+				if (stats_enabled) {
+					if (warm)
+						__sync_fetch_and_add(
+							&nr_tick_preempts_warm,
+							1);
+					else
+						__sync_fetch_and_add(
+							&nr_tick_preempts, 1);
+				}
 			}
 		}
 	}
@@ -1059,7 +1080,26 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(baby_init)
 	u32 key = 0;
 	s32 node, cpu, err;
 
-	nr_cpu_ids = scx_bpf_nr_cpu_ids();
+	/*
+	 * The DSQ ids are laid out from the two topology counts, and the
+	 * per-CPU arrays are sized for BABY_MAX_CPUS. Userspace publishes
+	 * both as rodata before load; assert them against the kernel's own
+	 * counts here so a mismatch can never alias two CPUs or two node
+	 * queues onto one id.
+	 */
+	if (!nr_cpu_ids || nr_cpu_ids > BABY_MAX_CPUS ||
+	    nr_cpu_ids != scx_bpf_nr_cpu_ids()) {
+		scx_bpf_error("CPU count mismatch: rodata %llu, kernel %u, max %u",
+			      nr_cpu_ids, scx_bpf_nr_cpu_ids(), BABY_MAX_CPUS);
+		return -EINVAL;
+	}
+	if (!nr_node_ids || nr_node_ids > BABY_MAX_NODES ||
+	    nr_node_ids != __COMPAT_scx_bpf_nr_node_ids()) {
+		scx_bpf_error("node count mismatch: rodata %llu, kernel %u, max %u",
+			      nr_node_ids, __COMPAT_scx_bpf_nr_node_ids(),
+			      BABY_MAX_NODES);
+		return -EINVAL;
+	}
 
 	/*
 	 * Create the per-CPU seats and the per-node deadline queues for
@@ -1081,7 +1121,7 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(baby_init)
 		}
 	}
 
-	bpf_for(node, 0, __COMPAT_scx_bpf_nr_node_ids()) {
+	bpf_for(node, 0, nr_node_ids) {
 		err = scx_bpf_create_dsq(node, node);
 		if (err) {
 			scx_bpf_error("failed to create DSQ %d: %d", node, err);
@@ -1120,16 +1160,23 @@ void BPF_STRUCT_OPS(baby_exit, struct scx_exit_info *ei)
 	UEI_RECORD(uei, ei);
 }
 
+/*
+ * Publish one CPU's tier. Userspace counts the tiers before load and
+ * writes the counts as rodata, so this program only fills the masks;
+ * calling it twice for the same CPU is a no-op, and the counts cannot
+ * double.
+ */
 SEC("syscall")
 int enable_core_class(struct core_arg *input)
 {
 	struct bpf_cpumask *mask;
+	s32 cpu = input->cpu_id;
+	s32 tier = input->tier;
 	int err;
 
-	if (input->big)
-		__sync_fetch_and_add(&nr_big_cpus, 1);
-	else
-		__sync_fetch_and_add(&nr_little_cpus, 1);
+	if (cpu < 0 || (u32)cpu >= nr_cpu_ids ||
+	    tier < CORE_TIER_BIG || tier > CORE_TIER_LP)
+		return -EINVAL;
 
 	err = init_cpumask(&big_cpumask);
 	if (err)
@@ -1137,11 +1184,24 @@ int enable_core_class(struct core_arg *input)
 	err = init_cpumask(&little_cpumask);
 	if (err)
 		return err;
+	err = init_cpumask(&non_lp_cpumask);
+	if (err)
+		return err;
 
 	bpf_rcu_read_lock();
-	mask = input->big ? big_cpumask : little_cpumask;
+	if (tier != CORE_TIER_LP) {
+		mask = non_lp_cpumask;
+		if (mask)
+			bpf_cpumask_set_cpu(cpu, mask);
+	}
+	if (tier == CORE_TIER_BIG)
+		mask = big_cpumask;
+	else if (tier == CORE_TIER_LITTLE)
+		mask = little_cpumask;
+	else
+		mask = NULL;
 	if (mask)
-		bpf_cpumask_set_cpu(input->cpu_id, mask);
+		bpf_cpumask_set_cpu(cpu, mask);
 	bpf_rcu_read_unlock();
 
 	return 0;

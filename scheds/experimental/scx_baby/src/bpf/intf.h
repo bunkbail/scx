@@ -25,10 +25,39 @@ enum consts {
 	 *   [BABY_FL_NODE_DSQ_BASE .. BABY_CPU_DSQ_BASE) : FL per-node DSQs
 	 *   [BABY_CPU_DSQ_BASE .. BABY_FL_CPU_DSQ_BASE)  : bulk per-CPU warm seats
 	 *   [BABY_FL_CPU_DSQ_BASE .. )            : FL per-CPU warm seats
+	 *
+	 * The node id ranges bound the id spaces: a machine with more node
+	 * ids than the gap between the bases would alias a fast-lane node
+	 * queue onto a bulk one, and a CPU id past BABY_MAX_CPUS would
+	 * alias two CPUs onto one warm seat.
 	 */
 	BABY_FL_NODE_DSQ_BASE = 50,
 	BABY_CPU_DSQ_BASE = 100,
 	BABY_FL_CPU_DSQ_BASE = 300,
+
+	BABY_MAX_CPUS = 128,
+	BABY_MAX_NODES = (BABY_CPU_DSQ_BASE - BABY_FL_NODE_DSQ_BASE),
+
+	/*
+	 * Instrumentation widths, shared with src/stats.rs through bindgen
+	 * so the Rust side cannot drift from the BPF arrays it reads.
+	 */
+	BABY_DIST_NR = 8,
+	BABY_WDEPTH_NR = 4,
+	BABY_WCLS_NR = 4,
+	BABY_WTYPE_NR = 2,
+	BABY_WG_NR = 10,
+	BABY_CENSUS_NR = 8,
+};
+
+/*
+ * Core tier as published by userspace. The LP tier is excluded from the
+ * non-LP cpumask the kernel selector is allowed to pick from.
+ */
+enum core_tier {
+	CORE_TIER_BIG = 0,
+	CORE_TIER_LITTLE = 1,
+	CORE_TIER_LP = 2,
 };
 
 #ifndef __VMLINUX_H__
@@ -45,7 +74,7 @@ typedef signed long s64;
 
 struct core_arg {
 	s32 cpu_id;
-	s32 big;
+	s32 tier;
 };
 
 #endif /* __INTF_H */

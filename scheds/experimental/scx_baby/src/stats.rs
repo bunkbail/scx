@@ -602,16 +602,12 @@ pub struct Metrics {
     pub nr_running: u64,
     #[stat(desc = "Number of direct dispatches to an idle CPU")]
     pub nr_direct_dispatches: u64,
-    #[stat(desc = "Number of tasks enqueued to the global deadline queue")]
-    pub nr_shared_dispatches: u64,
     #[stat(desc = "Number of preemption kicks sent to a CPU")]
     pub nr_preemptions: u64,
     #[stat(desc = "Number of interactive priority boosts granted")]
     pub nr_boosts: u64,
     #[stat(desc = "Number of slice-end continuations of the deadline winner")]
     pub nr_sticky: u64,
-    #[stat(desc = "Number of tasks parked on their previous CPU's warm seat")]
-    pub nr_warmseats: u64,
     #[stat(desc = "Number of enqueues the oversubscription gate sent to the shared queue")]
     pub nr_coldspreads: u64,
     #[stat(desc = "Victims cut short at ops.tick for a shared-queue waiter")]
@@ -674,7 +670,7 @@ impl Metrics {
             crate::SCHEDULER_NAME,
             self.nr_running,
             self.nr_direct_dispatches,
-            self.nr_shared_dispatches,
+            self.nr_arr_shared,
             self.nr_preemptions,
             self.nr_tick_preempts,
             self.nr_tick_preempts_warm,
@@ -683,7 +679,7 @@ impl Metrics {
             self.nr_wake_preempts,
             self.nr_boosts,
             self.nr_sticky,
-            self.nr_warmseats,
+            self.nr_arr_seat,
             self.nr_coldspreads,
         )?;
         write!(w, "  land: ")?;
@@ -887,13 +883,9 @@ impl Metrics {
             nr_direct_dispatches: self
                 .nr_direct_dispatches
                 .saturating_sub(rhs.nr_direct_dispatches),
-            nr_shared_dispatches: self
-                .nr_shared_dispatches
-                .saturating_sub(rhs.nr_shared_dispatches),
             nr_preemptions: self.nr_preemptions.saturating_sub(rhs.nr_preemptions),
             nr_boosts: self.nr_boosts.saturating_sub(rhs.nr_boosts),
             nr_sticky: self.nr_sticky.saturating_sub(rhs.nr_sticky),
-            nr_warmseats: self.nr_warmseats.saturating_sub(rhs.nr_warmseats),
             nr_coldspreads: self.nr_coldspreads.saturating_sub(rhs.nr_coldspreads),
             nr_tick_preempts: self.nr_tick_preempts.saturating_sub(rhs.nr_tick_preempts),
             nr_tick_preempts_warm: self

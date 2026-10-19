@@ -20,14 +20,14 @@ const volatile bool stats_enabled;
 /*
  * Scheduling statistics. nr_running is a control-plane input read by
  * ops.select_cpu() and the warm-seat gate on every wake and enqueue;
- * it holds a cache line of its own so that the diagnostic counters'
- * atomics do not bounce it under the hot paths, and the next group is
- * aligned off it in turn.
+ * it is always maintained. Every other counter in this file is
+ * diagnostic and is written only when --stats enabled the instrument,
+ * so the default hot path carries no global atomics and the verifier
+ * prunes the increments outright.
  */
 __attribute__((aligned(64))) volatile u64 nr_running;
-__attribute__((aligned(64))) volatile u64 nr_direct_dispatches,
-	nr_shared_dispatches, nr_preemptions, nr_boosts, nr_sticky,
-	nr_warmseats, nr_coldspreads;
+__attribute__((aligned(64))) volatile u64 nr_direct_dispatches;
+volatile u64 nr_preemptions, nr_boosts, nr_sticky, nr_coldspreads;
 
 /*
  * Saturation preemption instrument: victims ops.tick() cut short
@@ -72,7 +72,6 @@ volatile u64 nr_wait_n[BABY_WDEPTH_NR];
 volatile u64 nr_wait_ns[BABY_WDEPTH_NR];
 volatile u64 nr_wait_max[BABY_WDEPTH_NR];
 volatile u64 nr_wait_slow[BABY_WDEPTH_NR];
-volatile u64 nr_arr_seat, nr_arr_shared;
 
 #define BABY_WAIT_SLOW_NS	(5ULL * NSEC_PER_MSEC)
 
@@ -167,12 +166,21 @@ __hidden void stamp_wait(struct task_ctx *tctx, u64 now, u64 depth, bool shared)
 __hidden void charge_wait(struct task_ctx *tctx, u64 now)
 {
 	u64 stamp = tctx->wait_stamp;
+	u8 miss = tctx->wake_gate_miss;
 
 	/*
 	 * The stamp is consumed whether or not the instrument runs:
 	 * a stale stamp must never outlive the run that paid for it.
 	 */
 	tctx->wait_stamp = 0;
+
+	/*
+	 * The wake-gate miss reason is a control-plane input to the
+	 * warm-seat relocation filter, not just a histogram key. It
+	 * describes the most recent wake and must not outlive the run
+	 * that consumed it, whether or not --stats was enabled.
+	 */
+	tctx->wake_gate_miss = BABY_WG_NO_GATE;
 
 	if (!stats_enabled || !stamp)
 		return;
@@ -218,10 +226,8 @@ __hidden void charge_wait(struct task_ctx *tctx, u64 now)
 
 		if (l) {
 			u32 r = (tctx->arrival_is_wake & 1) ?
-				       (u32)tctx->wake_gate_miss :
-				       (u32)BABY_WG_NON_WAKE;
+				       (u32)miss : (u32)BABY_WG_NON_WAKE;
 
-			tctx->wake_gate_miss = BABY_WG_NO_GATE;
 			if (r >= BABY_WG_NR)
 				r = BABY_WG_NO_GATE;
 

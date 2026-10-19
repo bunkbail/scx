@@ -8,15 +8,21 @@
  */
 #include "baby.bpf.h"
 
-u64 nr_cpu_ids;
+/*
+ * Topology counts, published as rodata by userspace before load. The
+ * verifier sees a constant in every bounds check and can prune the
+ * hybrid arms when a tier count is zero; ops.init() asserts that the
+ * values match the kernel's own nr_cpu_ids and nr_node_ids.
+ */
+const volatile u64 nr_cpu_ids;
+const volatile u64 nr_node_ids;
 
 /*
- * Tier sizes as published by userspace at init (enable_core_class),
- * counted locklessly. On a platform without a capacity split the
- * little set is empty and the hybrid gates below are statically
- * false: the compaction never engages there.
+ * Tier sizes as published by userspace before load. On a platform
+ * without a capacity split the little set is empty and the hybrid gates
+ * are statically false: the compaction never engages there.
  */
-u64 nr_little_cpus, nr_big_cpus;
+const volatile u64 nr_little_cpus, nr_big_cpus;
 
 /*
  * Cache-topology distance tables, as published by userspace from the
@@ -55,7 +61,7 @@ __hidden u32 cpu_dist(s32 a, s32 b)
 		return BABY_DIST_L2;
 	if (topo_llc[ia] && topo_llc[ia] == topo_llc[ib])
 		return BABY_DIST_LLC;
-	if (topo_node[ia] == topo_node[ib])
+	if (topo_node[ia] && topo_node[ia] == topo_node[ib])
 		return BABY_DIST_NODE;
 
 	return BABY_DIST_BEYOND;

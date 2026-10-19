@@ -16,7 +16,7 @@
  * utilization-driven level; -2 leaves the platform governor entirely
  * alone.
  */
-volatile s64 cpuperf_lvl;
+const volatile s64 cpuperf_lvl;
 
 /* True when the platform governor is left alone entirely. */
 static bool cpuperf_offline(void)

@@ -131,7 +131,7 @@ __hidden bool balance_try_warm_seat(struct task_struct *p, struct task_ctx *tctx
 						&nr_seat_move[cpu_dist(
 							prev_cpu, target)],
 						1);
-			} else {
+			} else if (stats_enabled) {
 				__sync_fetch_and_add(&nr_seat_self, 1);
 			}
 
@@ -139,8 +139,6 @@ __hidden bool balance_try_warm_seat(struct task_struct *p, struct task_ctx *tctx
 			scx_bpf_dsq_insert_vtime(p, dsq, slice,
 						 tctx->deadline, 0);
 			stamp_wait(tctx, now, target_nr, false);
-			__sync_fetch_and_add(&nr_arr_seat, 1);
-			__sync_fetch_and_add(&nr_warmseats, 1);
 			scx_bpf_kick_cpu(target, SCX_KICK_IDLE);
 			return true;
 		}
@@ -151,7 +149,8 @@ __hidden bool balance_try_warm_seat(struct task_struct *p, struct task_ctx *tctx
 		 * before joining the shared queue, which keeps the load
 		 * distribution flowing at saturation.
 		 */
-		__sync_fetch_and_add(&nr_coldspreads, 1);
+		if (stats_enabled)
+			__sync_fetch_and_add(&nr_coldspreads, 1);
 	}
 
 	return false;
