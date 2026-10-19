@@ -54,6 +54,15 @@ struct cpu_ctx {
 	 * what lets the boost latch for the duration of a burst.
 	 */
 	u64 perf_req;
+
+	/*
+	 * When this CPU last went idle. A long idle must not be averaged
+	 * into the next window with the runtime charged before it: a
+	 * 60-second sleep followed by a microsecond blip is not 100%
+	 * utilization. A short idle keeps the pre-idle runtime, which is
+	 * recent history and is why the window below is capped.
+	 */
+	u64 idle_since;
 };
 
 struct {
@@ -110,7 +119,7 @@ static void update_cpuperf(struct cpu_ctx *cctx, s32 cpu, u64 now, bool max_floo
 	 * Smooth the target performance level, so that short spikes are
 	 * absorbed while load variations still react quickly.
 	 */
-	cctx->perf_lvl = calc_avg(perf_lvl, cctx->perf_lvl);
+	cctx->perf_lvl = calc_avg(cctx->perf_lvl, perf_lvl);
 
 	if (max_floor)
 		perf_lvl = SCX_CPUPERF_ONE;
@@ -179,7 +188,7 @@ __hidden void cpuperf_init(void)
  */
 __hidden void cpuperf_on_tick(struct task_struct *p, u64 now, bool max_floor)
 {
-	if (cpuperf_lvl < 0) {
+	if (cpuperf_lvl == -1) {
 		struct cpu_ctx *cctx;
 		s32 cpu = scx_bpf_task_cpu(p);
 
@@ -199,12 +208,26 @@ __hidden void cpuperf_on_tick(struct task_struct *p, u64 now, bool max_floor)
  */
 __hidden void cpuperf_on_running(s32 cpu, u64 now, bool max_floor)
 {
-	if (cpuperf_lvl < 0) {
+	if (cpuperf_lvl == -1) {
 		struct cpu_ctx *cctx;
 
 		cctx = try_lookup_cpu_ctx(cpu);
-		if (cctx)
+		if (cctx) {
+			/*
+			 * A long idle ends the previous utilization window.
+			 * Drop its runtime instead of charging it to the
+			 * window that starts with this run; a short idle
+			 * keeps it, and the cap in update_cpuperf() stops a
+			 * brief sleep from diluting it.
+			 */
+			if (cctx->idle_since &&
+			    now - cctx->idle_since > 4 * deadline_ns) {
+				cctx->last_running = now;
+				cctx->prev_runtime = cctx->tot_runtime;
+			}
+			cctx->idle_since = 0;
 			update_cpuperf(cctx, cpu, now, max_floor);
+		}
 	}
 }
 
@@ -214,7 +237,7 @@ __hidden void cpuperf_on_running(s32 cpu, u64 now, bool max_floor)
  */
 __hidden void cpuperf_on_stopping(s32 cpu, u64 now)
 {
-	if (!cpuperf_offline()) {
+	if (cpuperf_lvl == -1) {
 		struct cpu_ctx *cctx;
 
 		cctx = try_lookup_cpu_ctx(cpu);
@@ -229,12 +252,15 @@ __hidden void cpuperf_on_stopping(s32 cpu, u64 now)
  */
 __hidden void cpuperf_on_idle(s32 cpu)
 {
-	if (cpuperf_lvl < 0) {
+	if (cpuperf_lvl == -1) {
 		struct cpu_ctx *cctx = try_lookup_cpu_ctx(cpu);
 
-		if (cctx && cctx->perf_req) {
-			scx_bpf_cpuperf_set(cpu, 0);
-			cctx->perf_req = 0;
+		if (cctx) {
+			cctx->idle_since = bpf_ktime_get_ns();
+			if (cctx->perf_req) {
+				scx_bpf_cpuperf_set(cpu, 0);
+				cctx->perf_req = 0;
+			}
 		}
 	}
 }

@@ -538,6 +538,8 @@ __hidden s64 task_prio_factor(const struct task_struct *p,
 __hidden u64 calc_deadline(const struct task_struct *p, struct task_ctx *tctx,
 		  u64 now);
 __hidden void class_on_runnable(struct task_ctx *tctx, u64 enq_flags, u64 now);
+__hidden void class_on_running(struct task_struct *p, struct task_ctx *tctx,
+			       u64 now);
 __hidden void class_boost_on_sleep(struct task_struct *p, struct task_ctx *tctx,
 			  bool runnable, u64 now);
 __hidden void class_init_task(struct task_ctx *tctx, struct task_struct *p, u64 now);

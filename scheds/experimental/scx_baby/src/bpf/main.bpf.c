@@ -999,13 +999,7 @@ void BPF_STRUCT_OPS(baby_running, struct task_struct *p)
 	cpuperf_on_running(scx_bpf_task_cpu(p), now,
 			   is_heavy_proven(tctx) || is_foreground(tctx));
 
-	/*
-	 * set_next_entity(): a task picked with a deadline that is already
-	 * behind gets a fresh one (only for tasks at nice >= 0, as in the
-	 * original).
-	 */
-	if (PRIO_TO_NICE(p->static_prio) >= 0 && reached_deadline(tctx, now))
-		tctx->deadline = calc_deadline(p, tctx, now);
+	class_on_running(p, tctx, now);
 }
 
 /*

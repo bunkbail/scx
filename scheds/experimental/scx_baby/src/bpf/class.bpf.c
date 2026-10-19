@@ -10,26 +10,18 @@
 #include "baby.bpf.h"
 
 /*
- * Deadline shift applied by the task's nice level, carried over from the
- * original prio_factor[40] table. A nice value of 0 applies no shift; each
- * step below 0 pulls the deadline earlier (down to -1.08ms) and each step
- * above 0 pushes it later (up to +1.26ms).
+ * Deadline offset applied by the task's nice level: the original
+ * prio_factor[40] table, rescaled to the configured deadline offset by
+ * userspace and published as rodata. A nice value of 0 applies the
+ * base offset; each step below 0 pulls the deadline earlier and each
+ * step above 0 pushes it later, in the proportions of the original
+ * table. Scaling is what keeps -d 500 (or -d 100) from producing a
+ * deadline in the past when the table's -20 entry is applied.
  *
  * The table is padded to a power-of-two size and the index is masked, so
  * the verifier can always prove the array access in bounds.
  */
-#define PRIO_FACTOR_NR		64
-
-static const s64 prio_factor[PRIO_FACTOR_NR] = {
- /* -20 */  -1080000L,  -980000L,  -880000L,  -780000L,  -680000L,
- /* -15 */   -580000L,  -480000L,  -380000L,  -280000L,  -180000L,
- /* -10 */    -80000L,   -79000L,   -78000L,   -77000L,   -76000L,
- /*  -5 */    -75000L,   -74000L,   -73000L,   -72000L,   -71000L,
- /*   0 */         0L,  1080000L,  1090000L,  1100000L,  1110000L,
- /*   5 */   1120000L,  1130000L,  1140000L,  1150000L,  1160000L,
- /*  10 */   1170000L,  1180000L,  1190000L,  1200000L,  1210000L,
- /*  15 */   1220000L,  1230000L,  1240000L,  1250000L,  1260000L
-};
+const volatile s64 prio_offset_ns[BABY_PRIO_OFFSET_NR];
 
 /*
  * Return the task's effective nice level: its static nice level shifted by
@@ -55,14 +47,24 @@ static s32 task_nice(const struct task_struct *p, const struct task_ctx *tctx)
 }
 
 /*
- * Return the deadline offset applied by the task's nice level.
+ * Return the absolute deadline offset applied by the task's effective
+ * nice level, including the base deadline.
+ */
+static __always_inline u64
+task_deadline_offset(const struct task_struct *p, const struct task_ctx *tctx)
+{
+	s32 idx = (task_nice(p, tctx) + 20) & (BABY_PRIO_OFFSET_NR - 1);
+
+	return (u64)prio_offset_ns[idx];
+}
+
+/*
+ * Return the offset relative to the base deadline, for the yield push.
  */
 __hidden s64 task_prio_factor(const struct task_struct *p,
 		     const struct task_ctx *tctx)
 {
-	s32 idx = (task_nice(p, tctx) + 20) & (PRIO_FACTOR_NR - 1);
-
-	return prio_factor[idx];
+	return (s64)task_deadline_offset(p, tctx) - (s64)deadline_ns;
 }
 
 /*
@@ -71,7 +73,7 @@ __hidden s64 task_prio_factor(const struct task_struct *p,
 __hidden u64
 calc_deadline(const struct task_struct *p, struct task_ctx *tctx, u64 now)
 {
-	return now + deadline_ns + task_prio_factor(p, tctx);
+	return now + task_deadline_offset(p, tctx);
 }
 
 /*
@@ -207,12 +209,32 @@ __hidden void class_on_runnable(struct task_ctx *tctx, u64 enq_flags, u64 now)
 __hidden void class_boost_on_sleep(struct task_struct *p, struct task_ctx *tctx,
 			  bool runnable, u64 now)
 {
-	if (!runnable && !reached_deadline(tctx, now) &&
+	/*
+	 * Only ordinary fair tasks earn the boost: SCHED_IDLE and
+	 * SCHED_BATCH asked for a lower share, and the boost is a fair
+	 * scheduling construct, not a latency hint for every policy.
+	 */
+	if (!runnable && p->policy == BABY_SCHED_NORMAL &&
+	    !reached_deadline(tctx, now) &&
 	    task_nice(p, tctx) > MIN_NICE) {
 		tctx->boost++;
 		if (stats_enabled)
 			__sync_fetch_and_add(&nr_boosts, 1);
 	}
+}
+
+/*
+ * set_next_entity(): a task picked with a deadline that is already behind
+ * gets a fresh one, for tasks whose effective nice is zero or above.
+ * The effective nice includes the earned boost; a boosted task is
+ * already inside its shorter deadline and renewing it again at run
+ * start would only push it behind the tasks the boost exists to beat.
+ */
+__hidden void class_on_running(struct task_struct *p, struct task_ctx *tctx,
+			       u64 now)
+{
+	if (task_nice(p, tctx) >= 0 && reached_deadline(tctx, now))
+		tctx->deadline = calc_deadline(p, tctx, now);
 }
 
 /*

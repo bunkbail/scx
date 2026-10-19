@@ -48,6 +48,18 @@ enum consts {
 	BABY_WTYPE_NR = 2,
 	BABY_WG_NR = 10,
 	BABY_CENSUS_NR = 8,
+
+	/*
+	 * The nice-offset table is padded to a power of two so the nice
+	 * index can be masked; entries past nice +19 are unused.
+	 */
+	BABY_PRIO_OFFSET_NR = 64,
+
+	/*
+	 * SCHED_NORMAL is 0 but is not emitted into vmlinux BTF, so the
+	 * policy test carries the value.
+	 */
+	BABY_SCHED_NORMAL = 0,
 };
 
 /*

@@ -72,6 +72,35 @@ fn possible_node_ids() -> Result<usize> {
     max.map(|m| m + 1).context("empty possible NUMA node list")
 }
 
+/// The original prio_factor[40] table, in nanoseconds at the original
+/// 1.18ms deadline. Userspace rescales it to the configured deadline
+/// so the base offset and the nice shift keep their proportions.
+const PRIO_FACTOR_BASE: [i64; 40] = [
+    /* -20 */ -1080000, -980000, -880000, -780000, -680000, /* -15 */ -580000, -480000,
+    -380000, -280000, -180000, /* -10 */ -80000, -79000, -78000, -77000, -76000,
+    /*  -5 */ -75000, -74000, -73000, -72000, -71000, /*   0 */ 0, 1080000, 1090000,
+    1100000, 1110000, /*   5 */ 1120000, 1130000, 1140000, 1150000, 1160000,
+    /*  10 */ 1170000, 1180000, 1190000, 1200000, 1210000, /*  15 */ 1220000, 1230000,
+    1240000, 1250000, 1260000,
+];
+
+const DEADLINE_NS_DEFAULT: i64 = 1_180_000;
+
+/// Rescale the nice table to the configured deadline. The result is an
+/// absolute offset from now, so the BPF side never multiplies: the
+/// floor keeps a boosted task's deadline in the future even at the
+/// smallest accepted `-d`.
+fn scaled_prio_offsets(deadline_ns: u64) -> [i64; consts_BABY_PRIO_OFFSET_NR as usize] {
+    let base = deadline_ns as i64;
+    let floor = (base >> 5).max(10_000);
+    let mut table = [0i64; consts_BABY_PRIO_OFFSET_NR as usize];
+
+    for (slot, factor) in table.iter_mut().zip(PRIO_FACTOR_BASE) {
+        *slot = (base + factor * base / DEADLINE_NS_DEFAULT).max(floor);
+    }
+    table
+}
+
 /// Classify the cores from the topology and the sysfs capacity and
 /// frequency ladders. Pure over its inputs, so the tier counts can be
 /// written as rodata before load.
@@ -271,6 +300,7 @@ impl<'a> Scheduler<'a> {
         let rodata = skel.maps.rodata_data.as_mut().unwrap();
         rodata.debug = opts.debug;
         rodata.deadline_ns = opts.deadline_us * 1000;
+        rodata.prio_offset_ns = scaled_prio_offsets(rodata.deadline_ns);
 
         // The wait/census instrument and the distance histograms run
         // only when the scheduler was started with --stats: the flag
@@ -572,6 +602,33 @@ mod tests {
     }
 
     #[test]
+    fn prio_offsets_keep_nice_zero_at_the_base() {
+        for deadline_ns in [100_000u64, 500_000, 1_180_000, 10_000_000] {
+            let table = scaled_prio_offsets(deadline_ns);
+            assert_eq!(table[20], deadline_ns as i64);
+        }
+    }
+
+    #[test]
+    fn negative_nice_offsets_stay_in_the_future() {
+        let table = scaled_prio_offsets(100_000);
+        // Nice -20 at the smallest accepted -d: the floor, not a
+        // deadline in the past.
+        assert_eq!(table[0], 10_000);
+        // Nice -1 is pulled earlier than the base but stays positive.
+        assert!(table[19] > 0 && table[19] < 100_000);
+    }
+
+    #[test]
+    fn prio_offsets_scale_with_the_deadline() {
+        let small = scaled_prio_offsets(1_180_000);
+        let large = scaled_prio_offsets(2_360_000);
+        assert!(large[0] > small[0]);
+        assert_eq!(small[20], 1_180_000);
+        assert_eq!(large[20], 2_360_000);
+    }
+
+    #[test]
     fn perf_lvl_outside_the_range_is_rejected() {
         assert!(Opts::try_parse_from(["scx_baby", "-p", "-3"]).is_err());
         assert!(Opts::try_parse_from(["scx_baby", "-p", "1025"]).is_err());
@@ -601,6 +658,7 @@ mod tests {
             let mut skel = scx_ops_open!(builder, &mut object, baby_ops, None)?;
             let ro = skel.maps.rodata_data.as_mut().unwrap();
             ro.deadline_ns = 1180 * 1000;
+            ro.prio_offset_ns = scaled_prio_offsets(ro.deadline_ns);
             ro.nr_cpu_ids = nr_cpus as u64;
             ro.nr_node_ids = 2;
             ro.nr_big_cpus = (nr_cpus / 2) as u64;
