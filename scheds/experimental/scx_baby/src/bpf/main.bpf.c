@@ -52,9 +52,11 @@ private(BABY) struct bpf_cpumask __kptr *non_lp_cpumask;
  * - the victim has held the CPU for at least the protect window, so a
  *   task that just got the CPU keeps it;
  * - for a shared-queue head, one CPU at a time claims it: the per-CPU
- *   ticks would otherwise all preempt for the same waiter. A global
- *   stamp with a short quiet window bounds the herd. Warm-seat waiters
- *   are per-CPU precise; the victim's rotation pulls the waiter in the
+ *   ticks would otherwise all preempt for the same waiter. The claim
+ *   is per node and carries the waiter's pid, so it neither suppresses
+ *   another node nor blocks a different head, and a successful pull
+ *   from that node's fast-lane queue clears it. Warm-seat waiters are
+ *   per-CPU precise; the victim's rotation pulls the waiter in the
  *   same scheduling cycle.
  *
  * The victim requeues with its deadline intact, behind the waiter, on
@@ -70,15 +72,26 @@ private(BABY) struct bpf_cpumask __kptr *non_lp_cpumask;
 /*
  * Fallback quiet window for the shared-queue claim. It covers the
  * tick -> resched -> dispatch flight, which may be diverted to a
- * warm-seat arrival and never pull the waiter. The stamp is cleared
- * when any CPU pulls the shared head, so a later staggered tick can
- * serve the next waiter instead of waiting out a slice.
+ * warm-seat arrival and never pull the waiter. The claim is cleared by
+ * a successful pull from the same fast-lane queue, so a later
+ * staggered tick can serve the next waiter instead of waiting out a
+ * slice; a new head may also claim without waiting for the window,
+ * because the claim names the waiter it was made for.
  */
 #define BABY_TICK_PREEMPT_FALLBACK_NS	(100ULL * NSEC_PER_USEC)
 
 static u64 cpu_running_at[BABY_MAX_CPUS];
 bool cpu_is_lat[BABY_MAX_CPUS];
-static u64 node_preempt_at;
+
+/*
+ * One anti-herd claim per node: the high 32 bits hold the waiter's pid,
+ * the low 32 bits the claim time with its low bit forced to one, so a
+ * zero word means unclaimed. A claim suppresses another CPU's tick only
+ * for the same waiter; a different head may claim immediately. The
+ * claim is cleared by a successful pull from that node's fast-lane
+ * queue, not by a bulk pull or a seat pull, which serve other work.
+ */
+static u64 node_preempt_claim[BABY_NODE_CLOCK_NR];
 
 /*
  * Per-queue service clocks for the starve rescue, indexed by lane
@@ -406,19 +419,6 @@ s32 BPF_STRUCT_OPS(baby_select_cpu, struct task_struct *p,
 }
 
 /*
- * Waiting work in this node's bulk and fast-lane queues. The queue
- * probe cannot run inside an RCU read-side section, so callers call
- * this outside one.
- */
-static u64 node_backlog(s32 cpu)
-{
-	s32 node = __COMPAT_scx_bpf_cpu_node(cpu);
-
-	return scx_bpf_dsq_nr_queued(node) +
-	       scx_bpf_dsq_nr_queued(fl_node2dsq(node));
-}
-
-/*
  * Enqueue a task with no idle CPU to run on. The node queue is ordered
  * by deadline, and dispatch takes the earliest one.
  */
@@ -426,8 +426,9 @@ void BPF_STRUCT_OPS(baby_enqueue, struct task_struct *p, u64 enq_flags)
 {
 	struct task_ctx *tctx = try_lookup_task_ctx(p);
 	s32 prev_cpu = scx_bpf_task_cpu(p);
+	s32 node = __COMPAT_scx_bpf_cpu_node(prev_cpu);
 	bool is_running = scx_bpf_task_running(p);
-	u64 backlog, slice, now = bpf_ktime_get_ns();
+	u64 bulk_backlog, fl_backlog, slice, now = bpf_ktime_get_ns();
 
 	if (!tctx)
 		return;
@@ -469,7 +470,14 @@ void BPF_STRUCT_OPS(baby_enqueue, struct task_struct *p, u64 enq_flags)
 		tctx->deadline = calc_deadline(p, tctx, now);
 	}
 
-	backlog = node_backlog(prev_cpu);
+	/*
+	 * The two lanes are counted separately: a fast-lane backlog must
+	 * not open a bulk seat or grant a bulk arrival the deep rung, and
+	 * a bulk backlog must not open a fast-lane seat. The probe cannot
+	 * run inside an RCU read-side section; enqueue is outside one.
+	 */
+	bulk_backlog = scx_bpf_dsq_nr_queued(node);
+	fl_backlog = scx_bpf_dsq_nr_queued(fl_node2dsq(node));
 
 	/*
 	 * check_preempt_wakeup(): preempt the previous CPU's task when the
@@ -481,17 +489,25 @@ void BPF_STRUCT_OPS(baby_enqueue, struct task_struct *p, u64 enq_flags)
 	 * a task that never wakes has no latency to protect. The victim
 	 * warm-seats behind its successor, so this is a same-CPU
 	 * alternation.
+	 *
+	 * The guards mirror ops.select_cpu()'s wake gate: the wakee must
+	 * be allowed on the target, no in-flight wakee may hold the local
+	 * DSQ (the insert would queue behind it), and a latency-critical
+	 * victim is shielded so the class the two lanes protect is never
+	 * the one displaced here.
 	 */
 	if ((enq_flags & SCX_ENQ_WAKEUP) &&
+	    bpf_cpumask_test_cpu(prev_cpu, p->cpus_ptr) &&
 	    !scx_bpf_dsq_nr_queued(fl_cpu2dsq(prev_cpu)) &&
 	    !scx_bpf_dsq_nr_queued(cpu2dsq(prev_cpu)) &&
+	    !scx_bpf_dsq_nr_queued(SCX_DSQ_LOCAL_ON | prev_cpu) &&
 	    (is_interactive(tctx) || is_foreground(tctx))) {
 		struct task_struct *curr = __COMPAT_scx_bpf_cpu_curr(prev_cpu);
 
 		if (curr && curr != p && !(curr->flags & PF_IDLE)) {
 			struct task_ctx *cctx = try_lookup_task_ctx(curr);
 
-			if (cctx &&
+			if (cctx && !is_lat_cri(cctx) &&
 			    (s64)(tctx->deadline - cctx->deadline) < 0 &&
 			    p->static_prio <= curr->static_prio &&
 			    can_resched(cctx)) {
@@ -519,7 +535,8 @@ void BPF_STRUCT_OPS(baby_enqueue, struct task_struct *p, u64 enq_flags)
 	/*
 	 * Warm seat, gated on oversubscription (see balance.bpf.c).
 	 */
-	if (balance_try_warm_seat(p, tctx, enq_flags, backlog, now))
+	if (balance_try_warm_seat(p, tctx, enq_flags, bulk_backlog,
+				  fl_backlog, now))
 		return;
 
 	/*
@@ -529,8 +546,8 @@ void BPF_STRUCT_OPS(baby_enqueue, struct task_struct *p, u64 enq_flags)
 	 * serves ahead of bulk under the quota.
 	 */
 	{
-		s32 node = __COMPAT_scx_bpf_cpu_node(prev_cpu);
 		bool lat = is_lat_cri(tctx);
+		u64 lane_backlog = lat ? fl_backlog : bulk_backlog;
 		u64 dsq = lat ? fl_node2dsq(node) : (u64)node;
 
 		/*
@@ -541,13 +558,13 @@ void BPF_STRUCT_OPS(baby_enqueue, struct task_struct *p, u64 enq_flags)
 			node_service_at[lat & 1][node &
 						 (BABY_NODE_CLOCK_NR - 1)] = now;
 
-		slice = backlog_deep(backlog) && !tctx->tick_preempted
+		slice = backlog_deep(lane_backlog) && !tctx->tick_preempted
 			? 4 * deadline_ns : task_slice(tctx);
 
 		scx_bpf_dsq_insert_vtime(p, dsq, slice, tctx->deadline,
 					 enq_flags);
+		stamp_wait(tctx, now, lane_backlog, true);
 	}
-	stamp_wait(tctx, now, backlog, true);
 
 	/*
 	 * The task is placed without the wake side effect of
@@ -571,6 +588,7 @@ void BPF_STRUCT_OPS(baby_dispatch, s32 cpu, struct task_struct *prev)
 	bool need_running = prev && is_queued(prev);
 	s32 node = __COMPAT_scx_bpf_cpu_node(cpu);
 	u32 idx = (u32)cpu & (BABY_MAX_CPUS - 1);
+	u32 nidx = (u32)node & (BABY_NODE_CLOCK_NR - 1);
 	u64 fl_seat_dsq = fl_cpu2dsq(cpu);
 	u64 fl_node_dsq = fl_node2dsq(node);
 	u64 bulk_seat_dsq = cpu2dsq(cpu);
@@ -683,9 +701,8 @@ void BPF_STRUCT_OPS(baby_dispatch, s32 cpu, struct task_struct *prev)
 			s32 from = fl_q ? scx_bpf_task_cpu(fl_q) : -1;
 
 			if (scx_bpf_dsq_move_to_local(fl_node_dsq, 0)) {
-				node_preempt_at = 0;
-				node_service_at[1][node &
-						  (BABY_NODE_CLOCK_NR - 1)] = now;
+				node_preempt_claim[nidx] = 0;
+				node_service_at[1][nidx] = now;
 				if (has_bulk) {
 					fl_streak[idx]++;
 					if (stats_enabled)
@@ -711,8 +728,8 @@ void BPF_STRUCT_OPS(baby_dispatch, s32 cpu, struct task_struct *prev)
 			return;
 		}
 		if (scx_bpf_dsq_move_to_local(fl_node_dsq, 0)) {
-			node_preempt_at = 0;
-			node_service_at[1][node & (BABY_NODE_CLOCK_NR - 1)] = now;
+			node_preempt_claim[nidx] = 0;
+			node_service_at[1][nidx] = now;
 			if (has_bulk) {
 				fl_streak[idx]++;
 				if (stats_enabled)
@@ -739,15 +756,7 @@ void BPF_STRUCT_OPS(baby_dispatch, s32 cpu, struct task_struct *prev)
 
 		if (scx_bpf_dsq_move_to_local(node, 0)) {
 			fl_streak[idx] = 0;
-			node_service_at[0][node & (BABY_NODE_CLOCK_NR - 1)] = now;
-			/*
-			 * The waiter this claim was made for is served, or
-			 * another head took its place; either way the next
-			 * staggered tick may claim again. A racing tick CAS
-			 * against the cleared stamp fails and retries next
-			 * tick.
-			 */
-			node_preempt_at = 0;
+			node_service_at[0][nidx] = now;
 			if (stats_enabled)
 				__sync_fetch_and_add(
 					&nr_pull_land[cpu_dist(cpu, from)], 1);
@@ -766,8 +775,7 @@ void BPF_STRUCT_OPS(baby_dispatch, s32 cpu, struct task_struct *prev)
 		}
 		if (scx_bpf_dsq_move_to_local(node, 0)) {
 			fl_streak[idx] = 0;
-			node_service_at[0][node & (BABY_NODE_CLOCK_NR - 1)] = now;
-			node_preempt_at = 0;
+			node_service_at[0][nidx] = now;
 			return;
 		}
 	}
@@ -783,8 +791,8 @@ void BPF_STRUCT_OPS(baby_dispatch, s32 cpu, struct task_struct *prev)
 			return;
 		}
 		if (scx_bpf_dsq_move_to_local(fl_node_dsq, 0)) {
-			node_service_at[1][node &
-					  (BABY_NODE_CLOCK_NR - 1)] = now;
+			node_preempt_claim[nidx] = 0;
+			node_service_at[1][nidx] = now;
 			return;
 		}
 	}
@@ -898,14 +906,29 @@ void BPF_STRUCT_OPS(baby_tick, struct task_struct *p)
 					dsq_peek_allowed(fl_node2dsq(node), cpu);
 
 				if (head) {
-					u64 last = node_preempt_at;
+					u32 idx = (u32)node &
+						  (BABY_NODE_CLOCK_NR - 1);
+					u32 pid = (u32)head->pid;
+					u64 now32 = (u32)now | 1;
+					u64 claim = ((u64)pid << 32) | now32;
+					u64 old = node_preempt_claim[idx];
 
-					if (now - last >=
-					    BABY_TICK_PREEMPT_FALLBACK_NS &&
-					    __sync_bool_compare_and_swap(
-						    &node_preempt_at, last,
-						    now))
-						cri = true;
+					/*
+					 * Same waiter and inside the
+					 * quiet window: another CPU is
+					 * already in flight for it.
+					 * A new head, or a stale claim,
+					 * may claim at once.
+					 */
+					if (old == 0 ||
+					    (u32)(old >> 32) != pid ||
+					    (u32)(now32 - (u32)old) >=
+						    BABY_TICK_PREEMPT_FALLBACK_NS) {
+						if (__sync_bool_compare_and_swap(
+							    &node_preempt_claim[idx],
+							    old, claim))
+							cri = true;
+					}
 				}
 			}
 

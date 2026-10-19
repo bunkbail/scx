@@ -573,7 +573,8 @@ __hidden void cpuperf_on_idle(s32 cpu);
  * balance.bpf.c: the warm-seat balance under oversubscription.
  */
 __hidden bool balance_try_warm_seat(struct task_struct *p, struct task_ctx *tctx,
-			   u64 enq_flags, u64 backlog, u64 now);
+			   u64 enq_flags, u64 bulk_backlog, u64 fl_backlog,
+			   u64 now);
 
 /*
  * main.bpf.c: the hybrid LP-island guard: re-pick a confirmed idle

@@ -19,18 +19,19 @@
  * At full saturation the seat is harmful: with every CPU holding one
  * task, it freezes lane skew. Overloaded lanes rotate internally while
  * CPUs whose task blocked starve. The discriminator is the machine's
- * outstanding runnable work: running lanes plus everything queued,
- * shared or warm. The sum is conserved across the running-to-queued
- * transitions that race a bare nr_running gate, because a worker can
- * block between chunks and make nr_running dip. One lane of margin
- * keeps a transient two-deep queue at saturation from flipping the
- * mode back.
+ * outstanding runnable work, per lane: running lanes plus that lane's
+ * shared backlog and warm seats. The sum is conserved across the
+ * running-to-queued transitions that race a bare nr_running gate,
+ * because a worker can block between chunks and make nr_running dip.
+ * One lane of margin keeps a transient two-deep queue at saturation
+ * from flipping the mode back.
  *
  * Returns true when the task was seated on a warm queue; false leaves
  * the enqueue to the direct dispatch and the shared queue.
  */
 __hidden bool balance_try_warm_seat(struct task_struct *p, struct task_ctx *tctx,
-			   u64 enq_flags, u64 backlog, u64 now)
+			   u64 enq_flags, u64 bulk_backlog, u64 fl_backlog,
+			   u64 now)
 {
 	s32 prev_cpu = scx_bpf_task_cpu(p);
 
@@ -95,9 +96,9 @@ __hidden bool balance_try_warm_seat(struct task_struct *p, struct task_ctx *tctx
 		 * not be, and counting bulk residency against a
 		 * fast-lane-only workload closes the seats.
 		 */
-		if (nr_running + backlog + b_warm + (lat ? target_nr : 0) >
-			    nr_cpu_ids + 1 ||
-		    lat_running + backlog + q_warm > nr_cpu_ids + 1) {
+		if (nr_running + bulk_backlog + b_warm +
+			    (lat ? target_nr : 0) > nr_cpu_ids + 1 ||
+		    lat_running + fl_backlog + q_warm > nr_cpu_ids + 1) {
 			/*
 			 * A waking latency-critical task whose previous
 			 * CPU runs another latency-critical task gets an
@@ -110,18 +111,7 @@ __hidden bool balance_try_warm_seat(struct task_struct *p, struct task_ctx *tctx
 			 * no relocation happens there.
 			 */
 			u64 eff_nr = target_nr + (vlat ? 2 : 0);
-			/*
-			 * The depth rung is bulk-only: a non-foreground
-			 * latency-critical arrival granted four slices
-			 * becomes a long fast-lane resident that neither
-			 * the tick gate, the wake-path preempt nor a seat
-			 * relocation can cut. Foreground tasks get the
-			 * fourfold slice from task_slice() anyway.
-			 */
-			u64 slice = (!lat && (backlog_deep(backlog) ||
-					      target_nr >= 2)) ?
-				    4 * deadline_ns : task_slice(tctx);
-			u64 dsq;
+			u64 dsq, slice;
 
 			if (best != target && best_nr + 2 <= eff_nr) {
 				target = best;
@@ -134,6 +124,21 @@ __hidden bool balance_try_warm_seat(struct task_struct *p, struct task_ctx *tctx
 			} else if (stats_enabled) {
 				__sync_fetch_and_add(&nr_seat_self, 1);
 			}
+
+			/*
+			 * The depth rung is bulk-only and is decided on the
+			 * seat the task actually joins: a non-foreground
+			 * latency-critical arrival granted four slices
+			 * becomes a long fast-lane resident that neither
+			 * the tick gate, the wake-path preempt nor a seat
+			 * relocation can cut, and a tick-preempted victim
+			 * did not earn the rung. Foreground tasks get the
+			 * fourfold slice from task_slice() anyway.
+			 */
+			slice = (!lat && !tctx->tick_preempted &&
+				 (backlog_deep(bulk_backlog) ||
+				  target_nr >= 2)) ?
+				4 * deadline_ns : task_slice(tctx);
 
 			dsq = lat ? fl_cpu2dsq(target) : cpu2dsq(target);
 			/*
