@@ -423,10 +423,12 @@ s32 BPF_STRUCT_OPS(baby_select_cpu, struct task_struct *p,
 		 *
 		 * SCX_ENQ_PREEMPT puts the wakee at the head of the local
 		 * DSQ, zeroes the victim's slice and reschedules. The
-		 * victim is requeued at the local DSQ head through
-		 * SCX_ENQ_HEAD; ops.enqueue() is not called for it, so the
-		 * deep-backlog rung and the tick_preempted mark do not
-		 * apply to it.
+		 * victim goes through ops.enqueue() with its running bit
+		 * still set, so it takes the natural-expiry path there: a
+		 * fresh deadline, and the deep-backlog rung when the bulk
+		 * backlog is deep. Only a preemption by a higher sched
+		 * class leaves the victim parked at the local DSQ head
+		 * without an enqueue.
 		 */
 		struct task_struct *curr;
 		struct task_ctx *cctx;
@@ -446,11 +448,12 @@ s32 BPF_STRUCT_OPS(baby_select_cpu, struct task_struct *p,
 		/*
 		 * A bulk head in the warm seat cannot hide the wakee: it
 		 * runs on its own fast-lane seat, so only a fast-lane
-		 * waiter blocks the preempt. Starvation is self-bounded:
-		 * the displaced victim sits in SCX_DSQ_LOCAL (blocking a
-		 * second preempt via LOCAL_BUSY) and gets a fresh 200us
-		 * residency stamp when it resumes. The quota takes no
-		 * part here: the preempt happens between dispatches.
+		 * waiter blocks the preempt. Repetition is bounded by the
+		 * latency-critical victim refusal below and by the 200us
+		 * residency stamp; the displaced victim is requeued
+		 * through the natural-expiry path in ops.enqueue(). The
+		 * quota takes no part here: the preempt happens between
+		 * dispatches.
 		 */
 		if (scx_bpf_dsq_nr_queued(fl_cpu2dsq(prev_cpu))) {
 			tctx->wake_gate_miss = BABY_WG_M3_SEAT_BUSY;
