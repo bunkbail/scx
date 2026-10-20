@@ -150,8 +150,10 @@ static __always_inline void refill_fl_budget(u32 idx, u64 now)
 static __always_inline bool bulk_waiting(s32 cpu)
 {
 	s32 node = __COMPAT_scx_bpf_cpu_node(cpu);
+	u32 idx = (u32)cpu & (BABY_MAX_CPUS - 1);
 
-	return scx_bpf_dsq_nr_queued(cpu2dsq(cpu)) ||
+	return (seat_used[0][idx] &&
+		scx_bpf_dsq_nr_queued(cpu2dsq(cpu))) ||
 	       scx_bpf_dsq_nr_queued(node);
 }
 
@@ -646,7 +648,7 @@ void BPF_STRUCT_OPS(baby_enqueue, struct task_struct *p, u64 enq_flags)
 		 * Seed the rescue clock when the lane's shared queue was
 		 * empty; a queue that is already served does not need it.
 		 */
-		if (!scx_bpf_dsq_nr_queued(dsq))
+		if (!lane_backlog)
 			node_service_at[lat & 1][node &
 						 (BABY_NODE_CLOCK_NR - 1)] = now;
 
@@ -688,7 +690,7 @@ void BPF_STRUCT_OPS(baby_dispatch, s32 cpu, struct task_struct *prev)
 	struct task_struct *fl_wq, *fl_q, *wq, *q;
 	u64 fl_wq_dl, fl_g_dl, wq_dl, g_dl, fl_dl, bulk_dl, best_dl;
 	u64 now = bpf_ktime_get_ns();
-	bool has_fl, has_bulk, serve_fl;
+	bool has_fl, has_bulk, fl_allowed, serve_fl;
 
 	census_sample(cpu);
 	refill_fl_budget(idx, now);
@@ -726,30 +728,30 @@ void BPF_STRUCT_OPS(baby_dispatch, s32 cpu, struct task_struct *prev)
 	 */
 	if (!has_bulk && fl_budget_ns[idx] < 0)
 		fl_budget_ns[idx] = 0;
-	serve_fl = has_fl && (!has_bulk || fl_budget_ns[idx] > 0);
+	fl_allowed = !has_bulk || fl_budget_ns[idx] > 0;
+	serve_fl = has_fl && fl_allowed;
 
 	if (need_running && tctx && !tctx->yield_pending) {
 		/*
 		 * Keep the current task only while its deadline beats the
 		 * earliest head of the lane that would run next; ties go to
 		 * the waiter. A yielding task has given the round up. The
-		 * quota has the last word over a latency-critical resident:
-		 * once its streak is spent and bulk work waits, the resident
-		 * rotates like any other task. A bulk task cannot keep the
-		 * CPU out of turn when the fast lane is served either; that
-		 * is the budget's business.
+		 * budget has the last word over a latency-critical resident:
+		 * when it is spent and bulk work waits, the resident rotates
+		 * like any other task. A bulk task cannot keep the CPU out of
+		 * turn when the fast lane is served either.
 		 */
-		if (!serve_fl && has_bulk && is_lat_cri(tctx)) {
-			best_dl = 0;
-		} else if (serve_fl && !is_lat_cri(tctx)) {
-			best_dl = 0;
-		} else if (serve_fl) {
-			best_dl = fl_dl;
+		bool keep_ok;
+
+		if (is_lat_cri(tctx)) {
+			keep_ok = fl_allowed;
+			best_dl = has_fl ? fl_dl : 0;
 		} else {
+			keep_ok = !serve_fl;
 			best_dl = bulk_dl;
 		}
 
-		if (best_dl) {
+		if (keep_ok) {
 			/*
 			 * Compare before renewing: a resident whose
 			 * deadline is due still owns its turn against a
@@ -758,7 +760,8 @@ void BPF_STRUCT_OPS(baby_dispatch, s32 cpu, struct task_struct *prev)
 			 * ops.stopping(), so renew the deadline and
 			 * restamp the per-CPU state inside the branch.
 			 */
-			if ((s64)(tctx->deadline - best_dl) < 0) {
+			if (!best_dl ||
+			    (s64)(tctx->deadline - best_dl) < 0) {
 				if (reached_deadline(tctx, now))
 					tctx->deadline = calc_deadline(prev, tctx, now);
 				/*
