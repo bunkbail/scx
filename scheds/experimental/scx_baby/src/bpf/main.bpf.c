@@ -145,12 +145,27 @@ static __always_inline void refill_fl_budget(u32 idx, u64 now)
 }
 
 /*
- * Charge the fast-lane runtime consumed since the last accounting
- * point. The charge is capped at one fourfold slice, the longest a
- * fast-lane task can run without a tick, so a stale stamp cannot
- * clear the bucket in one go. The debt floor is two base slices.
+ * Whether bulk work waits for a CPU: its own seat or the node queue.
  */
-static __always_inline void charge_fl_runtime(u32 idx, u64 now)
+static __always_inline bool bulk_waiting(s32 cpu)
+{
+	s32 node = __COMPAT_scx_bpf_cpu_node(cpu);
+
+	return scx_bpf_dsq_nr_queued(cpu2dsq(cpu)) ||
+	       scx_bpf_dsq_nr_queued(node);
+}
+
+/*
+ * Charge the fast-lane runtime consumed since the last accounting
+ * point. Only a contested interval debits the bucket: while no bulk
+ * work waits, the fast lane runs freely and must not bank debt that
+ * would stall it the moment bulk appears. The charge is capped at one
+ * fourfold slice, the longest a fast-lane task can run without a tick,
+ * so a stale stamp cannot clear the bucket in one go. The debt floor
+ * is two base slices.
+ */
+static __always_inline void charge_fl_runtime(u32 idx, u64 now,
+					      bool contended)
 {
 	u64 started = cpu_fl_running_at[idx];
 	s64 floor = -(s64)(2 * deadline_ns);
@@ -163,7 +178,8 @@ static __always_inline void charge_fl_runtime(u32 idx, u64 now)
 	ran = now - started;
 	if (ran > 4 * deadline_ns)
 		ran = 4 * deadline_ns;
-	fl_budget_ns[idx] = MAX(fl_budget_ns[idx] - (s64)ran, floor);
+	if (contended)
+		fl_budget_ns[idx] = MAX(fl_budget_ns[idx] - (s64)ran, floor);
 	cpu_fl_running_at[idx] = now;
 }
 
@@ -538,18 +554,19 @@ void BPF_STRUCT_OPS(baby_enqueue, struct task_struct *p, u64 enq_flags)
 						      bulk_backlog;
 
 		tctx->deadline = now + (lane_backlog + 1) * deadline_ns;
-	} else if (!is_running &&
+	} else if ((!is_running || !tctx->tick_preempted) &&
 		   !(enq_flags & (SCX_ENQ_LAST | SCX_ENQ_WAKEUP |
 				  SCX_ENQ_REENQ))) {
 		/*
-		 * A migrated or freshly created task gets a fresh deadline.
-		 * A rotation requeue keeps the deadline ops.stopping()
-		 * left it with: renewed if it was reached, otherwise the
-		 * task's own, still-unexpired deadline, so a waiting
-		 * deadline ages across rotations. Woken tasks keep the
-		 * sleep-time deadline, a cpu_release() requeue keeps its
-		 * place, and SCX_ENQ_LAST is the same task re-entering
-		 * after an empty dispatch.
+		 * A migrated or freshly created task gets a fresh deadline,
+		 * and so does a rotation whose slice expired naturally: it
+		 * consumed the slice it was granted, so the fresh deadline
+		 * is its next turn. Only a task cut short by the tick keeps
+		 * the deadline ops.stopping() left it with, so its
+		 * remaining turn ages instead of being recomputed. Woken
+		 * tasks keep the sleep-time deadline, a cpu_release()
+		 * requeue keeps its place, and SCX_ENQ_LAST is the same
+		 * task re-entering after an empty dispatch.
 		 */
 		tctx->deadline = calc_deadline(p, tctx, now);
 	}
@@ -703,6 +720,12 @@ void BPF_STRUCT_OPS(baby_dispatch, s32 cpu, struct task_struct *prev)
 	bulk_dl = MIN(wq_dl, g_dl);
 	has_fl = fl_dl != ULLONG_MAX;
 	has_bulk = bulk_dl != ULLONG_MAX;
+	/*
+	 * An uncontested interval must not leave debt behind: the fast
+	 * lane ran freely, so clear what an earlier contention left.
+	 */
+	if (!has_bulk && fl_budget_ns[idx] < 0)
+		fl_budget_ns[idx] = 0;
 	serve_fl = has_fl && (!has_bulk || fl_budget_ns[idx] > 0);
 
 	if (need_running && tctx && !tctx->yield_pending) {
@@ -761,7 +784,8 @@ void BPF_STRUCT_OPS(baby_dispatch, s32 cpu, struct task_struct *prev)
 					u64 grant = task_slice(tctx);
 
 					if (is_lat_cri(tctx))
-						charge_fl_runtime(idx, now);
+						charge_fl_runtime(idx, now,
+								  has_bulk);
 					scx_bpf_task_set_slice(prev, grant);
 				}
 				if (stats_enabled)
@@ -906,7 +930,7 @@ void BPF_STRUCT_OPS(baby_dispatch, s32 cpu, struct task_struct *prev)
 			cpu_running_at[idx] = now;
 			cpu_is_lat[idx] = is_lat_cri(tctx);
 			if (cpu_is_lat[idx])
-				charge_fl_runtime(idx, now);
+				charge_fl_runtime(idx, now, has_bulk);
 		}
 		scx_bpf_task_set_slice(prev,
 				       tctx ? task_slice(tctx) : deadline_ns);
@@ -955,15 +979,16 @@ void BPF_STRUCT_OPS(baby_tick, struct task_struct *p)
 
 	/*
 	 * Keep the fast-lane budget current: a tick inside a long
-	 * fast-lane slice accounts the runtime since the last charge
-	 * point, so the stop that follows charges only the remainder.
+	 * fast-lane slice accounts the contested runtime since the last
+	 * charge point, so the stop that follows charges only the
+	 * remainder.
 	 */
 	if (is_lat_cri(tctx)) {
 		s32 cpu = scx_bpf_task_cpu(p);
 		u32 idx = (u32)cpu & (BABY_MAX_CPUS - 1);
 
 		refill_fl_budget(idx, now);
-		charge_fl_runtime(idx, now);
+		charge_fl_runtime(idx, now, bulk_waiting(cpu));
 	}
 
 	update_bursts(tctx, now);
@@ -1076,14 +1101,15 @@ void BPF_STRUCT_OPS(baby_stopping, struct task_struct *p, bool runnable)
 		u32 idx = (u32)last_cpu & (BABY_MAX_CPUS - 1);
 
 		/*
-		 * Account the fast-lane runtime actually consumed and
-		 * refill the elapsed-time credit before the residency
-		 * lapses; the two together leave the bucket one third of
-		 * the runtime lower, the bulk share the budget promises.
+		 * Account the contested fast-lane runtime actually
+		 * consumed and refill the elapsed-time credit before the
+		 * residency lapses; under contention the two together
+		 * leave the bucket one third of the runtime lower, the
+		 * bulk share the budget promises.
 		 */
 		if (cpu_is_lat[idx]) {
 			refill_fl_budget(idx, now);
-			charge_fl_runtime(idx, now);
+			charge_fl_runtime(idx, now, bulk_waiting(last_cpu));
 		}
 		cpu_is_lat[idx] = false;
 		cpu_fl_running_at[idx] = 0;

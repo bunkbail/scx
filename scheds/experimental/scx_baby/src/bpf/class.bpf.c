@@ -275,15 +275,15 @@ __hidden void class_boost_on_sleep(struct task_struct *p, struct task_ctx *tctx,
 
 /*
  * set_next_entity(): a task picked with a deadline that is already behind
- * gets a fresh one, for tasks whose effective nice is zero or above.
- * The effective nice includes the earned boost; a boosted task is
- * already inside its shorter deadline and renewing it again at run
- * start would only push it behind the tasks the boost exists to beat.
+ * gets a fresh one. The queue wait is over by the time the task runs, so
+ * the deadline must move into the future; otherwise the stop that follows
+ * sees an expired deadline, overwrites the run's start with the stop time,
+ * and a sub-tick burst can never measure itself or earn a boost.
  */
 __hidden void class_on_running(struct task_struct *p, struct task_ctx *tctx,
 			       u64 now)
 {
-	if (task_nice(p, tctx) >= 0 && reached_deadline(tctx, now))
+	if (reached_deadline(tctx, now))
 		tctx->deadline = calc_deadline(p, tctx, now);
 }
 

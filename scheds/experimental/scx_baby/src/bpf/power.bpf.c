@@ -93,33 +93,40 @@ static void update_cpuperf(struct cpu_ctx *cctx, s32 cpu, u64 now, bool max_floo
 	u64 perf_lvl, delta_runtime, delta_t;
 
 	delta_t = now - cctx->last_running;
-	if (!delta_t)
-		return;
+	if (delta_t) {
+		/*
+		 * The utilization window cannot predate the last few
+		 * slices: runtime charged before a sleep is recent
+		 * history, not a load spike to average away. Without the
+		 * cap a wake after a short sleep divides that runtime by
+		 * the whole sleep and the floor collapses, so a task
+		 * that blocks between chunks never holds its boost clock.
+		 */
+		if (delta_t > 4 * deadline_ns)
+			delta_t = 4 * deadline_ns;
 
-	/*
-	 * The utilization window cannot predate the last few slices:
-	 * runtime charged before a sleep is recent history, not a load
-	 * spike to average away. Without the cap a wake after a short
-	 * sleep divides that runtime by the whole sleep and the floor
-	 * collapses, so a task that blocks between chunks never holds
-	 * its boost clock.
-	 */
-	if (delta_t > 4 * deadline_ns)
-		delta_t = 4 * deadline_ns;
-
-	/*
-	 * Evaluate the CPU utilization of the last window, normalized in
-	 * the range [0 .. SCX_CPUPERF_ONE].
-	 */
-	delta_runtime = cctx->tot_runtime - cctx->prev_runtime;
-	perf_lvl = MIN(delta_runtime * SCX_CPUPERF_ONE / delta_t,
-		       SCX_CPUPERF_ONE);
+		/*
+		 * Evaluate the CPU utilization of the last window,
+		 * normalized in the range [0 .. SCX_CPUPERF_ONE].
+		 */
+		delta_runtime = cctx->tot_runtime - cctx->prev_runtime;
+		perf_lvl = MIN(delta_runtime * SCX_CPUPERF_ONE / delta_t,
+			       SCX_CPUPERF_ONE);
+	} else {
+		/*
+		 * A run that opens a fresh window after a long idle has
+		 * no elapsed time yet. Its utilization is zero, but the
+		 * floor below must still be applied: the idle path just
+		 * dropped the request to zero.
+		 */
+		perf_lvl = 0;
+	}
 
 	/*
 	 * Smooth the target performance level, so that short spikes are
 	 * absorbed while load variations still react quickly.
 	 */
-	cctx->perf_lvl = calc_avg(cctx->perf_lvl, perf_lvl);
+	cctx->perf_lvl = calc_avg(perf_lvl, cctx->perf_lvl);
 
 	if (max_floor)
 		perf_lvl = SCX_CPUPERF_ONE;
