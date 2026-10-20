@@ -723,13 +723,17 @@ mod tests {
 
     #[test]
     fn woke_task_keeps_interactive_through_a_zero_window() {
-        // Mirror of is_interactive: a task with a zero previous burst
-        // stays interactive once it has four wake samples.
+        // Mirror of is_interactive: runtime in either window, or four
+        // wake samples, keeps a task interactive; a fresh hog is
+        // rejected by the burst bound.
         fn interactive(prev: u64, curr: u64, samples: u32) -> bool {
-            (prev > 0 || samples >= 4) && prev < 50_000_000 && curr < 50_000_000
+            (prev > 0 || curr > 0 || samples >= 4)
+                && prev < 50_000_000
+                && curr < 50_000_000
         }
         assert!(interactive(0, 10_000_000, 4));
-        assert!(!interactive(0, 10_000_000, 0));
+        assert!(interactive(0, 10_000_000, 0));
+        assert!(!interactive(0, 60_000_000, 0));
         assert!(!interactive(60_000_000, 10_000_000, 4));
     }
 

@@ -135,13 +135,15 @@ __hidden bool can_resched(const struct task_ctx *tctx)
 __hidden bool is_interactive(const struct task_ctx *tctx)
 {
 	/*
-	 * A task that has just been sampled as a waker keeps the class
-	 * through a window whose previous burst is zero (a fresh task, or
-	 * a task that slept or waited through a window). Without the
-	 * wake-sample arm, a waker would fall out of the class for the
-	 * first window after every long wait.
+	 * A task with runtime in either window has shown it does real
+	 * work, so it may preempt on wakeup; a fresh process in its first
+	 * window is included, or short-lived helpers would queue behind
+	 * long-running bulk work until their second window. The burst
+	 * bounds reject a fresh hog, and the wake-sample arm keeps a
+	 * waker in the class through a window whose previous burst is
+	 * zero (a task that slept or waited through a window).
 	 */
-	return (tctx->prev_bursts > 0 ||
+	return (tctx->prev_bursts > 0 || tctx->bursts > 0 ||
 		tctx->wake_samples >= WAKE_SANE_MIN) &&
 	       tctx->prev_bursts < TIME_PERIOD / 4 &&
 	       tctx->bursts < TIME_PERIOD / 4;
