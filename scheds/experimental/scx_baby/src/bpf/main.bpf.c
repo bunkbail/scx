@@ -580,6 +580,17 @@ void BPF_STRUCT_OPS(baby_enqueue, struct task_struct *p, u64 enq_flags)
 	}
 
 	/*
+	 * A latency-critical task that is requeued while it still owns the
+	 * CPU (a wake-preempt or a timer cut) or comes back from an RT
+	 * lease keeps that CPU as its home. baby_dispatch() lets the home
+	 * CPU take it back whatever the budget, so a displaced resident
+	 * waits for its own CPU instead of another CPU's tick.
+	 */
+	if (is_lat_cri(tctx) &&
+	    (is_running || (enq_flags & SCX_ENQ_REENQ)))
+		tctx->last_cpu = prev_cpu;
+
+	/*
 	 * check_preempt_wakeup(): preempt the previous CPU's task when the
 	 * waker has an earlier deadline and no lower priority, provided
 	 * the CPU has no warm backlog and the running task passes
@@ -736,6 +747,21 @@ void BPF_STRUCT_OPS(baby_dispatch, s32 cpu, struct task_struct *prev)
 		fl_budget_ns[idx] = 0;
 	fl_allowed = !has_bulk || fl_budget_ns[idx] > 0;
 	serve_fl = has_fl && fl_allowed;
+
+	/*
+	 * A fast-lane head this CPU was running when it was displaced is
+	 * served back even with the budget spent: the CPU takes back its
+	 * own resident instead of making it wait for another CPU's tick.
+	 */
+	if (has_fl && !fl_allowed) {
+		struct task_struct *head = (fl_g_dl < fl_wq_dl) ? fl_q : fl_wq;
+		struct task_ctx *hctx = head ? try_lookup_task_ctx(head) : NULL;
+
+		if (hctx && hctx->last_cpu == cpu) {
+			fl_allowed = true;
+			serve_fl = true;
+		}
+	}
 
 	if (need_running && tctx && !tctx->yield_pending) {
 		/*
