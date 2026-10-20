@@ -128,6 +128,20 @@ static s64 fl_budget_ns[BABY_MAX_CPUS];
 static u64 fl_budget_at[BABY_MAX_CPUS];
 static u64 cpu_fl_running_at[BABY_MAX_CPUS];
 
+/*
+ * Bulk backstop: the longest a CPU may run nothing but the fast lane
+ * while bulk work waits for it. The time budget alone cannot bound
+ * this: its credit is wall time, so a supply of fast-lane work that
+ * switches often enough keeps the credit ahead of the charges. A bulk
+ * task pinned to the CPU then waits behind a lane no other CPU can
+ * pull, and the kernel's runnable-task watchdog unloads the scheduler
+ * after five seconds. When the stamp is older than the bound, the
+ * dispatcher serves bulk whatever the budget says.
+ */
+#define BABY_BULK_BACKSTOP_NS	(20ULL * NSEC_PER_MSEC)
+
+static u64 cpu_bulk_at[BABY_MAX_CPUS];
+
 static __always_inline void refill_fl_budget(u32 idx, u64 now)
 {
 	u64 elapsed = now - fl_budget_at[idx];
@@ -749,11 +763,23 @@ void BPF_STRUCT_OPS(baby_dispatch, s32 cpu, struct task_struct *prev)
 	serve_fl = has_fl && fl_allowed;
 
 	/*
-	 * A fast-lane head this CPU was running when it was displaced is
-	 * served back even with the budget spent: the CPU takes back its
-	 * own resident instead of making it wait for another CPU's tick.
+	 * Bulk backstop (see cpu_bulk_at): a CPU that has run nothing but
+	 * the fast lane for a full bound serves bulk now, whatever the
+	 * budget or a home head says. Pinned bulk work has no other CPU
+	 * to run on, so the alternative is the kernel's stall watchdog.
 	 */
-	if (has_fl && !fl_allowed) {
+	if (has_bulk && now - cpu_bulk_at[idx] > BABY_BULK_BACKSTOP_NS) {
+		if (stats_enabled && has_fl)
+			__sync_fetch_and_add(&nr_bulk_backstop, 1);
+		fl_allowed = false;
+		serve_fl = false;
+	} else if (has_fl && !fl_allowed) {
+		/*
+		 * A fast-lane head this CPU was running when it was
+		 * displaced is served back even with the budget spent: the
+		 * CPU takes back its own resident instead of making it wait
+		 * for another CPU's tick.
+		 */
 		struct task_struct *head = (fl_g_dl < fl_wq_dl) ? fl_q : fl_wq;
 		struct task_ctx *hctx = head ? try_lookup_task_ctx(head) : NULL;
 
@@ -809,6 +835,8 @@ void BPF_STRUCT_OPS(baby_dispatch, s32 cpu, struct task_struct *prev)
 				tctx->last_cpu = cpu;
 				cpu_running_at[idx] = now;
 				cpu_is_lat[idx] = is_lat_cri(tctx);
+				if (!cpu_is_lat[idx])
+					cpu_bulk_at[idx] = now;
 				/*
 				 * The cpuperf ledger is deliberately left
 				 * alone: ticks advance it, and charging the
@@ -979,6 +1007,8 @@ void BPF_STRUCT_OPS(baby_dispatch, s32 cpu, struct task_struct *prev)
 			cpu_is_lat[idx] = is_lat_cri(tctx);
 			if (cpu_is_lat[idx])
 				charge_fl_runtime(idx, now, has_bulk);
+			else
+				cpu_bulk_at[idx] = now;
 		}
 		scx_bpf_task_set_slice(prev,
 				       tctx ? task_slice(tctx) : deadline_ns);
@@ -1237,6 +1267,8 @@ void BPF_STRUCT_OPS(baby_running, struct task_struct *p)
 
 		cpu_running_at[cpu_idx] = now;
 		cpu_is_lat[cpu_idx] = tctx && is_lat_cri(tctx);
+		if (!cpu_is_lat[cpu_idx])
+			cpu_bulk_at[cpu_idx] = now;
 		/*
 		 * Start the fast-lane runtime clock; a bulk run clears it
 		 * so a later stop has nothing to charge.

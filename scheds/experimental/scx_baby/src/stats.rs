@@ -663,6 +663,8 @@ pub struct Metrics {
     pub nr_depth1_pulls: u64,
     #[stat(desc = "Fast-lane warm-seat pulls while bulk work waited")]
     pub nr_depth1_pulls_seat: u64,
+    #[stat(desc = "Dispatches where the bulk backstop withheld the fast lane")]
+    pub nr_bulk_backstop: u64,
     #[stat(desc = "Lat-cri wakees preempting a running non-lat-cri victim at wake")]
     pub nr_wake_preempts: u64,
     #[stat(desc = "Direct dispatches to an idle CPU, by distance")]
@@ -717,7 +719,7 @@ impl Metrics {
         }
         writeln!(
             w,
-            "[{}] tasks -> r: {:>2} | dispatch -> d: {:<5} s: {:<5} | preempt: {:<5} tick: {:<4}+{:<4} | d1pull: {:<4}+{:<4} | wkpre: {:<5} | boost: {:<4} | sticky: {:<5} | warm: {:<5} | cold: {:<5}",
+            "[{}] tasks -> r: {:>2} | dispatch -> d: {:<5} s: {:<5} | preempt: {:<5} tick: {:<4}+{:<4} | d1pull: {:<4}+{:<4} | bkstop: {:<4} | wkpre: {:<5} | boost: {:<4} | sticky: {:<5} | warm: {:<5} | cold: {:<5}",
             crate::SCHEDULER_NAME,
             self.nr_running,
             self.nr_direct_dispatches,
@@ -727,6 +729,7 @@ impl Metrics {
             self.nr_tick_preempts_warm,
             self.nr_depth1_pulls,
             self.nr_depth1_pulls_seat,
+            self.nr_bulk_backstop,
             self.nr_wake_preempts,
             self.nr_boosts,
             self.nr_sticky,
@@ -962,6 +965,7 @@ impl Metrics {
             nr_depth1_pulls_seat: self
                 .nr_depth1_pulls_seat
                 .saturating_sub(rhs.nr_depth1_pulls_seat),
+            nr_bulk_backstop: self.nr_bulk_backstop.saturating_sub(rhs.nr_bulk_backstop),
             nr_wake_preempts: self.nr_wake_preempts.saturating_sub(rhs.nr_wake_preempts),
             nr_land: self.nr_land.sub(&rhs.nr_land),
             nr_wake_land: self.nr_wake_land.sub(&rhs.nr_wake_land),

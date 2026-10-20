@@ -265,6 +265,13 @@ extern volatile u64 nr_tick_preempts, nr_tick_preempts_warm;
 extern volatile u64 nr_depth1_pulls, nr_depth1_pulls_seat;
 
 /*
+ * Dispatches where the bulk backstop withheld a fast-lane task: the
+ * CPU had served only the fast lane for the whole bound while bulk
+ * work waited for it.
+ */
+extern volatile u64 nr_bulk_backstop;
+
+/*
  * Wake-path preempts: latency-critical wakees handed a busy CPU at wake
  * time, preempting a non-latency-critical victim instead of waiting for
  * the tick.
@@ -396,10 +403,14 @@ struct task_ctx {
 	bool tick_preempted;
 
 	/*
-	 * The CPU the task last entered ops.running() on. ops.stopping()
-	 * can run on the task's new CPU after a migration, so the
-	 * per-CPU state the run stamped must be cleared through the CPU
-	 * that stamped it, not through scx_bpf_task_cpu().
+	 * The CPU the task last ran on, or the CPU an RT lease
+	 * reenqueued it from. ops.enqueue() also sets it for a
+	 * latency-critical task requeued while it still owns the CPU, so
+	 * dispatch can serve that task back on its home CPU.
+	 * ops.stopping() can run on the task's new CPU after a
+	 * migration, so the per-CPU state the run stamped must be
+	 * cleared through the CPU that stamped it, not through
+	 * scx_bpf_task_cpu().
 	 */
 	s32 last_cpu;
 };

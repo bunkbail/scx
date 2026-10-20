@@ -51,6 +51,12 @@ volatile u64 nr_tick_preempts, nr_tick_preempts_warm;
 volatile u64 nr_depth1_pulls, nr_depth1_pulls_seat;
 
 /*
+ * Dispatches where the bulk backstop withheld a fast-lane task because
+ * the CPU had served only the fast lane for the whole bound.
+ */
+volatile u64 nr_bulk_backstop;
+
+/*
  * Wake-path preempts: latency-critical wakees handed a busy CPU at wake
  * time, preempting a non-latency-critical victim instead of waiting for
  * the tick.
