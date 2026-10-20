@@ -1417,8 +1417,10 @@ s32 BPF_STRUCT_OPS(baby_init_task, struct task_struct *p,
  * moved under it, strands its tasks where the rest of the machine
  * cannot see them. A queue that has held work this long without a
  * successful pull is overdue by far more than a warm wait; re-enqueue
- * it. The kernel watchdog unloads the scheduler five seconds after a
- * queued task stops being consumable, so this fires well before that.
+ * it. This does not save a task pinned to a queue no CPU can pull: the
+ * re-enqueue lands it in the same queue. Dispatch's bulk backstop
+ * keeps such a CPU serving bulk, and this timer only returns work
+ * whose queue lost its server.
  */
 #define STARVE_RESCUE_NS	1000000000ull
 
