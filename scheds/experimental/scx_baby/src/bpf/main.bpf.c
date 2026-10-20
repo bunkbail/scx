@@ -99,7 +99,10 @@ static u64 node_preempt_claim[BABY_NODE_CLOCK_NR];
  * without a successful pull is re-enqueued. The clock is seeded when
  * the queue becomes non-empty and advanced on every successful pull,
  * so a continuously served queue never looks starved and a newly
- * populated one does not inherit the clock of the queue's birth.
+ * populated one does not inherit the clock of the queue's birth. The
+ * node clocks are shared by every CPU on the node, so their pulls
+ * advance them at most once per millisecond; the one-second window
+ * cannot tell. The per-CPU seat clocks stay exact.
  */
 u64 seat_service_at[2][BABY_MAX_CPUS];
 u64 node_service_at[2][BABY_NODE_CLOCK_NR];
@@ -812,8 +815,11 @@ void BPF_STRUCT_OPS(baby_dispatch, s32 cpu, struct task_struct *prev)
 			s32 from = fl_q ? scx_bpf_task_cpu(fl_q) : -1;
 
 			if (scx_bpf_dsq_move_to_local(fl_node_dsq, 0)) {
-				node_preempt_claim[nidx] = 0;
-				node_service_at[1][nidx] = now;
+				if (node_preempt_claim[nidx])
+					node_preempt_claim[nidx] = 0;
+				if (now - node_service_at[1][nidx] >
+				    NSEC_PER_MSEC)
+					node_service_at[1][nidx] = now;
 				if (has_bulk) {
 					if (stats_enabled)
 						__sync_fetch_and_add(
@@ -840,8 +846,11 @@ void BPF_STRUCT_OPS(baby_dispatch, s32 cpu, struct task_struct *prev)
 			return;
 		}
 		if (scx_bpf_dsq_move_to_local(fl_node_dsq, 0)) {
-			node_preempt_claim[nidx] = 0;
-			node_service_at[1][nidx] = now;
+			if (node_preempt_claim[nidx])
+				node_preempt_claim[nidx] = 0;
+			if (now - node_service_at[1][nidx] >
+			    NSEC_PER_MSEC)
+				node_service_at[1][nidx] = now;
 			if (has_bulk) {
 				if (stats_enabled)
 					__sync_fetch_and_add(
@@ -866,7 +875,9 @@ void BPF_STRUCT_OPS(baby_dispatch, s32 cpu, struct task_struct *prev)
 		s32 from = q ? scx_bpf_task_cpu(q) : -1;
 
 		if (scx_bpf_dsq_move_to_local(node, 0)) {
-			node_service_at[0][nidx] = now;
+			if (now - node_service_at[0][nidx] >
+			    NSEC_PER_MSEC)
+				node_service_at[0][nidx] = now;
 			if (stats_enabled)
 				__sync_fetch_and_add(
 					&nr_pull_land[cpu_dist(cpu, from)], 1);
@@ -888,7 +899,9 @@ void BPF_STRUCT_OPS(baby_dispatch, s32 cpu, struct task_struct *prev)
 			return;
 		}
 		if (scx_bpf_dsq_move_to_local(node, 0)) {
-			node_service_at[0][nidx] = now;
+			if (now - node_service_at[0][nidx] >
+			    NSEC_PER_MSEC)
+				node_service_at[0][nidx] = now;
 			return;
 		}
 	}
@@ -910,8 +923,11 @@ void BPF_STRUCT_OPS(baby_dispatch, s32 cpu, struct task_struct *prev)
 			return;
 		}
 		if (scx_bpf_dsq_move_to_local(fl_node_dsq, 0)) {
-			node_preempt_claim[nidx] = 0;
-			node_service_at[1][nidx] = now;
+			if (node_preempt_claim[nidx])
+				node_preempt_claim[nidx] = 0;
+			if (now - node_service_at[1][nidx] >
+			    NSEC_PER_MSEC)
+				node_service_at[1][nidx] = now;
 			return;
 		}
 	}
