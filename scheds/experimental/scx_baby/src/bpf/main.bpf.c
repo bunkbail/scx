@@ -455,8 +455,8 @@ s32 BPF_STRUCT_OPS(baby_select_cpu, struct task_struct *p,
 		 * latency-critical victim refusal below and by the 200us
 		 * residency stamp; the displaced victim is requeued
 		 * through the natural-expiry path in ops.enqueue(). The
-		 * quota takes no part here: the preempt happens between
-		 * dispatches.
+		 * time budget takes no part here: the preempt happens
+		 * between dispatches.
 		 */
 		if (scx_bpf_dsq_nr_queued(fl_cpu2dsq(prev_cpu))) {
 			tctx->wake_gate_miss = BABY_WG_M3_SEAT_BUSY;
@@ -643,7 +643,7 @@ void BPF_STRUCT_OPS(baby_enqueue, struct task_struct *p, u64 enq_flags)
 	 * No idle CPU: join the deadline order. A deep backlog grants the
 	 * fourfold slice; a tick-preempted victim keeps the base slice.
 	 * Latency-critical tasks use their own node queue, which dispatch
-	 * serves ahead of bulk under the quota.
+	 * serves ahead of bulk while the time budget allows.
 	 */
 	{
 		bool lat = is_lat_cri(tctx);
@@ -1026,9 +1026,9 @@ void BPF_STRUCT_OPS(baby_tick, struct task_struct *p)
 	 * victim's residency comes from its ops.running() stamp; the
 	 * waiter is any non-empty fast lane: this CPU's seat, or the
 	 * fast-lane node queue under the one-CPU-at-a-time stamp. The
-	 * quota takes no part: the tick fires between dispatches, and
-	 * counting it would black the lane out with no dispatch to reset
-	 * it. baby_dispatch() owns the quota.
+	 * time budget takes no part: the tick fires between dispatches,
+	 * and counting it would black the lane out with no dispatch to
+	 * reset it. baby_dispatch() owns the budget.
 	 */
 	if (!is_lat_cri(tctx)) {
 		s32 cpu = scx_bpf_task_cpu(p);

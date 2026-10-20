@@ -27,7 +27,7 @@ per-CPU warm seat that parks an arrival on the CPU it last ran on while the
 machine is oversubscribed. The fast lane carries tasks classified
 latency-critical by wake rate, in a queue pair beside the bulk one, so a
 game thread's wake never waits behind a batch slice. Dispatch arbitrates
-the lanes with a per-CPU quota so neither starves.
+the lanes with a per-CPU time budget so neither starves.
 
 Task classes are measured, not declared. A task's runtime history and its
 wake frequency set its slice length, its wake-preemption eligibility and

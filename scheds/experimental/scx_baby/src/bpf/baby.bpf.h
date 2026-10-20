@@ -30,7 +30,7 @@
  * same layout one id space over (the fast lane): a per-node queue from
  * BABY_FL_NODE_DSQ_BASE and per-CPU seats from BABY_FL_CPU_DSQ_BASE.
  * Keeping the class out of the bulk seats lets the wake-path preempt
- * fire past an occupied bulk seat, and a per-CPU dispatch quota bounds
+ * fire past an occupied bulk seat, and a per-CPU time budget bounds
  * what the fast lane can take from a contended CPU.
  */
 
@@ -258,8 +258,9 @@ extern volatile u64 nr_tick_preempts, nr_tick_preempts_warm;
 
 /*
  * Fast-lane services under bulk pressure: dispatches that served the
- * fast lane while the CPU's bulk queue held waiting work, each spending
- * a quota unit, split by which fast-lane queue held the task.
+ * fast lane while the CPU's bulk queue held waiting work, each served
+ * under the CPU's time budget, split by which fast-lane queue held the
+ * task.
  */
 extern volatile u64 nr_depth1_pulls, nr_depth1_pulls_seat;
 
