@@ -126,7 +126,7 @@ static void update_cpuperf(struct cpu_ctx *cctx, s32 cpu, u64 now, bool max_floo
 	 * Smooth the target performance level, so that short spikes are
 	 * absorbed while load variations still react quickly.
 	 */
-	cctx->perf_lvl = calc_avg(perf_lvl, cctx->perf_lvl);
+	cctx->perf_lvl = calc_avg(cctx->perf_lvl, perf_lvl);
 
 	if (max_floor)
 		perf_lvl = SCX_CPUPERF_ONE;
