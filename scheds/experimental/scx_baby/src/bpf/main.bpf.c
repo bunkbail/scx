@@ -592,9 +592,9 @@ void BPF_STRUCT_OPS(baby_enqueue, struct task_struct *p, u64 enq_flags)
 	 *
 	 * The guards mirror ops.select_cpu()'s wake gate: the wakee must
 	 * be allowed on the target, no in-flight wakee may hold the local
-	 * DSQ (the insert would queue behind it), and a latency-critical
-	 * victim is shielded so the class the two lanes protect is never
-	 * the one displaced here.
+	 * DSQ (the insert would queue behind it), and the deadline order
+	 * arbitrates between two latency-critical tasks as it does between
+	 * bulk ones.
 	 */
 	if ((enq_flags & SCX_ENQ_WAKEUP) &&
 	    bpf_cpumask_test_cpu(prev_cpu, p->cpus_ptr) &&
@@ -607,7 +607,7 @@ void BPF_STRUCT_OPS(baby_enqueue, struct task_struct *p, u64 enq_flags)
 		if (curr && curr != p && !(curr->flags & PF_IDLE)) {
 			struct task_ctx *cctx = try_lookup_task_ctx(curr);
 
-			if (cctx && !is_lat_cri(cctx) &&
+			if (cctx &&
 			    (s64)(tctx->deadline - cctx->deadline) < 0 &&
 			    p->static_prio <= curr->static_prio &&
 			    can_resched(cctx)) {
