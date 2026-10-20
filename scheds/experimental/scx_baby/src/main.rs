@@ -727,9 +727,7 @@ mod tests {
         // wake samples, keeps a task interactive; a fresh hog is
         // rejected by the burst bound.
         fn interactive(prev: u64, curr: u64, samples: u32) -> bool {
-            (prev > 0 || curr > 0 || samples >= 4)
-                && prev < 50_000_000
-                && curr < 50_000_000
+            (prev > 0 || curr > 0 || samples >= 4) && prev < 50_000_000 && curr < 50_000_000
         }
         assert!(interactive(0, 10_000_000, 4));
         assert!(interactive(0, 10_000_000, 0));
