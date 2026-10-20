@@ -111,13 +111,20 @@ u8 seat_used[2][BABY_MAX_CPUS];
 /*
  * Fast-lane time budget, per CPU. The bucket accrues two thirds of
  * wall time as fast-lane credit and holds at most four base slices.
- * It is charged the CPU time a fast-lane task actually consumes, not
- * the slice it is granted, so a task that sleeps early pays only for
- * what it used and a 50-60Hz frame thread keeps its share. While a
- * fast-lane task runs the net rate is +2/3 - 1 = -1/3 of wall time;
- * while bulk runs it is +2/3. The steady state is therefore a two
- * thirds fast-lane and one third bulk share of a contended CPU,
- * independent of how long each slice runs.
+ * It is charged the span a fast-lane interval covers: the run itself,
+ * not the slice it is granted, plus the stop-to-run gap to the next
+ * fast-lane run on the same CPU while bulk waits. A task that
+ * sleeps early pays only for what it used, a 50-60Hz frame thread
+ * keeps its share, and the scheduling overhead between two fast-lane
+ * runs is not credited for free. While a fast-lane interval runs the
+ * net rate is +2/3 - 1 = -1/3 of wall time; while bulk runs it is
+ * +2/3. The steady state is therefore a two thirds fast-lane and one
+ * third bulk share of a contended CPU, independent of how long each
+ * slice runs.
+ *
+ * A bulk run or an idle dispatch breaks the interval: the CPU was
+ * doing other work, so the next fast-lane run charges no gap for it.
+ * An RT lease does the same; its time belongs to the RT task.
  *
  * The budget is consulted only while bulk work waits; on an
  * otherwise idle CPU the fast lane runs freely. The debt floor bounds
@@ -1037,8 +1044,10 @@ void BPF_STRUCT_OPS(baby_dispatch, s32 cpu, struct task_struct *prev)
 		/*
 		 * The CPU is going idle: drop its performance level. The
 		 * write happens once, when the level changes; see the
-		 * comment on perf_req.
+		 * comment on perf_req. An idle dispatch breaks the
+		 * fast-lane interval, so the next run charges no gap.
 		 */
+		cpu_fl_running_at[idx] = 0;
 		cpuperf_on_idle(cpu);
 	}
 }
@@ -1048,6 +1057,8 @@ void BPF_STRUCT_OPS(baby_dispatch, s32 cpu, struct task_struct *prev)
  * back. Tasks that dispatch() had moved into the local DSQ waited out
  * the lease where no other CPU could see them; push them back through
  * enqueue, where they land on an idle core or in the deadline order.
+ * The lease time belongs to the RT task: it breaks the fast-lane
+ * interval, so the budget does not charge it.
  */
 void BPF_STRUCT_OPS(baby_cpu_release, s32 cpu,
 		    struct scx_cpu_release_args *args)
@@ -1057,6 +1068,7 @@ void BPF_STRUCT_OPS(baby_cpu_release, s32 cpu,
 	 * is shimmed to void through the compat layer on others; call it
 	 * as void, the re-enqueue happens either way.
 	 */
+	cpu_fl_running_at[(u32)cpu & (BABY_MAX_CPUS - 1)] = 0;
 	scx_bpf_reenqueue_local();
 }
 
@@ -1203,15 +1215,18 @@ void BPF_STRUCT_OPS(baby_stopping, struct task_struct *p, bool runnable)
 		 * Account the contested fast-lane runtime actually
 		 * consumed and refill the elapsed-time credit before the
 		 * residency lapses; under contention the two together
-		 * leave the bucket one third of the runtime lower, the
-		 * bulk share the budget promises.
+		 * leave the bucket one third of the interval lower, the
+		 * bulk share the budget promises. A latency-critical stop
+		 * keeps its stamp, so the next fast-lane run on this CPU
+		 * charges the stop-to-run gap; a bulk stop clears it.
 		 */
 		if (cpu_is_lat[idx]) {
 			refill_fl_budget(idx, now);
 			charge_fl_runtime(idx, now, bulk_waiting(last_cpu));
+		} else {
+			cpu_fl_running_at[idx] = 0;
 		}
 		cpu_is_lat[idx] = false;
-		cpu_fl_running_at[idx] = 0;
 	}
 
 	if (!tctx)
@@ -1291,9 +1306,17 @@ void BPF_STRUCT_OPS(baby_running, struct task_struct *p)
 		if (!cpu_is_lat[cpu_idx])
 			cpu_bulk_at[cpu_idx] = now;
 		/*
-		 * Start the fast-lane runtime clock; a bulk run clears it
-		 * so a later stop has nothing to charge.
+		 * The fast-lane clock. A non-zero stamp means the CPU's last
+		 * run was fast-lane work and no bulk run or idle dispatch
+		 * came between; the switch back is overhead the budget was
+		 * crediting without charging, so charge it before the new
+		 * interval starts. A bulk run or an idle dispatch clears
+		 * the stamp.
 		 */
+		if (cpu_fl_running_at[cpu_idx]) {
+			refill_fl_budget(cpu_idx, now);
+			charge_fl_runtime(cpu_idx, now, bulk_waiting(cpu));
+		}
 		cpu_fl_running_at[cpu_idx] = cpu_is_lat[cpu_idx] ? now : 0;
 		if (tctx)
 			tctx->last_cpu = cpu;
