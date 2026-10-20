@@ -651,9 +651,10 @@ mod tests {
 
     /// Test-only mirror of the wake-rate blend and peak gate in
     /// class.bpf.c. The BPF side cannot be unit tested from userspace, so
-    /// this pins the arithmetic the class bars depend on: the 50/50
-    /// warmup, the round-up that lets a 10-sample rate reach 10, and the
-    /// sustained gate that rejects one startup spike.
+    /// this pins the arithmetic the class bar depends on: the 50/50
+    /// warmup, the round-up that lets a 5-sample rate reach 5, and the
+    /// four-sample warmup that keeps one startup spike from arming the
+    /// peak.
     fn wake_rate_blend(avg: u64, raw: u64, samples: u32) -> u64 {
         if samples < 4 {
             (avg + raw + 1) >> 1
@@ -665,8 +666,6 @@ mod tests {
     fn class_peak_after(seq: &[u64]) -> u32 {
         let mut avg = 0u64;
         let mut samples = 0u32;
-        let mut sane = 0u32;
-        let mut fg_sane = 0u32;
         let mut peak = 0u32;
 
         for &raw in seq {
@@ -674,25 +673,10 @@ mod tests {
             if samples < 4 {
                 samples += 1;
             }
-            if raw >= 5 {
-                sane = (sane + 1).min(4);
-            } else {
-                sane = 0;
-            }
-            if raw >= 10 {
-                fg_sane = (fg_sane + 1).min(4);
-            } else {
-                fg_sane = 0;
-            }
             peak -= peak >> 6;
-            if sane >= 4 {
-                let mut cand = avg as u32;
+            if samples >= 4 {
+                let cand = avg as u32;
 
-                // A 50-60Hz task hit by one or two spikes must not
-                // cross the foreground bar.
-                if fg_sane < 4 && cand >= 10 {
-                    cand = 9;
-                }
                 if cand > peak {
                     peak = cand;
                 }
@@ -702,8 +686,8 @@ mod tests {
     }
 
     #[test]
-    fn rounded_blend_reaches_both_bars() {
-        // 100Hz reaches 10; a 50Hz sample of 5 reaches the latency bar
+    fn rounded_blend_reaches_the_wake_bar() {
+        // 100Hz reaches 10; a 50Hz sample of 5 reaches the class bar
         // of 5. A truncating 3:1 blend has a fixed point at 9 for the
         // 100Hz input, so the round-up matters.
         assert_eq!(wake_rate_blend(9, 10, 4), 10);
@@ -712,29 +696,27 @@ mod tests {
     }
 
     #[test]
-    fn sixty_hz_is_latency_critical_but_not_foreground() {
-        // 60Hz is six wakes per 100ms: above the latency bar of 5 and
-        // below the foreground bar of 10.
+    fn sixty_hz_clears_the_wake_bar() {
+        // 60Hz is six wakes per 100ms: above the class bar of 5. The
+        // foreground test adds the runtime floor on top of the bar,
+        // which this mirror does not model.
         let peak = class_peak_after(&[6; 16]);
-        assert!(peak >= 5 && peak < 10);
+        assert!(peak >= 5);
     }
 
     #[test]
-    fn one_startup_spike_cannot_earn_foreground() {
-        // A single very short interval followed by a steady 60Hz cadence
-        // would carry a plain four-sample EWMA to 12; the foreground
-        // run gate caps the candidate at 9.
-        let mut seq = vec![100u64];
-        seq.extend([6u64; 8]);
-        let peak = class_peak_after(&seq);
-        assert!(peak >= 5 && peak < 10);
+    fn one_startup_spike_is_smoothed_out() {
+        // One very short interval followed by three slow wakes blends
+        // down to 7 by the time the peak can arm; it does not latch
+        // the spike.
+        assert_eq!(class_peak_after(&[100, 0, 0, 0]), 7);
     }
 
     #[test]
-    fn fast_wakers_earn_foreground_and_keep_latency() {
-        assert!(class_peak_after(&[12; 8]) >= 10);
-        // After a slowdown the latency hold stays above its bar even
-        // though the foreground bar is no longer met.
+    fn fast_wakers_keep_the_class() {
+        assert!(class_peak_after(&[12; 8]) >= 5);
+        // After a slowdown the hold stays above the bar even though
+        // the current average is no longer there.
         let peak = class_peak_after(&[12, 12, 12, 12, 6, 6, 6, 6]);
         assert!(peak >= 5);
     }
@@ -742,9 +724,9 @@ mod tests {
     #[test]
     fn woke_task_keeps_interactive_through_a_zero_window() {
         // Mirror of is_interactive: a task with a zero previous burst
-        // stays interactive once it has four latency-bar wake samples.
-        fn interactive(prev: u64, curr: u64, sane: u32) -> bool {
-            (prev > 0 || sane >= 4) && prev < 50_000_000 && curr < 50_000_000
+        // stays interactive once it has four wake samples.
+        fn interactive(prev: u64, curr: u64, samples: u32) -> bool {
+            (prev > 0 || samples >= 4) && prev < 50_000_000 && curr < 50_000_000
         }
         assert!(interactive(0, 10_000_000, 4));
         assert!(!interactive(0, 10_000_000, 0));

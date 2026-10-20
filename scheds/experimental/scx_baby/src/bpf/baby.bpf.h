@@ -80,7 +80,7 @@ static __always_inline u64 fl_node2dsq(s32 node)
  * foreground bar are needed before the peak can reach 10.
  */
 #define LAT_CRI_WAKE_FREQ	5
-#define FOREGROUND_WAKE_FREQ	10
+#define FOREGROUND_WAKE_FREQ	5
 #define WAKE_SANE_MIN		4
 #define MIN_NICE		(-20)
 #define MAX_NICE		19
@@ -328,29 +328,23 @@ struct task_ctx {
 	/*
 	 * Peak hold of wakeup_freq, the latency-critical credit. The
 	 * EWMA is blended 50/50 until four samples exist and 3:1 after
-	 * that, and the peak rises only after four consecutive samples
-	 * at or above the latency bar (5). The hold then decays by 1/64
-	 * per wake only while above 64 (a shift of a value below 64 is
-	 * zero), so it falls from a spike to 63 and stays there. 63 is
-	 * far above both class bars (5 and 10): the latency class
-	 * latches once earned, by design. A real decay would strip the
-	 * class from a frame-paced thread the moment overcommit throttles
-	 * its frame rate, which is the state the credit exists for.
+	 * that, and the peak rises only once the four-sample warmup is
+	 * done. The hold then decays by 1/64 per wake only while above
+	 * 64 (a shift of a value below 64 is zero), so it falls from a
+	 * spike to 63 and stays there. 63 is far above the class bar
+	 * (5): the latency class latches once earned, by design. A real
+	 * decay would strip the class from a frame-paced thread the
+	 * moment overcommit throttles its frame rate, which is the state
+	 * the credit exists for.
 	 */
 	u32 peak_freq;
 
 	/*
-	 * Wake-frequency samples taken (warmup ends at WAKE_SANE_MIN),
-	 * the current run of samples at or above the latency bar, and
-	 * the current run at or above the foreground bar. The peak may
-	 * rise only once the latency run is armed; its candidate is
-	 * capped at 9 while the foreground run is not four, so a 50-60Hz
-	 * task hit by one or two spikes cannot cross the 10 bar and earn
-	 * the fourfold slice.
+	 * Wake-frequency samples taken (warmup ends at WAKE_SANE_MIN).
+	 * The peak may rise only after the warmup, so one startup spike
+	 * cannot arm it.
 	 */
 	u32 wake_samples;
-	u8 wake_sane;
-	u8 fg_sane;
 
 	/*
 	 * Number of interactive priority boosts the task has earned by
@@ -470,13 +464,13 @@ static __always_inline bool is_lat_cri(const struct task_ctx *tctx)
 }
 
 /*
- * A task is foreground when it wakes frequently and does real work: a
- * browser renderer or an audio thread wakes dozens of times per window
- * with sizable bursts, a CPU hog never wakes, and a UI blip barely
- * uses the CPU. Foreground earns the fourfold slice, waker eligibility
- * and precedence over the heavy pin in the compaction, so light
- * workers that cross the heavy bar with their mutex spins keep the
- * little-tier packing.
+ * A task is foreground when it wakes at the class bar and does real
+ * work: a browser renderer, an audio thread or a game renderer wakes
+ * tens of times per window with sizable bursts, a CPU hog never wakes,
+ * and a UI blip barely uses the CPU. Foreground earns the fourfold
+ * slice, waker eligibility and precedence over the heavy pin in the
+ * compaction, so light workers that cross the heavy bar with their
+ * mutex spins keep the little-tier packing.
  */
 static __always_inline bool is_foreground(const struct task_ctx *tctx)
 {
@@ -489,12 +483,11 @@ static __always_inline bool is_foreground(const struct task_ctx *tctx)
  * Foreground tasks get a longer slice: their requests are memory-bound,
  * and interleaving them with hog slices on a busy core multiplies the
  * wall time of each request. Every foreground task is also
- * latency-critical (its 10-wake bar is above the latency bar of 5;
- * foreground only adds the runtime floor), so a latency-critical check
- * above the foreground test would make the fourfold slice dead code.
- * There is no upper burst bound: a heavy waker that also does real work
- * stays foreground, so the hybrid compaction still lets foreground beat
- * the heavy pin.
+ * latency-critical (it clears the same wake bar; foreground only adds
+ * the runtime floor), so a latency-critical check above the foreground
+ * test would make the fourfold slice dead code. There is no upper burst
+ * bound: a heavy waker that also does real work stays foreground, so
+ * the hybrid compaction still lets foreground beat the heavy pin.
  */
 static __always_inline u64 task_slice(const struct task_ctx *tctx)
 {

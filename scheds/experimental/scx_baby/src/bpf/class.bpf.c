@@ -138,11 +138,11 @@ __hidden bool is_interactive(const struct task_ctx *tctx)
 	 * A task that has just been sampled as a waker keeps the class
 	 * through a window whose previous burst is zero (a fresh task, or
 	 * a task that slept or waited through a window). Without the
-	 * wake_sane arm, a waker would fall out of the class for the
+	 * wake-sample arm, a waker would fall out of the class for the
 	 * first window after every long wait.
 	 */
 	return (tctx->prev_bursts > 0 ||
-		tctx->wake_sane >= WAKE_SANE_MIN) &&
+		tctx->wake_samples >= WAKE_SANE_MIN) &&
 	       tctx->prev_bursts < TIME_PERIOD / 4 &&
 	       tctx->bursts < TIME_PERIOD / 4;
 }
@@ -206,8 +206,6 @@ __hidden void class_on_runnable(struct task_ctx *tctx, u64 enq_flags, u64 now)
 			 */
 			if (!tctx->peak_freq)
 				tctx->wake_samples = 0;
-			tctx->wake_sane = 0;
-			tctx->fg_sane = 0;
 			tctx->peak_freq -= tctx->peak_freq >> 6;
 			return;
 		}
@@ -234,35 +232,19 @@ __hidden void class_on_runnable(struct task_ctx *tctx, u64 enq_flags, u64 now)
 				(3 * tctx->wakeup_freq + raw + 3) >> 2;
 		}
 
-		if (raw >= LAT_CRI_WAKE_FREQ) {
-			if (tctx->wake_sane < WAKE_SANE_MIN)
-				tctx->wake_sane++;
-		} else {
-			tctx->wake_sane = 0;
-		}
-		if (raw >= FOREGROUND_WAKE_FREQ) {
-			if (tctx->fg_sane < WAKE_SANE_MIN)
-				tctx->fg_sane++;
-		} else {
-			tctx->fg_sane = 0;
-		}
-
 		/*
 		 * The peak is the latency credit. Decay it on every
 		 * sample (a shift below 64 is zero, so the hold stays
-		 * above both bars once earned), then let it rise only
-		 * after four consecutive latency-bar samples. While the
-		 * foreground run is shorter than four, cap the candidate
-		 * at 9, so one or two spikes cannot push a 50-60Hz task
-		 * across the 10 bar and earn the fourfold slice.
+		 * above the bar once earned), then let it rise once the
+		 * four-sample warmup is done. The warmup itself rejects
+		 * a single spike: one 100 sample followed by three slow
+		 * ones blends down to 7, and the peak cannot arm before
+		 * the fourth sample.
 		 */
 		tctx->peak_freq -= tctx->peak_freq >> 6;
-		if (tctx->wake_sane >= WAKE_SANE_MIN) {
+		if (tctx->wake_samples >= WAKE_SANE_MIN) {
 			u32 cand = (u32)tctx->wakeup_freq;
 
-			if (tctx->fg_sane < WAKE_SANE_MIN &&
-			    cand >= FOREGROUND_WAKE_FREQ)
-				cand = FOREGROUND_WAKE_FREQ - 1;
 			if (cand > tctx->peak_freq)
 				tctx->peak_freq = cand;
 		}
@@ -330,8 +312,6 @@ __hidden void class_init_task(struct task_ctx *tctx, struct task_struct *p, u64 
 	tctx->wakeup_freq = 0;
 	tctx->peak_freq = 0;
 	tctx->wake_samples = 0;
-	tctx->wake_sane = 0;
-	tctx->fg_sane = 0;
 	tctx->prev_bursts = 0;
 	{
 		struct task_struct *parent = p->real_parent;

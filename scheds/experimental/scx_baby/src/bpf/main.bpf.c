@@ -728,16 +728,16 @@ void BPF_STRUCT_OPS(baby_dispatch, s32 cpu, struct task_struct *prev)
 
 		if (best_dl) {
 			/*
-			 * ops.dispatch() runs before ops.stopping(), so a
-			 * keep skips every callback that would renew the
-			 * deadline, charge the slice and restamp the
-			 * per-CPU state. Renew here exactly as stopping
-			 * would, then decide on the renewed deadline.
+			 * Compare before renewing: a resident whose
+			 * deadline is due still owns its turn against a
+			 * later waiter, and renewing first would move it
+			 * past that waiter and kill the keep. A keep skips
+			 * ops.stopping(), so renew the deadline and
+			 * restamp the per-CPU state inside the branch.
 			 */
-			if (reached_deadline(tctx, now))
-				tctx->deadline = calc_deadline(prev, tctx, now);
-
 			if ((s64)(tctx->deadline - best_dl) < 0) {
+				if (reached_deadline(tctx, now))
+					tctx->deadline = calc_deadline(prev, tctx, now);
 				/*
 				 * The victim kept its CPU, so the tick's
 				 * cut did not happen: consume the mark
