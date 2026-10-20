@@ -257,6 +257,18 @@ extern volatile u64 nr_wait_wg_slow[BABY_WDEPTH_NR * BABY_WG_NR];
 extern volatile u64 nr_tick_preempts, nr_tick_preempts_warm;
 
 /*
+ * Tick cuts whose waiter the following dispatch did not serve: the
+ * tick gate claimed a waiter without consulting the CPU's budget.
+ */
+extern volatile u64 nr_tick_cut_refused;
+
+/*
+ * RT-lease take-back instrument: latency-critical tasks requeued from
+ * an RT lease, and the dispatches that served one back on its home CPU.
+ */
+extern volatile u64 nr_lease_requeues, nr_home_takebacks;
+
+/*
  * Fast-lane services under bulk pressure: dispatches that served the
  * fast lane while the CPU's bulk queue held waiting work, each served
  * under the CPU's time budget, split by which fast-lane queue held the

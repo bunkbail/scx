@@ -45,6 +45,19 @@ volatile u64 nr_lane[2];
 volatile u64 nr_tick_preempts, nr_tick_preempts_warm;
 
 /*
+ * Tick cuts whose waiter the following dispatch did not serve: the
+ * tick claimed a waiter without consulting the CPU's budget, and the
+ * dispatch refused it.
+ */
+volatile u64 nr_tick_cut_refused;
+
+/*
+ * RT-lease take-back instrument: latency-critical tasks requeued from
+ * an RT lease, and the dispatches that served one back on its home CPU.
+ */
+volatile u64 nr_lease_requeues, nr_home_takebacks;
+
+/*
  * Fast-lane services under bulk pressure: dispatches that served the
  * fast lane while the bulk queue held waiting work, split by queue.
  */

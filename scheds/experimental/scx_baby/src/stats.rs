@@ -659,6 +659,12 @@ pub struct Metrics {
     pub nr_tick_preempts: u64,
     #[stat(desc = "Victims cut short at ops.tick for a warm-seat waiter")]
     pub nr_tick_preempts_warm: u64,
+    #[stat(desc = "Tick cuts whose fast-lane waiter the next dispatch refused")]
+    pub nr_tick_cut_refused: u64,
+    #[stat(desc = "Latency-critical tasks requeued from an RT lease")]
+    pub nr_lease_requeues: u64,
+    #[stat(desc = "Dispatches that served an RT-lease task back on its home CPU")]
+    pub nr_home_takebacks: u64,
     #[stat(desc = "Fast-lane node-queue pulls while bulk work waited")]
     pub nr_depth1_pulls: u64,
     #[stat(desc = "Fast-lane warm-seat pulls while bulk work waited")]
@@ -719,7 +725,7 @@ impl Metrics {
         }
         writeln!(
             w,
-            "[{}] tasks -> r: {:>2} | dispatch -> d: {:<5} s: {:<5} | preempt: {:<5} tick: {:<4}+{:<4} | d1pull: {:<4}+{:<4} | bkstop: {:<4} | wkpre: {:<5} | boost: {:<4} | sticky: {:<5} | warm: {:<5} | cold: {:<5}",
+            "[{}] tasks -> r: {:>2} | dispatch -> d: {:<5} s: {:<5} | preempt: {:<5} tick: {:<4}+{:<4} tkref: {:<4} | d1pull: {:<4}+{:<4} | bkstop: {:<4} | wkpre: {:<5} | lease: {:<4}/{:<4} | boost: {:<4} | sticky: {:<5} | warm: {:<5} | cold: {:<5}",
             crate::SCHEDULER_NAME,
             self.nr_running,
             self.nr_direct_dispatches,
@@ -727,10 +733,13 @@ impl Metrics {
             self.nr_preemptions,
             self.nr_tick_preempts,
             self.nr_tick_preempts_warm,
+            self.nr_tick_cut_refused,
             self.nr_depth1_pulls,
             self.nr_depth1_pulls_seat,
             self.nr_bulk_backstop,
             self.nr_wake_preempts,
+            self.nr_lease_requeues,
+            self.nr_home_takebacks,
             self.nr_boosts,
             self.nr_sticky,
             self.nr_arr_seat,
@@ -961,6 +970,11 @@ impl Metrics {
             nr_tick_preempts_warm: self
                 .nr_tick_preempts_warm
                 .saturating_sub(rhs.nr_tick_preempts_warm),
+            nr_tick_cut_refused: self
+                .nr_tick_cut_refused
+                .saturating_sub(rhs.nr_tick_cut_refused),
+            nr_lease_requeues: self.nr_lease_requeues.saturating_sub(rhs.nr_lease_requeues),
+            nr_home_takebacks: self.nr_home_takebacks.saturating_sub(rhs.nr_home_takebacks),
             nr_depth1_pulls: self.nr_depth1_pulls.saturating_sub(rhs.nr_depth1_pulls),
             nr_depth1_pulls_seat: self
                 .nr_depth1_pulls_seat

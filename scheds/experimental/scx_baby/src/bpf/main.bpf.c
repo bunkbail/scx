@@ -612,8 +612,11 @@ void BPF_STRUCT_OPS(baby_enqueue, struct task_struct *p, u64 enq_flags)
 	 * work pinned to the same CPU with nowhere else to run.
 	 */
 	if (is_lat_cri(tctx) &&
-	    (is_running || (enq_flags & SCX_ENQ_REENQ)))
+	    (is_running || (enq_flags & SCX_ENQ_REENQ))) {
 		tctx->last_cpu = prev_cpu;
+		if ((enq_flags & SCX_ENQ_REENQ) && stats_enabled)
+			__sync_fetch_and_add(&nr_lease_requeues, 1);
+	}
 
 	/*
 	 * check_preempt_wakeup(): preempt the previous CPU's task when the
@@ -824,7 +827,19 @@ void BPF_STRUCT_OPS(baby_dispatch, s32 cpu, struct task_struct *prev)
 		    bpf_cpumask_weight(head->cpus_ptr) > 1) {
 			fl_allowed = true;
 			serve_fl = true;
+			if (stats_enabled)
+				__sync_fetch_and_add(&nr_home_takebacks, 1);
 		}
+	}
+
+	/*
+	 * The tick cut this CPU's resident for a fast-lane waiter, but
+	 * the arbitration above will not serve that waiter: the tick
+	 * gate claims a head without consulting this CPU's budget.
+	 */
+	if (tctx && tctx->tick_preempted && has_fl && !serve_fl) {
+		if (stats_enabled)
+			__sync_fetch_and_add(&nr_tick_cut_refused, 1);
 	}
 
 	if (need_running && tctx && !tctx->yield_pending) {
