@@ -225,7 +225,7 @@ falls back to a big core when it is full. The gates are statically false on
 a single-tier machine, where the little mask is empty.
 
 The tiers come from the kernel's per-CPU capacity: big is every CPU at or
-above 80 percent of the top capacity, little is the rest, and a core below
+above 85 percent of the top capacity, little is the rest, and a core below
 both half of the little tier's top and a third of the machine's top is an
 LP island and joins neither. A core-type fallback corroborated by the
 clock spread covers platforms without capacity files.
