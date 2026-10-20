@@ -107,20 +107,23 @@ u8 seat_used[2][BABY_MAX_CPUS];
 
 /*
  * Fast-lane time budget, per CPU. The bucket accrues two thirds of
- * wall time as fast-lane credit and holds at most four base slices; a
- * fast-lane service spends the slice it is granted. Bulk therefore
- * keeps at least a third of a contended CPU over time, where a
- * dispatch count let a foreground fast-lane task spend four slices
- * between two bulk slices. The budget is consulted only while bulk
- * work waits; on an otherwise idle CPU the fast lane runs freely.
+ * wall time as fast-lane credit and holds at most four base slices.
+ * It is charged the CPU time a fast-lane task actually consumes, not
+ * the slice it is granted, so a task that sleeps early pays only for
+ * what it used and a 50-60Hz frame thread keeps its share. While a
+ * fast-lane task runs the net rate is +2/3 - 1 = -1/3 of wall time;
+ * while bulk runs it is +2/3. The steady state is therefore a two
+ * thirds fast-lane and one third bulk share of a contended CPU,
+ * independent of how long each slice runs.
  *
- * The bucket is conservative: a task that sleeps early still spends
- * its grant, so the fast lane can under-serve but never over-serves.
- * Wake-path preempts charge the bucket at the point they hand the CPU
- * over; tick preempts are charged by the dispatch that follows them.
+ * The budget is consulted only while bulk work waits; on an
+ * otherwise idle CPU the fast lane runs freely. The debt floor bounds
+ * how far one burst can push bulk ahead, not how long the fast lane
+ * may run.
  */
 static s64 fl_budget_ns[BABY_MAX_CPUS];
 static u64 fl_budget_at[BABY_MAX_CPUS];
+static u64 cpu_fl_running_at[BABY_MAX_CPUS];
 
 static __always_inline void refill_fl_budget(u32 idx, u64 now)
 {
@@ -142,19 +145,26 @@ static __always_inline void refill_fl_budget(u32 idx, u64 now)
 }
 
 /*
- * Spend @grant against the bucket. The budget is signed on purpose:
- * an over-spend must become debt that the next refills repay, or the
- * fast lane would refill from its own runtime and never yield. The
- * debt floor bounds how far one wake-preempt burst can push bulk
- * ahead, not how long the fast lane may run.
+ * Charge the fast-lane runtime consumed since the last accounting
+ * point. The charge is capped at one fourfold slice, the longest a
+ * fast-lane task can run without a tick, so a stale stamp cannot
+ * clear the bucket in one go. The debt floor is two base slices.
  */
-static __always_inline void charge_fl_budget(u32 idx, u64 grant)
+static __always_inline void charge_fl_runtime(u32 idx, u64 now)
 {
-	s64 cap = (s64)(4 * deadline_ns);
+	u64 started = cpu_fl_running_at[idx];
+	s64 floor = -(s64)(2 * deadline_ns);
+	u64 ran;
 
-	if (grant > (u64)cap)
-		grant = (u64)cap;
-	fl_budget_ns[idx] = MAX(fl_budget_ns[idx] - (s64)grant, -cap);
+	if (!started) {
+		cpu_fl_running_at[idx] = now;
+		return;
+	}
+	ran = now - started;
+	if (ran > 4 * deadline_ns)
+		ran = 4 * deadline_ns;
+	fl_budget_ns[idx] = MAX(fl_budget_ns[idx] - (s64)ran, floor);
+	cpu_fl_running_at[idx] = now;
 }
 
 /*
@@ -465,12 +475,6 @@ s32 BPF_STRUCT_OPS(baby_select_cpu, struct task_struct *p,
 			return cpu;
 		}
 
-		/*
-		 * The preempt hands the fast lane the CPU between two
-		 * dispatches; charge it now so the budget sees the
-		 * service. The slice is the wakee's grant.
-		 */
-		charge_fl_budget(pcpu_idx, task_slice(tctx));
 		scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL_ON | prev_cpu,
 				   task_slice(tctx), SCX_ENQ_PREEMPT);
 		if (stats_enabled) {
@@ -699,8 +703,7 @@ void BPF_STRUCT_OPS(baby_dispatch, s32 cpu, struct task_struct *prev)
 	bulk_dl = MIN(wq_dl, g_dl);
 	has_fl = fl_dl != ULLONG_MAX;
 	has_bulk = bulk_dl != ULLONG_MAX;
-	serve_fl = has_fl &&
-		   (!has_bulk || fl_budget_ns[idx] >= (s64)deadline_ns);
+	serve_fl = has_fl && (!has_bulk || fl_budget_ns[idx] > 0);
 
 	if (need_running && tctx && !tctx->yield_pending) {
 		/*
@@ -757,8 +760,8 @@ void BPF_STRUCT_OPS(baby_dispatch, s32 cpu, struct task_struct *prev)
 				{
 					u64 grant = task_slice(tctx);
 
-					if (has_bulk && is_lat_cri(tctx))
-						charge_fl_budget(idx, grant);
+					if (is_lat_cri(tctx))
+						charge_fl_runtime(idx, now);
 					scx_bpf_task_set_slice(prev, grant);
 				}
 				if (stats_enabled)
@@ -771,8 +774,8 @@ void BPF_STRUCT_OPS(baby_dispatch, s32 cpu, struct task_struct *prev)
 	/*
 	 * Serve the fast lane: the node queue first when its head beats
 	 * the seat's (the seat wins ties), then the seat, then the node
-	 * queue again for a raced first try. Under bulk pressure a serve
-	 * spends one quota unit.
+	 * queue again for a raced first try. The service's runtime is
+	 * charged when the task runs, not at the pull.
 	 */
 	if (serve_fl) {
 		if (fl_g_dl < fl_wq_dl) {
@@ -782,17 +785,13 @@ void BPF_STRUCT_OPS(baby_dispatch, s32 cpu, struct task_struct *prev)
 				node_preempt_claim[nidx] = 0;
 				node_service_at[1][nidx] = now;
 				if (has_bulk) {
-					charge_fl_budget(
-						idx,
-						fl_q ? fl_q->scx.slice :
-						       deadline_ns);
 					if (stats_enabled)
 						__sync_fetch_and_add(
 							&nr_depth1_pulls, 1);
 				} else if (stats_enabled) {
 					__sync_fetch_and_add(
 						&nr_pull_land[cpu_dist(cpu,
-									       from)],
+								       from)],
 						1);
 				}
 				return;
@@ -804,10 +803,6 @@ void BPF_STRUCT_OPS(baby_dispatch, s32 cpu, struct task_struct *prev)
 			    !scx_bpf_dsq_nr_queued(fl_seat_dsq))
 				seat_used[1][idx] = 0;
 			if (has_bulk) {
-				charge_fl_budget(
-					idx,
-					fl_wq ? fl_wq->scx.slice :
-						deadline_ns);
 				if (stats_enabled)
 					__sync_fetch_and_add(
 						&nr_depth1_pulls_seat, 1);
@@ -818,9 +813,6 @@ void BPF_STRUCT_OPS(baby_dispatch, s32 cpu, struct task_struct *prev)
 			node_preempt_claim[nidx] = 0;
 			node_service_at[1][nidx] = now;
 			if (has_bulk) {
-				charge_fl_budget(
-					idx,
-					fl_q ? fl_q->scx.slice : deadline_ns);
 				if (stats_enabled)
 					__sync_fetch_and_add(
 						&nr_depth1_pulls, 1);
@@ -875,14 +867,13 @@ void BPF_STRUCT_OPS(baby_dispatch, s32 cpu, struct task_struct *prev)
 	 * Fallback: if all bulk moves failed (e.g. affinity mismatch on
 	 * the peeked head) while the fast lane still had work held back
 	 * by the budget, drain the fast lane rather than idling the CPU.
-	 * The service is charged like any other: the bucket goes to zero,
-	 * and the refill makes bulk wait its turn afterwards.
+	 * The service's runtime is charged when the task runs, so the
+	 * drain needs no charge of its own; the bucket stays where the
+	 * last accounting left it and bulk waits its turn afterwards.
 	 */
 	if (has_fl && !serve_fl) {
 		if (scx_bpf_dsq_move_to_local(fl_seat_dsq, 0)) {
 			seat_service_at[1][idx] = now;
-			charge_fl_budget(idx, fl_wq ? fl_wq->scx.slice :
-						      deadline_ns);
 			if (seat_used[1][idx] &&
 			    !scx_bpf_dsq_nr_queued(fl_seat_dsq))
 				seat_used[1][idx] = 0;
@@ -891,8 +882,6 @@ void BPF_STRUCT_OPS(baby_dispatch, s32 cpu, struct task_struct *prev)
 		if (scx_bpf_dsq_move_to_local(fl_node_dsq, 0)) {
 			node_preempt_claim[nidx] = 0;
 			node_service_at[1][nidx] = now;
-			charge_fl_budget(idx, fl_q ? fl_q->scx.slice :
-						     deadline_ns);
 			return;
 		}
 	}
@@ -904,7 +893,8 @@ void BPF_STRUCT_OPS(baby_dispatch, s32 cpu, struct task_struct *prev)
 		 * emptied under the mark and the cut never happened, and a
 		 * yield mark, since there was nothing to yield to. This is
 		 * another slice grant that skips stopping/running, so
-		 * charge the slice and restamp the per-CPU state here.
+		 * charge the runtime of the slice that just ended and
+		 * restamp the per-CPU state here.
 		 */
 		if (tctx) {
 			update_bursts(tctx, now);
@@ -915,6 +905,8 @@ void BPF_STRUCT_OPS(baby_dispatch, s32 cpu, struct task_struct *prev)
 			tctx->last_cpu = cpu;
 			cpu_running_at[idx] = now;
 			cpu_is_lat[idx] = is_lat_cri(tctx);
+			if (cpu_is_lat[idx])
+				charge_fl_runtime(idx, now);
 		}
 		scx_bpf_task_set_slice(prev,
 				       tctx ? task_slice(tctx) : deadline_ns);
@@ -960,6 +952,20 @@ void BPF_STRUCT_OPS(baby_tick, struct task_struct *p)
 		return;
 
 	now = bpf_ktime_get_ns();
+
+	/*
+	 * Keep the fast-lane budget current: a tick inside a long
+	 * fast-lane slice accounts the runtime since the last charge
+	 * point, so the stop that follows charges only the remainder.
+	 */
+	if (is_lat_cri(tctx)) {
+		s32 cpu = scx_bpf_task_cpu(p);
+		u32 idx = (u32)cpu & (BABY_MAX_CPUS - 1);
+
+		refill_fl_budget(idx, now);
+		charge_fl_runtime(idx, now);
+	}
+
 	update_bursts(tctx, now);
 
 	cpuperf_on_tick(p, now,
@@ -1065,12 +1071,26 @@ void BPF_STRUCT_OPS(baby_stopping, struct task_struct *p, bool runnable)
 	 */
 	last_cpu = (tctx && tctx->last_cpu >= 0) ? tctx->last_cpu :
 						  scx_bpf_task_cpu(p);
-	cpu_is_lat[(u32)last_cpu & (BABY_MAX_CPUS - 1)] = false;
+	now = bpf_ktime_get_ns();
+	{
+		u32 idx = (u32)last_cpu & (BABY_MAX_CPUS - 1);
+
+		/*
+		 * Account the fast-lane runtime actually consumed and
+		 * refill the elapsed-time credit before the residency
+		 * lapses; the two together leave the bucket one third of
+		 * the runtime lower, the bulk share the budget promises.
+		 */
+		if (cpu_is_lat[idx]) {
+			refill_fl_budget(idx, now);
+			charge_fl_runtime(idx, now);
+		}
+		cpu_is_lat[idx] = false;
+		cpu_fl_running_at[idx] = 0;
+	}
 
 	if (!tctx)
 		return;
-
-	now = bpf_ktime_get_ns();
 
 	/*
 	 * Whatever enqueues this task next is a re-entry of a task that
@@ -1143,6 +1163,11 @@ void BPF_STRUCT_OPS(baby_running, struct task_struct *p)
 
 		cpu_running_at[cpu_idx] = now;
 		cpu_is_lat[cpu_idx] = tctx && is_lat_cri(tctx);
+		/*
+		 * Start the fast-lane runtime clock; a bulk run clears it
+		 * so a later stop has nothing to charge.
+		 */
+		cpu_fl_running_at[cpu_idx] = cpu_is_lat[cpu_idx] ? now : 0;
 		if (tctx)
 			tctx->last_cpu = cpu;
 	}
