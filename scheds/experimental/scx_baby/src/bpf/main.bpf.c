@@ -596,9 +596,10 @@ void BPF_STRUCT_OPS(baby_enqueue, struct task_struct *p, u64 enq_flags)
 	/*
 	 * A latency-critical task that is requeued while it still owns the
 	 * CPU (a wake-preempt or a timer cut) or comes back from an RT
-	 * lease keeps that CPU as its home. baby_dispatch() lets the home
-	 * CPU take it back whatever the budget, so a displaced resident
-	 * waits for its own CPU instead of another CPU's tick.
+	 * lease keeps that CPU as its home. baby_dispatch() serves it back
+	 * there while the budget has overdraw left, provided the task can
+	 * run on another CPU: a pinned task's take-back would leave bulk
+	 * work pinned to the same CPU with nowhere else to run.
 	 */
 	if (is_lat_cri(tctx) &&
 	    (is_running || (enq_flags & SCX_ENQ_REENQ)))
@@ -722,6 +723,14 @@ void BPF_STRUCT_OPS(baby_dispatch, s32 cpu, struct task_struct *prev)
 	u64 fl_wq_dl, fl_g_dl, wq_dl, g_dl, fl_dl, bulk_dl, best_dl;
 	u64 now = bpf_ktime_get_ns();
 	bool has_fl, has_bulk, fl_allowed, serve_fl;
+	/*
+	 * The budget carried into this dispatch, before its own credit.
+	 * The take-back below is bounded by this value, not by the
+	 * refilled one: the dispatch credit would otherwise lift the
+	 * budget off the debt floor on every call and the exemption would
+	 * be granted forever.
+	 */
+	s64 fl_budget_in = fl_budget_ns[idx];
 
 	census_sample(cpu);
 	refill_fl_budget(idx, now);
@@ -773,17 +782,29 @@ void BPF_STRUCT_OPS(baby_dispatch, s32 cpu, struct task_struct *prev)
 			__sync_fetch_and_add(&nr_bulk_backstop, 1);
 		fl_allowed = false;
 		serve_fl = false;
-	} else if (has_fl && !fl_allowed) {
+	} else if (has_fl && !fl_allowed &&
+		   fl_budget_in > -(s64)(2 * deadline_ns)) {
 		/*
 		 * A fast-lane head this CPU was running when it was
 		 * displaced is served back even with the budget spent: the
-		 * CPU takes back its own resident instead of making it wait
-		 * for another CPU's tick.
+		 * CPU takes back its own resident instead of making it
+		 * wait for another CPU's tick. The exemption spends only
+		 * credit the CPU banked while not running the fast lane:
+		 * once the debt reaches the two-slice floor the runtime
+		 * charge enforces, the next dispatch carries no overdraw
+		 * left and serves bulk.
+		 *
+		 * The task must be able to run elsewhere. A pinned
+		 * fast-lane task would otherwise take its CPU back for as
+		 * long as it keeps arriving, and bulk work pinned to the
+		 * same CPU would never run there; such a task waits in the
+		 * shared queue like any other.
 		 */
 		struct task_struct *head = (fl_g_dl < fl_wq_dl) ? fl_q : fl_wq;
 		struct task_ctx *hctx = head ? try_lookup_task_ctx(head) : NULL;
 
-		if (hctx && hctx->last_cpu == cpu) {
+		if (hctx && hctx->last_cpu == cpu &&
+		    bpf_cpumask_weight(head->cpus_ptr) > 1) {
 			fl_allowed = true;
 			serve_fl = true;
 		}

@@ -403,14 +403,13 @@ struct task_ctx {
 	bool tick_preempted;
 
 	/*
-	 * The CPU the task last ran on, or the CPU an RT lease
-	 * reenqueued it from. ops.enqueue() also sets it for a
-	 * latency-critical task requeued while it still owns the CPU, so
-	 * dispatch can serve that task back on its home CPU.
-	 * ops.stopping() can run on the task's new CPU after a
-	 * migration, so the per-CPU state the run stamped must be
-	 * cleared through the CPU that stamped it, not through
-	 * scx_bpf_task_cpu().
+	 * The CPU the task last ran on, or the CPU an RT lease or a wake
+	 * preempt requeued it from. baby_dispatch() serves a displaced
+	 * latency-critical task back there while its budget allows it and
+	 * the task can run on another CPU. ops.stopping() can run on the
+	 * task's new CPU after a migration, so the per-CPU state the run
+	 * stamped must be cleared through the CPU that stamped it, not
+	 * through scx_bpf_task_cpu().
 	 */
 	s32 last_cpu;
 };
