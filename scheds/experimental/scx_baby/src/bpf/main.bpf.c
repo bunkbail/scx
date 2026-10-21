@@ -137,13 +137,18 @@ static u64 cpu_fl_running_at[BABY_MAX_CPUS];
 
 /*
  * Bulk backstop: the longest a CPU may run nothing but the fast lane
- * while bulk work waits for it. The time budget alone cannot bound
- * this: its credit is wall time, so a supply of fast-lane work that
- * switches often enough keeps the credit ahead of the charges. A bulk
- * task pinned to the CPU then waits behind a lane no other CPU can
+ * while bulk work keeps waiting for it. The time budget alone cannot
+ * bound this: its credit is wall time, so a supply of fast-lane work
+ * that switches often enough keeps the credit ahead of the charges. A
+ * bulk task pinned to the CPU then waits behind a lane no other CPU can
  * pull, and the kernel's runnable-task watchdog unloads the scheduler
  * after five seconds. When the stamp is older than the bound, the
  * dispatcher serves bulk whatever the budget says.
+ *
+ * The stamp means "bulk last ran here, or had nothing to wait for
+ * here": a quiet period refreshes it, so a burst that arrives after
+ * 20ms of no bulk starts the clock instead of inheriting the idle time
+ * and displacing a latency-critical resident at once.
  */
 #define BABY_BULK_BACKSTOP_NS	(20ULL * NSEC_PER_MSEC)
 
@@ -786,6 +791,15 @@ void BPF_STRUCT_OPS(baby_dispatch, s32 cpu, struct task_struct *prev)
 	serve_fl = has_fl && fl_allowed;
 
 	/*
+	 * The bulk clock starts when bulk work arrives, not when the last
+	 * bulk task ran: refresh it while no bulk waits (and on a CPU that
+	 * has never recorded a run), so a burst after a quiet period does
+	 * not fire the backstop on its first dispatch.
+	 */
+	if (!has_bulk || !cpu_bulk_at[idx])
+		cpu_bulk_at[idx] = now;
+
+	/*
 	 * Bulk backstop (see cpu_bulk_at): a CPU that has run nothing but
 	 * the fast lane for a full bound serves bulk now, whatever the
 	 * budget or a home head says. Pinned bulk work has no other CPU
@@ -1067,6 +1081,7 @@ void BPF_STRUCT_OPS(baby_dispatch, s32 cpu, struct task_struct *prev)
 		 * fast-lane interval, so the next run charges no gap.
 		 */
 		cpu_fl_running_at[idx] = 0;
+		cpu_bulk_at[idx] = 0;
 		cpuperf_on_idle(cpu);
 	}
 }
