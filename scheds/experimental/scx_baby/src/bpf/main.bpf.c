@@ -735,7 +735,7 @@ void BPF_STRUCT_OPS(baby_dispatch, s32 cpu, struct task_struct *prev)
 	struct task_struct *fl_wq, *fl_q, *wq, *q;
 	u64 fl_wq_dl, fl_g_dl, wq_dl, g_dl, fl_dl, bulk_dl, best_dl;
 	u64 now = bpf_ktime_get_ns();
-	bool has_fl, has_bulk, bulk_present, fl_allowed, serve_fl;
+	bool has_fl, has_bulk, fl_allowed, serve_fl;
 	/*
 	 * The budget carried into this dispatch, before its own credit.
 	 * The take-back below is bounded by this value, not by the
@@ -752,8 +752,9 @@ void BPF_STRUCT_OPS(baby_dispatch, s32 cpu, struct task_struct *prev)
 	 * One peek of each lane per dispatch: the sticky check and the
 	 * arbitration read the same heads, and the peeked pointers stay
 	 * valid until the pulls enter their own RCU scope. The shared
-	 * heads are filtered by this CPU's affinity: a head it cannot
-	 * pull must not read as the lane's next deadline here.
+	 * heads are the first task this CPU can run, not the queue head:
+	 * an affinity-restricted head must neither read as the lane's
+	 * next deadline here nor hide the tasks behind it.
 	 */
 	fl_wq = __COMPAT_scx_bpf_dsq_peek(fl_seat_dsq);
 	fl_q = dsq_peek_allowed(fl_node_dsq, cpu);
@@ -776,19 +777,12 @@ void BPF_STRUCT_OPS(baby_dispatch, s32 cpu, struct task_struct *prev)
 	has_fl = fl_dl != ULLONG_MAX;
 	has_bulk = bulk_dl != ULLONG_MAX;
 	/*
-	 * The peek stops at a head this CPU may not run, but the queue
-	 * can still hold bulk work behind it that this CPU can pull. For
-	 * the budget decision that counts as bulk waiting, or the fast
-	 * lane runs free while runnable bulk waits.
-	 */
-	bulk_present = has_bulk || (!q && scx_bpf_dsq_nr_queued(node));
-	/*
 	 * An uncontested interval must not leave debt behind: the fast
 	 * lane ran freely, so clear what an earlier contention left.
 	 */
-	if (!bulk_present && fl_budget_ns[idx] < 0)
+	if (!has_bulk && fl_budget_ns[idx] < 0)
 		fl_budget_ns[idx] = 0;
-	fl_allowed = !bulk_present || fl_budget_ns[idx] > 0;
+	fl_allowed = !has_bulk || fl_budget_ns[idx] > 0;
 	serve_fl = has_fl && fl_allowed;
 
 	/*
@@ -797,7 +791,7 @@ void BPF_STRUCT_OPS(baby_dispatch, s32 cpu, struct task_struct *prev)
 	 * budget or a home head says. Pinned bulk work has no other CPU
 	 * to run on, so the alternative is the kernel's stall watchdog.
 	 */
-	if (bulk_present && now - cpu_bulk_at[idx] > BABY_BULK_BACKSTOP_NS) {
+	if (has_bulk && now - cpu_bulk_at[idx] > BABY_BULK_BACKSTOP_NS) {
 		if (stats_enabled && has_fl)
 			__sync_fetch_and_add(&nr_bulk_backstop, 1);
 		fl_allowed = false;

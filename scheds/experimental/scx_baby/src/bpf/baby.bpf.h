@@ -582,13 +582,29 @@ static __always_inline s32 any_allowed_cpu(const struct task_struct *p,
  * that can reach it: dispatch treats it as the lane's next deadline,
  * and the tick preempts bulk work for a waiter the CPU cannot pull.
  */
+/*
+ * The first task in @dsq that can run on @cpu. A plain peek stops at
+ * the head, so an affinity-restricted head hides every task behind it:
+ * a CPU that could run one of them reads the lane as empty, dispatches
+ * nothing and goes idle, and the stranded work waits for an unrelated
+ * wakeup. Scan a bounded number of entries so the verifier keeps a
+ * constant trip count; the pull itself still skips unaffine tasks past
+ * the bound.
+ */
+#define BABY_DSQ_PEEK_NR	16
+
 static __always_inline struct task_struct *dsq_peek_allowed(u64 dsq, s32 cpu)
 {
-	struct task_struct *p = __COMPAT_scx_bpf_dsq_peek(dsq);
+	struct task_struct *p;
+	u32 scanned = 0;
 
-	if (!p || !bpf_cpumask_test_cpu(cpu, p->cpus_ptr))
-		return NULL;
-	return p;
+	bpf_for_each(scx_dsq, p, dsq, 0) {
+		if (bpf_cpumask_test_cpu(cpu, p->cpus_ptr))
+			return p;
+		if (++scanned >= BABY_DSQ_PEEK_NR)
+			break;
+	}
+	return NULL;
 }
 
 /*
