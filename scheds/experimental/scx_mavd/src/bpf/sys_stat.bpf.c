@@ -62,6 +62,7 @@ struct sys_stat_ctx {
 	u64		sum_lat_cri;
 	u32		nr_sched;
 	u32		nr_preempt;
+	u32		nr_reenq_kfunc;
 	u32		nr_perf_cri;
 	u32		nr_lat_cri;
 	u32		nr_x_migration;
@@ -103,6 +104,7 @@ static void collect_sys_stat(void)
 	 */
 	bpf_arena_for(cpdom_id, 0, nr_cpdoms) {
 		struct cpdom_ctx *cpdomc = get_cpdom_ctx(cpdom_id);
+		struct scx_cmask *cpus;
 
 		cpdomc->cur_util_wall_sum = 0;
 		cpdomc->avg_util_wall_sum = 0;
@@ -128,10 +130,14 @@ static void collect_sys_stat(void)
 			cpdomc->nr_queued_task = scx_bpf_dsq_nr_queued(cpdom_to_dsq(cpdom_id))
 					       + scx_bpf_dsq_nr_queued(cpdom_to_turb_dsq(cpdom_id));
 
-		cmask_for_each(cpu, &cpdomc->cpus) {
+		/* a sub counts only the cids it holds */
+		cpus = sub_mode ? get_cpdom_mask(cpdom_id) : &cpdomc->cpus;
+		cmask_for_each(cpu, cpus) {
 			cpdomc->nr_queued_task +=
 				scx_bpf_dsq_nr_queued(SCX_DSQ_LOCAL_ON | cpu);
-			if (use_per_cpu_dsq() && cpu == get_primary_cpu(cpu))
+			/* the core DSQ counts once, on its first counted cid */
+			if (use_per_cpu_dsq() &&
+			    cpu == cmask_next_set(cpus, get_primary_cpu(cpu)))
 				cpdomc->nr_queued_task +=
 					scx_bpf_dsq_nr_queued(cpu_to_dsq(cpu));
 		}
@@ -167,8 +173,8 @@ static void collect_sys_stat(void)
 		 * or there are pending tasks to run), shrink the time slice
 		 * of slice-boosted tasks.
 		 */
-		if (cpuc->nr_pinned_tasks || !can_boost_slice() ||
-		    scx_bpf_dsq_nr_queued(SCX_DSQ_LOCAL_ON | cpuc->cid)) {
+		if (cpuc->is_online && (cpuc->nr_pinned_tasks || !can_boost_slice() ||
+		    scx_bpf_dsq_nr_queued(SCX_DSQ_LOCAL_ON | cpuc->cid))) {
 			shrink_boosted_slice_remote(cpuc, c->now);
 		}
 
@@ -507,6 +513,9 @@ static void collect_sys_stat(void)
 		c->nr_preempt += cpuc->nr_preempt;
 		cpuc->nr_preempt = 0;
 
+		c->nr_reenq_kfunc += cpuc->nr_reenq_kfunc;
+		cpuc->nr_reenq_kfunc = 0;
+
 		if (cpuc->max_lat_cri > c->max_lat_cri)
 			c->max_lat_cri = cpuc->max_lat_cri;
 		cpuc->max_lat_cri = 0;
@@ -693,6 +702,7 @@ static void calc_sys_stat(void)
 
 	sys_stat.nr_sched += c->nr_sched;
 	sys_stat.nr_preempt += c->nr_preempt;
+	sys_stat.nr_reenq_kfunc += c->nr_reenq_kfunc;
 	sys_stat.nr_perf_cri += c->nr_perf_cri;
 	sys_stat.nr_lat_cri += c->nr_lat_cri;
 	sys_stat.nr_x_migration += c->nr_x_migration;

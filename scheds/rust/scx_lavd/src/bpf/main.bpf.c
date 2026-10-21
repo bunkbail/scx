@@ -1008,7 +1008,7 @@ void BPF_STRUCT_OPS(lavd_enqueue, struct task_struct *p, u64 enq_flags)
 		 * deadline would over-prioritize it. Re-anchor to the current
 		 * clock.
 		 */
-		p->scx.dsq_vtime = calc_when_to_run(p, taskc);
+		scx_bpf_task_set_dsq_vtime(p, calc_when_to_run(p, taskc));
 
 		dsq_id = get_target_dsq_id(p, cpuc, taskc);
 		scx_bpf_dsq_insert_vtime(p, dsq_id, p->scx.slice,
@@ -2295,7 +2295,7 @@ void BPF_STRUCT_OPS(lavd_dump, struct scx_dump_ctx *dctx)
 	 * Dump the cpu.max status of the entire cgroup hierarchy.
 	 */
 	if (enable_cpu_bw) {
-		scx_cgroup_bw_dump(1, true, true, true);
+		scx_cgroup_bw_dump(0, true, true, true);
 	}
 }
 
