@@ -167,7 +167,32 @@ __hidden bool balance_try_warm_seat(struct task_struct *p, struct task_ctx *tctx
 			scx_bpf_dsq_insert_vtime(p, dsq, slice,
 						 tctx->deadline, 0);
 			stamp_wait(tctx, now, target_nr, false);
-			scx_bpf_kick_cpu(target, SCX_KICK_IDLE);
+			/*
+			 * A latency-critical arrival seated on a busy CPU
+			 * needs a preemption kick, not an idle one. A seat
+			 * is a per-CPU queue: only that CPU pulls it, and
+			 * only when it reaches its dispatcher. An idle kick
+			 * is a no-op while the CPU runs a task, so the
+			 * arrival would wait out the resident's slice (up
+			 * to the fourfold one); SCX_KICK_PREEMPT makes the
+			 * CPU reschedule and hand over now.
+			 *
+			 * Two arrivals keep the idle kick. A bulk arrival
+			 * waits its turn. A latency-critical arrival whose
+			 * target already runs another latency-critical task
+			 * does too: preempting it would trade one protected
+			 * task for the other, and a cell where every task
+			 * wakes often would then displace its resident on
+			 * every seat placement. That is the churn the
+			 * wake-side gate refuses to start, so the seat path
+			 * refuses it as well.
+			 */
+			struct task_struct *res = __COMPAT_scx_bpf_cpu_curr(target);
+			struct task_ctx *rctx = res ? try_lookup_task_ctx(res) : NULL;
+			bool preempt = lat && (!rctx || !is_lat_cri(rctx));
+
+			scx_bpf_kick_cpu(target, preempt ? SCX_KICK_PREEMPT
+							 : SCX_KICK_IDLE);
 			return true;
 		}
 
