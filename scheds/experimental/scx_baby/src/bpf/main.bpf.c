@@ -67,7 +67,20 @@ private(BABY) struct bpf_cpumask __kptr *non_lp_cpumask;
  * ceiling, and the peek/lookup/class pattern is already verifier-proven
  * in the rescue timer.
  */
-#define BABY_TICK_PREEMPT_PROTECT_NS	(200ULL * NSEC_PER_USEC)
+/*
+ * How long a victim must have held a CPU before a waiting task may
+ * preempt it. The floor exists so two waiters cannot ping-pong one CPU:
+ * a victim that just started makes progress before it is displaced
+ * again. On a saturated CPU the floor is also the extra wait every
+ * wake-side handoff pays on top of the victim's rotation, and a frame
+ * producer at several hundred frames per second runs for only about a
+ * millisecond per frame: a victim that has already held the CPU for
+ * 200us covers a fifth of that frame, and waiting it out costs a whole
+ * frame period. Fifty microseconds still gives a displaced task its
+ * first slice of progress; the per-node claim and the latency-critical
+ * victim refusal bound the churn on top of it.
+ */
+#define BABY_TICK_PREEMPT_PROTECT_NS	(50ULL * NSEC_PER_USEC)
 
 /*
  * Fallback quiet window for the shared-queue claim. It covers the
@@ -451,8 +464,8 @@ s32 BPF_STRUCT_OPS(baby_select_cpu, struct task_struct *p,
 		 * deliberately absent. The victim renews its deadline
 		 * while it runs, so the beat rarely binds, and the tick
 		 * gate cuts the same victims without either check. The
-		 * class pair, the priority order and the 200us residency
-		 * floor bound the churn.
+		 * class pair, the priority order and the residency floor
+		 * bound the churn.
 		 *
 		 * SCX_ENQ_PREEMPT puts the wakee at the head of the local
 		 * DSQ, zeroes the victim's slice and reschedules. The
@@ -482,7 +495,7 @@ s32 BPF_STRUCT_OPS(baby_select_cpu, struct task_struct *p,
 		 * A bulk head in the warm seat cannot hide the wakee: it
 		 * runs on its own fast-lane seat, so only a fast-lane
 		 * waiter blocks the preempt. Repetition is bounded by the
-		 * latency-critical victim refusal below and by the 200us
+		 * latency-critical victim refusal below and by the
 		 * residency stamp; the displaced victim is requeued
 		 * through the natural-expiry path in ops.enqueue(). The
 		 * time budget takes no part here: the preempt happens
