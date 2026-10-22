@@ -833,8 +833,7 @@ void BPF_STRUCT_OPS(baby_dispatch, s32 cpu, struct task_struct *prev)
 		struct task_struct *head = (fl_g_dl < fl_wq_dl) ? fl_q : fl_wq;
 		struct task_ctx *hctx = head ? try_lookup_task_ctx(head) : NULL;
 
-		if (hctx && hctx->last_cpu == cpu &&
-		    bpf_cpumask_weight(head->cpus_ptr) > 1) {
+		if (hctx && hctx->last_cpu == cpu && !is_pcpu_task(head)) {
 			fl_allowed = true;
 			serve_fl = true;
 			if (stats_enabled)
