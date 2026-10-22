@@ -113,17 +113,18 @@ u8 seat_used[2][BABY_MAX_CPUS];
  * wall time as fast-lane credit and holds at most four base slices.
  * It is charged the span a fast-lane interval covers: the run itself,
  * not the slice it is granted, plus the stop-to-run gap to the next
- * fast-lane run on the same CPU while bulk waits. A task that
- * sleeps early pays only for what it used, a 50-60Hz frame thread
- * keeps its share, and the scheduling overhead between two fast-lane
- * runs is not credited for free. While a fast-lane interval runs the
+ * run on the same CPU while bulk waits, charged before that run starts
+ * whether it is bulk or fast-lane work. A task that sleeps early pays
+ * only for what it used, a 50-60Hz frame thread keeps its share, and
+ * the scheduling overhead between two fast-lane runs is not credited
+ * for free. While a fast-lane interval runs the
  * net rate is +2/3 - 1 = -1/3 of wall time; while bulk runs it is
  * +2/3. The steady state is therefore a two thirds fast-lane and one
  * third bulk share of a contended CPU, independent of how long each
  * slice runs.
  *
  * A bulk run or an idle dispatch breaks the interval: the CPU was
- * doing other work, so the next fast-lane run charges no gap for it.
+ * doing other work, so the run that follows charges no gap for it.
  * An RT lease does the same; its time belongs to the RT task.
  *
  * The budget is consulted only while bulk work waits; on an
@@ -1252,8 +1253,9 @@ void BPF_STRUCT_OPS(baby_stopping, struct task_struct *p, bool runnable)
 		 * residency lapses; under contention the two together
 		 * leave the bucket one third of the interval lower, the
 		 * bulk share the budget promises. A latency-critical stop
-		 * keeps its stamp, so the next fast-lane run on this CPU
-		 * charges the stop-to-run gap; a bulk stop clears it.
+		 * keeps its stamp, so the next run on this CPU charges the
+		 * stop-to-run gap before it starts, bulk or fast-lane; a
+		 * bulk stop clears the stamp.
 		 */
 		if (cpu_is_lat[idx]) {
 			refill_fl_budget(idx, now);
@@ -1344,9 +1346,9 @@ void BPF_STRUCT_OPS(baby_running, struct task_struct *p)
 		 * The fast-lane clock. A non-zero stamp means the CPU's last
 		 * run was fast-lane work and no bulk run or idle dispatch
 		 * came between; the switch back is overhead the budget was
-		 * crediting without charging, so charge it before the new
-		 * interval starts. A bulk run or an idle dispatch clears
-		 * the stamp.
+		 * crediting without charging, so charge it before this run
+		 * starts, whether it is bulk or fast-lane work. A bulk run
+		 * or an idle dispatch clears the stamp.
 		 */
 		if (cpu_fl_running_at[cpu_idx]) {
 			refill_fl_budget(cpu_idx, now);
