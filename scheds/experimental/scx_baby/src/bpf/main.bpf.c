@@ -443,6 +443,74 @@ s32 BPF_STRUCT_OPS(baby_select_cpu, struct task_struct *p,
 		}
 	}
 
+	/*
+	 * A waking latency-critical task keeps its own CPU when that CPU is
+	 * usable, before the idle selector is asked at all. The selector
+	 * spreads across idle cores, which parks a frame producer on a cold
+	 * core whenever its own is momentarily busy with a helper, and a
+	 * frame producer woken every millisecond pays the refill on every
+	 * move. Its cache-warm CPU is the placement the spread has to beat,
+	 * not the other way around.
+	 *
+	 * Usable means idle and allowed, or busy with a cuttable bulk
+	 * resident: the same preempt the wake gate below performs, but
+	 * reached before an idle CPU elsewhere wins the wake. A latency-
+	 * critical resident keeps its CPU, and the wakee spreads instead,
+	 * so two pipeline stages cannot stack on one CPU by this path.
+	 * The miss reasons are left to the gate below; this block only
+	 * returns where it has already placed the task.
+	 */
+	if (tctx && is_lat_cri(tctx) &&
+	    bpf_cpumask_test_cpu(prev_cpu, p->cpus_ptr)) {
+		u32 pidx = (u32)prev_cpu & (BABY_MAX_CPUS - 1);
+		bool allowed = true;
+		struct bpf_cpumask *mask = non_lp_cpumask;
+
+		if (mask && !bpf_cpumask_empty(cast_mask(mask)))
+			allowed = bpf_cpumask_test_cpu(prev_cpu,
+						       cast_mask(mask));
+
+		if (allowed) {
+			if (scx_bpf_test_and_clear_cpu_idle(prev_cpu)) {
+				scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL,
+						   task_slice(tctx), 0);
+				if (stats_enabled)
+					__sync_fetch_and_add(
+						&nr_direct_dispatches, 1);
+				return prev_cpu;
+			}
+
+			if (!scx_bpf_dsq_nr_queued(fl_cpu2dsq(prev_cpu)) &&
+			    !scx_bpf_dsq_nr_queued(cpu2dsq(prev_cpu)) &&
+			    !scx_bpf_dsq_nr_queued(SCX_DSQ_LOCAL_ON |
+						   prev_cpu)) {
+				struct task_struct *curr =
+					__COMPAT_scx_bpf_cpu_curr(prev_cpu);
+				struct task_ctx *cctx = curr ?
+					try_lookup_task_ctx(curr) : NULL;
+				u64 ran_at = cpu_running_at[pidx];
+
+				if (curr && curr != p &&
+				    !(curr->flags & PF_IDLE) && cctx &&
+				    !is_lat_cri(cctx) && !is_pcpu_task(curr) &&
+				    p->static_prio <= curr->static_prio &&
+				    ran_at &&
+				    now - ran_at >=
+					    BABY_TICK_PREEMPT_PROTECT_NS) {
+					scx_bpf_dsq_insert(p,
+							   SCX_DSQ_LOCAL_ON |
+							   prev_cpu,
+							   task_slice(tctx),
+							   SCX_ENQ_PREEMPT);
+					if (stats_enabled)
+						__sync_fetch_and_add(
+							&nr_wake_preempts, 1);
+					return prev_cpu;
+				}
+			}
+		}
+	}
+
 	cpu = pick_idle_cpu(p, prev_cpu, wake_flags, &is_idle);
 	if (is_idle) {
 		if (stats_enabled)
