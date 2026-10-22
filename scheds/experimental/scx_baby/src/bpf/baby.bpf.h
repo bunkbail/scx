@@ -587,9 +587,9 @@ static __always_inline s32 any_allowed_cpu(const struct task_struct *p,
  * the head, so an affinity-restricted head hides every task behind it:
  * a CPU that could run one of them reads the lane as empty, dispatches
  * nothing and goes idle, and the stranded work waits for an unrelated
- * wakeup. Scan a bounded number of entries so the verifier keeps a
- * constant trip count; the pull itself still skips unaffine tasks past
- * the bound.
+ * wakeup. Peek the head locklessly first; only a head this CPU cannot
+ * run needs the bounded scan, which keeps the verifier's trip count
+ * constant and leaves work past the bound to the pull.
  */
 #define BABY_DSQ_PEEK_NR	16
 
@@ -597,6 +597,12 @@ static __always_inline struct task_struct *dsq_peek_allowed(u64 dsq, s32 cpu)
 {
 	struct task_struct *p;
 	u32 scanned = 0;
+
+	p = __COMPAT_scx_bpf_dsq_peek(dsq);
+	if (!p)
+		return NULL;
+	if (bpf_cpumask_test_cpu(cpu, p->cpus_ptr))
+		return p;
 
 	bpf_for_each(scx_dsq, p, dsq, 0) {
 		if (bpf_cpumask_test_cpu(cpu, p->cpus_ptr))
