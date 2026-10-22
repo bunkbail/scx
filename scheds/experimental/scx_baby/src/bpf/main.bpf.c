@@ -806,7 +806,8 @@ void BPF_STRUCT_OPS(baby_dispatch, s32 cpu, struct task_struct *prev)
 	 * to run on, so the alternative is the kernel's stall watchdog.
 	 */
 	if (has_bulk && now - cpu_bulk_at[idx] > BABY_BULK_BACKSTOP_NS) {
-		if (stats_enabled && has_fl)
+		if (stats_enabled &&
+		    (has_fl || (need_running && tctx && is_lat_cri(tctx))))
 			__sync_fetch_and_add(&nr_bulk_backstop, 1);
 		fl_allowed = false;
 		serve_fl = false;
