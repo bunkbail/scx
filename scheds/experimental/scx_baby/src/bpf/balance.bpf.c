@@ -71,7 +71,7 @@ __hidden bool balance_try_warm_seat(struct task_struct *p, struct task_ctx *tctx
 			u64 q_nr = seat_used[1][ci] ?
 					   scx_bpf_dsq_nr_queued(fl_cpu2dsq(i)) : 0;
 			u64 nr = lat ? q_nr : b_nr;
-			bool i_lat = cpu_is_lat[ci];
+			bool i_lat = cpu_owned_by_other_lat(ci, (u32)p->pid, now);
 
 			b_warm += b_nr;
 			q_warm += q_nr;
