@@ -1076,6 +1076,27 @@ void BPF_STRUCT_OPS(baby_dispatch, s32 cpu, struct task_struct *prev)
 				       tctx ? task_slice(tctx) : deadline_ns);
 	} else {
 		/*
+		 * Never idle while a shared queue holds a task this CPU can
+		 * run: the bounded peek above may stop at a run of heads
+		 * its affinity excludes, and scx_bpf_dsq_move_to_local()
+		 * skips them itself. The bulk lane's else branch has
+		 * already pulled its node queue; the fast lane's serve and
+		 * fallback both require the peek, so a task past the bound
+		 * would otherwise leave this CPU idle.
+		 */
+		if (scx_bpf_dsq_move_to_local(fl_node_dsq, 0)) {
+			if (node_preempt_claim[nidx])
+				node_preempt_claim[nidx] = 0;
+			if (now - node_service_at[1][nidx] > NSEC_PER_MSEC)
+				node_service_at[1][nidx] = now;
+			return;
+		}
+		if (scx_bpf_dsq_move_to_local(node, 0)) {
+			if (now - node_service_at[0][nidx] > NSEC_PER_MSEC)
+				node_service_at[0][nidx] = now;
+			return;
+		}
+		/*
 		 * The CPU is going idle: drop its performance level. The
 		 * write happens once, when the level changes; see the
 		 * comment on perf_req. An idle dispatch breaks the
