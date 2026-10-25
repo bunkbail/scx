@@ -350,7 +350,9 @@ impl<'a> Scheduler<'a> {
         info!(
             "cpuperf level: {}",
             match opts.perf_lvl {
-                n if n < 0 => "auto".into(),
+                -2 => "off".into(),
+                -1 => "auto".into(),
+                n if n < 0 => n.to_string(),
                 0 => "min".into(),
                 1024 => "max".into(),
                 n => n.to_string(),
