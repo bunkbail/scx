@@ -54,12 +54,20 @@ __hidden bool balance_try_warm_seat(struct task_struct *p, struct task_ctx *tctx
 						      fl_cpu2dsq(target) :
 						      cpu2dsq(target));
 		u64 b_warm = 0, q_warm = 0, lat_running = 0;
-		u64 best_nr = BABY_MAX_CPUS, i;
+		u64 best_nr = BABY_MAX_CPUS, i, n_running = 0;
 		u32 best_rank = BABY_DIST_NR, rank;
 		s32 best = target;
 
 		bpf_for(i, 0, nr_cpu_ids) {
 			u32 ci = (u32)i & (BABY_MAX_CPUS - 1);
+			/*
+			 * The scan is the only reader of the runnable
+			 * count, so it counts the per-CPU residency here
+			 * instead of the switch path paying a global
+			 * read-modify-write for it.
+			 */
+			if (cpu_running[ci])
+				n_running++;
 			/*
 			 * Probe only seats the occupancy hint marks as
 			 * possibly non-empty. At saturation most seats
@@ -105,7 +113,7 @@ __hidden bool balance_try_warm_seat(struct task_struct *p, struct task_ctx *tctx
 		 * not be, and counting bulk residency against a
 		 * fast-lane-only workload closes the seats.
 		 */
-		if (nr_running + bulk_backlog + b_warm +
+		if (n_running + bulk_backlog + b_warm +
 			    (lat ? target_nr : 0) > nr_cpu_ids + 1 ||
 		    lat_running + fl_backlog + q_warm > nr_cpu_ids + 1) {
 			/*
@@ -162,10 +170,18 @@ __hidden bool balance_try_warm_seat(struct task_struct *p, struct task_ctx *tctx
 
 				if (!target_nr)
 					seat_service_at[lane][tidx] = now;
-				seat_used[lane][tidx] = 1;
+				/*
+				 * Publish the occupancy hint after the
+				 * insert. A reader that sees a clear hint
+				 * may then be sure the seat was empty when
+				 * the writer committed; an insert that
+				 * lands after the reader's peek carries the
+				 * kick that brings the CPU back.
+				 */
+				scx_bpf_dsq_insert_vtime(p, dsq, slice,
+							 tctx->deadline, 0);
+				WRITE_ONCE(seat_used[lane][tidx], 1);
 			}
-			scx_bpf_dsq_insert_vtime(p, dsq, slice,
-						 tctx->deadline, 0);
 			stamp_wait(tctx, now, target_nr, false);
 			/*
 			 * A latency-critical arrival seated on a busy CPU

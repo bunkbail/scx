@@ -136,6 +136,14 @@ u64 node_service_at[2][BABY_NODE_CLOCK_NR];
 u8 seat_used[2][BABY_MAX_CPUS];
 
 /*
+ * Whether a task runs on each CPU, counted by the warm-seat scan into
+ * its own per-lane sum. The scan already walks every CPU, so one load
+ * per CPU there replaces a pair of global read-modify-writes on the
+ * switch path.
+ */
+bool cpu_running[BABY_MAX_CPUS];
+
+/*
  * Fast-lane time budget, per CPU. The bucket accrues two thirds of
  * wall time as fast-lane credit and holds at most four base slices.
  * It is charged the span a fast-lane interval covers: the run itself,
@@ -162,6 +170,16 @@ u8 seat_used[2][BABY_MAX_CPUS];
 static s64 fl_budget_ns[BABY_MAX_CPUS];
 static u64 fl_budget_at[BABY_MAX_CPUS];
 static u64 cpu_fl_running_at[BABY_MAX_CPUS];
+
+/*
+ * The contention state stamped by the stop that ended this CPU's last
+ * fast-lane run. The run that follows charges the stop-to-run gap
+ * against the bulk work that waited when the run ended, so it reuses
+ * the stop's probe instead of taking a second one a few hundred
+ * nanoseconds later. A bulk run or an idle dispatch clears the stamp
+ * with the fast-lane clock.
+ */
+static bool cpu_bulk_wait[BABY_MAX_CPUS];
 
 /*
  * Bulk backstop: the longest a CPU may run nothing but the fast lane
@@ -207,13 +225,17 @@ static __always_inline void refill_fl_budget(u32 idx, u64 now)
 static __always_inline bool bulk_waiting(s32 cpu)
 {
 	s32 node = __COMPAT_scx_bpf_cpu_node(cpu);
+	u32 idx = (u32)cpu & (BABY_MAX_CPUS - 1);
 
 	/*
-	 * Probe the seat directly: a pull can clear the seat hint while
-	 * a concurrent enqueue has already set it and not yet committed
-	 * the insert, and the hint would then hide a waiting task.
+	 * The seat hint is published after the insert, so a clear hint
+	 * means the seat was empty when its writer committed; an insert
+	 * that lands after a clear costs one sampling interval of
+	 * contention accounting, not a wakeup, because it carries its
+	 * own kick. A set hint is only a hint: probe the queue itself.
 	 */
-	return scx_bpf_dsq_nr_queued(cpu2dsq(cpu)) ||
+	return (READ_ONCE(seat_used[0][idx]) &&
+		scx_bpf_dsq_nr_queued(cpu2dsq(cpu))) ||
 	       scx_bpf_dsq_nr_queued(node);
 }
 
@@ -498,32 +520,49 @@ s32 BPF_STRUCT_OPS(baby_select_cpu, struct task_struct *p,
 				return prev_cpu;
 			}
 
-			if (!scx_bpf_dsq_nr_queued(fl_cpu2dsq(prev_cpu)) &&
-			    !scx_bpf_dsq_nr_queued(cpu2dsq(prev_cpu)) &&
-			    !scx_bpf_dsq_nr_queued(SCX_DSQ_LOCAL_ON |
-						   prev_cpu)) {
-				struct task_struct *curr =
-					__COMPAT_scx_bpf_cpu_curr(prev_cpu);
-				struct task_ctx *cctx = curr ?
-					try_lookup_task_ctx(curr) : NULL;
+			/*
+			 * Neither the lease nor the residency floor can
+			 * change while the queues are probed, and both
+			 * veto the cut on their own. Test them first: a
+			 * wakee behind another latency-critical owner, or
+			 * one that arrives inside the floor, leaves every
+			 * queue and the resident's context untouched.
+			 */
+			if (!other_owner) {
 				u64 ran_at = cpu_running_at[pidx];
 
-				if (!other_owner && curr && curr != p &&
-				    !(curr->flags & PF_IDLE) && cctx &&
-				    !is_lat_cri(cctx) && !is_pcpu_task(curr) &&
-				    p->static_prio <= curr->static_prio &&
-				    ran_at &&
+				if (ran_at &&
 				    now - ran_at >=
-					    BABY_TICK_PREEMPT_PROTECT_NS) {
-					scx_bpf_dsq_insert(p,
-							   SCX_DSQ_LOCAL_ON |
-							   prev_cpu,
-							   task_slice(tctx),
-							   SCX_ENQ_PREEMPT);
-					if (stats_enabled)
-						__sync_fetch_and_add(
-							&nr_wake_preempts, 1);
-					return prev_cpu;
+					    BABY_TICK_PREEMPT_PROTECT_NS &&
+				    (!READ_ONCE(seat_used[1][pidx]) ||
+				     !scx_bpf_dsq_nr_queued(
+					     fl_cpu2dsq(prev_cpu))) &&
+				    (!READ_ONCE(seat_used[0][pidx]) ||
+				     !scx_bpf_dsq_nr_queued(
+					     cpu2dsq(prev_cpu))) &&
+				    !scx_bpf_dsq_nr_queued(SCX_DSQ_LOCAL_ON |
+							   prev_cpu)) {
+					struct task_struct *curr =
+						__COMPAT_scx_bpf_cpu_curr(prev_cpu);
+					struct task_ctx *cctx = curr ?
+						try_lookup_task_ctx(curr) : NULL;
+
+					if (curr && curr != p &&
+					    !(curr->flags & PF_IDLE) && cctx &&
+					    !is_lat_cri(cctx) &&
+					    !is_pcpu_task(curr) &&
+					    p->static_prio <= curr->static_prio) {
+						scx_bpf_dsq_insert(p,
+								   SCX_DSQ_LOCAL_ON |
+								   prev_cpu,
+								   task_slice(tctx),
+								   SCX_ENQ_PREEMPT);
+						if (stats_enabled)
+							__sync_fetch_and_add(
+								&nr_wake_preempts,
+								1);
+						return prev_cpu;
+					}
 				}
 			}
 		}
@@ -830,7 +869,7 @@ void BPF_STRUCT_OPS(baby_enqueue, struct task_struct *p, u64 enq_flags)
  */
 void BPF_STRUCT_OPS(baby_dispatch, s32 cpu, struct task_struct *prev)
 {
-	struct task_ctx *tctx = prev ? try_lookup_task_ctx(prev) : NULL;
+	struct task_ctx *tctx;
 	bool need_running = prev && is_queued(prev);
 	s32 node = __COMPAT_scx_bpf_cpu_node(cpu);
 	u32 idx = (u32)cpu & (BABY_MAX_CPUS - 1);
@@ -851,7 +890,16 @@ void BPF_STRUCT_OPS(baby_dispatch, s32 cpu, struct task_struct *prev)
 	 */
 	s64 fl_budget_in = fl_budget_ns[idx];
 
-	census_sample(cpu);
+	/*
+	 * Only the keep paths and the stats counters read the previous
+	 * task's context. A dispatch where prev is blocking, the common
+	 * case on a wake-heavy workload, skips the storage lookup.
+	 */
+	tctx = (need_running || stats_enabled) && prev ?
+		try_lookup_task_ctx(prev) : NULL;
+
+	if (stats_enabled)
+		census_sample(cpu);
 	refill_fl_budget(idx, now);
 
 	/*
@@ -1204,6 +1252,7 @@ void BPF_STRUCT_OPS(baby_dispatch, s32 cpu, struct task_struct *prev)
 		 */
 		cpu_fl_running_at[idx] = 0;
 		cpu_bulk_at[idx] = 0;
+		cpu_bulk_wait[idx] = false;
 		cpuperf_on_idle(cpu);
 	}
 }
@@ -1225,6 +1274,7 @@ void BPF_STRUCT_OPS(baby_cpu_release, s32 cpu,
 	 * as void, the re-enqueue happens either way.
 	 */
 	cpu_fl_running_at[(u32)cpu & (BABY_MAX_CPUS - 1)] = 0;
+	cpu_bulk_wait[(u32)cpu & (BABY_MAX_CPUS - 1)] = false;
 	scx_bpf_reenqueue_local();
 }
 
@@ -1353,7 +1403,13 @@ void BPF_STRUCT_OPS(baby_stopping, struct task_struct *p, bool runnable)
 	s32 last_cpu;
 	u64 now;
 
-	__sync_fetch_and_sub(&nr_running, 1);
+	/*
+	 * The count is a hybrid-compaction input and a stats field; a
+	 * single-tier machine with stats off reads neither, so it does
+	 * not pay two global read-modify-writes per switch to keep it.
+	 */
+	if ((nr_little_cpus && nr_big_cpus) || stats_enabled)
+		__sync_fetch_and_sub(&nr_running, 1);
 
 	/*
 	 * The CPU's running-class residency lapses with the resident;
@@ -1378,12 +1434,17 @@ void BPF_STRUCT_OPS(baby_stopping, struct task_struct *p, bool runnable)
 		 * bulk stop clears the stamp.
 		 */
 		if (cpu_is_lat[idx]) {
+			bool contended = bulk_waiting(last_cpu);
+
 			refill_fl_budget(idx, now);
-			charge_fl_runtime(idx, now, bulk_waiting(last_cpu));
+			charge_fl_runtime(idx, now, contended);
+			cpu_bulk_wait[idx] = contended;
 		} else {
 			cpu_fl_running_at[idx] = 0;
+			cpu_bulk_wait[idx] = false;
 		}
 		cpu_is_lat[idx] = false;
+		cpu_running[idx] = false;
 	}
 
 	if (!tctx)
@@ -1446,7 +1507,8 @@ void BPF_STRUCT_OPS(baby_running, struct task_struct *p)
 	struct task_ctx *tctx = try_lookup_task_ctx(p);
 	u64 now = bpf_ktime_get_ns();
 
-	__sync_fetch_and_add(&nr_running, 1);
+	if ((nr_little_cpus && nr_big_cpus) || stats_enabled)
+		__sync_fetch_and_add(&nr_running, 1);
 
 	/*
 	 * The victim-residency stamp for the tick gate, and the point where
@@ -1459,6 +1521,7 @@ void BPF_STRUCT_OPS(baby_running, struct task_struct *p)
 		u32 cpu_idx = (u32)cpu & (BABY_MAX_CPUS - 1);
 
 		cpu_running_at[cpu_idx] = now;
+		cpu_running[cpu_idx] = true;
 		cpu_is_lat[cpu_idx] = tctx && is_lat_cri(tctx);
 		if (cpu_is_lat[cpu_idx]) {
 			cpu_lat_pid[cpu_idx] = (u32)p->pid;
@@ -1476,7 +1539,8 @@ void BPF_STRUCT_OPS(baby_running, struct task_struct *p)
 		 */
 		if (cpu_fl_running_at[cpu_idx]) {
 			refill_fl_budget(cpu_idx, now);
-			charge_fl_runtime(cpu_idx, now, bulk_waiting(cpu));
+			charge_fl_runtime(cpu_idx, now,
+					  cpu_bulk_wait[cpu_idx]);
 		}
 		cpu_fl_running_at[cpu_idx] = cpu_is_lat[cpu_idx] ? now : 0;
 		if (tctx)

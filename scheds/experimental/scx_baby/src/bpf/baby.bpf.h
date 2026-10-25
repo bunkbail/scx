@@ -140,6 +140,7 @@ _Static_assert(BABY_FL_NODE_DSQ_BASE + BABY_MAX_NODES <= BABY_CPU_DSQ_BASE,
  * the relocation filter read this instead.
  */
 extern bool cpu_is_lat[BABY_MAX_CPUS];
+extern bool cpu_running[BABY_MAX_CPUS];
 
 /*
  * The CPU's recent fast-lane owner (see main.bpf.c): the task that last
