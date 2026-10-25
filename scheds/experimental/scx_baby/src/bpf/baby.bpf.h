@@ -185,6 +185,22 @@ extern u64 node_service_at[2][BABY_NODE_CLOCK_NR];
 extern u8 seat_used[2][BABY_MAX_CPUS];
 
 /*
+ * Per-queue pending counts, indexed by lane (0 bulk, 1 fast): the number
+ * of arrivals the scheduler inserted into that queue and has not yet
+ * seen leave it. A zero count is a fact about the queue when the reader
+ * looked, not a hint: it lets ops.dispatch() and the contention
+ * accounting skip the peeks and pull attempts a lane would otherwise
+ * cost on every switch, and only the arrival-side work that fills the
+ * queue raises it. An insert raises the count before it commits and
+ * rolls a refusal back, so a queue a reader finds at zero holds no work
+ * that has committed. A departure the scheduler never observes - a
+ * kernel-side pop, a task exiting while queued - leaves the count high,
+ * which costs a probe and never strands work.
+ */
+extern u64 seat_pending[2][BABY_MAX_CPUS];
+extern u64 node_pending[2][BABY_NODE_CLOCK_NR];
+
+/*
  * Scheduling statistics. nr_running owns a cache line: it is a
  * control-plane input read on the hot paths, and the diagnostic
  * counters must not share its line (see stats.bpf.c).
@@ -447,7 +463,99 @@ struct task_ctx {
 	 * through scx_bpf_task_cpu().
 	 */
 	s32 last_cpu;
+
+	/*
+	 * The queued arrival this task still owes its pending count to: a
+	 * tag naming the queue's kind, lane and index, or zero when the
+	 * task is in no tagged queue. baby_insert_vtime() sets it and
+	 * baby_untag() clears it where the task is next seen running or
+	 * enqueued, so the count is lowered exactly once per insert.
+	 */
+	u32 queued_tag;
 };
+
+/*
+ * A granted slice and the tag it needs share no storage: the tick, the
+ * yield and the dispatch keep path all rewrite p->scx.slice, and every
+ * caller of the helpers below already holds the task context. The tag
+ * names one of the four tagged queues, seat or node queue in one of the
+ * two lanes, plus one so that zero reads as "not queued".
+ */
+#define BABY_TAG_LANE_SHIFT	7	/* one bit, above the 7-bit index */
+#define BABY_TAG_NODE_SHIFT	8	/* 0 seat, 1 node queue */
+#define BABY_TAG_NODE_BIT	(1U << BABY_TAG_NODE_SHIFT)
+
+static __always_inline u32 baby_tag(u32 node, u32 lane, u32 idx)
+{
+	idx &= node ? (BABY_NODE_CLOCK_NR - 1) : (BABY_MAX_CPUS - 1);
+
+	return ((node << BABY_TAG_NODE_SHIFT) | (lane << BABY_TAG_LANE_SHIFT) |
+		idx) + 1;
+}
+
+static __always_inline void baby_pending_add(u32 tag)
+{
+	u32 t = tag - 1;
+
+	if (t & BABY_TAG_NODE_BIT)
+		__sync_fetch_and_add(
+			&node_pending[(t >> BABY_TAG_LANE_SHIFT) & 1]
+				     [t & (BABY_NODE_CLOCK_NR - 1)], 1);
+	else
+		__sync_fetch_and_add(
+			&seat_pending[(t >> BABY_TAG_LANE_SHIFT) & 1]
+				     [t & (BABY_MAX_CPUS - 1)], 1);
+}
+
+static __always_inline void baby_pending_sub(u32 tag)
+{
+	u32 t = tag - 1;
+
+	if (t & BABY_TAG_NODE_BIT)
+		__sync_fetch_and_sub(
+			&node_pending[(t >> BABY_TAG_LANE_SHIFT) & 1]
+				     [t & (BABY_NODE_CLOCK_NR - 1)], 1);
+	else
+		__sync_fetch_and_sub(
+			&seat_pending[(t >> BABY_TAG_LANE_SHIFT) & 1]
+				     [t & (BABY_MAX_CPUS - 1)], 1);
+}
+
+/*
+ * Account that the task has visibly left the queue its tag names. The
+ * tag is cleared here, so a second call is a no-op and a stale tag
+ * cannot lower a count twice.
+ */
+static __always_inline void baby_untag(struct task_ctx *tctx)
+{
+	u32 tag = tctx->queued_tag;
+
+	if (!tag)
+		return;
+	tctx->queued_tag = 0;
+	baby_pending_sub(tag);
+}
+
+/*
+ * Insert an arrival into one of the tagged queues. The count is raised
+ * before the insert commits so that a reader cannot see zero while an
+ * insert that will land is in flight, and a refused insert rolls the
+ * raise back so the count never outlives a task that did not join.
+ */
+static __always_inline bool baby_insert_vtime(struct task_struct *p,
+					      struct task_ctx *tctx, u64 dsq,
+					      u64 slice, u64 deadline,
+					      u64 enq_flags, u32 tag)
+{
+	baby_untag(tctx);
+	baby_pending_add(tag);
+	if (!scx_bpf_dsq_insert_vtime(p, dsq, slice, deadline, enq_flags)) {
+		baby_pending_sub(tag);
+		return false;
+	}
+	tctx->queued_tag = tag;
+	return true;
+}
 
 /*
  * Roll the 200ms burst window to the window @now falls in. A task that

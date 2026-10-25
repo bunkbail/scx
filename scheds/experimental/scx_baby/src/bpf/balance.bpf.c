@@ -178,8 +178,9 @@ __hidden bool balance_try_warm_seat(struct task_struct *p, struct task_ctx *tctx
 				 * lands after the reader's peek carries the
 				 * kick that brings the CPU back.
 				 */
-				scx_bpf_dsq_insert_vtime(p, dsq, slice,
-							 tctx->deadline, 0);
+				baby_insert_vtime(p, tctx, dsq, slice,
+						  tctx->deadline, 0,
+						  baby_tag(0, lane, target));
 				WRITE_ONCE(seat_used[lane][tidx], 1);
 			}
 			stamp_wait(tctx, now, target_nr, false);

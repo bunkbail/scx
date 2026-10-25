@@ -134,6 +134,8 @@ static u64 node_preempt_claim[BABY_NODE_CLOCK_NR];
 u64 seat_service_at[2][BABY_MAX_CPUS];
 u64 node_service_at[2][BABY_NODE_CLOCK_NR];
 u8 seat_used[2][BABY_MAX_CPUS];
+u64 seat_pending[2][BABY_MAX_CPUS];
+u64 node_pending[2][BABY_NODE_CLOCK_NR];
 
 /*
  * Whether a task runs on each CPU, counted by the warm-seat scan into
@@ -226,17 +228,22 @@ static __always_inline bool bulk_waiting(s32 cpu)
 {
 	s32 node = __COMPAT_scx_bpf_cpu_node(cpu);
 	u32 idx = (u32)cpu & (BABY_MAX_CPUS - 1);
+	u32 nidx = (u32)node & (BABY_NODE_CLOCK_NR - 1);
 
 	/*
-	 * The seat hint is published after the insert, so a clear hint
-	 * means the seat was empty when its writer committed; an insert
-	 * that lands after a clear costs one sampling interval of
-	 * contention accounting, not a wakeup, because it carries its
-	 * own kick. A set hint is only a hint: probe the queue itself.
+	 * Both counts at zero prove nothing was waiting on either bulk
+	 * queue when the reader looked, so the probes below are skipped on
+	 * the uncontended case. A count that a departure the scheduler
+	 * never observed left high only costs the probes.
 	 */
-	return (READ_ONCE(seat_used[0][idx]) &&
+	if (!READ_ONCE(seat_pending[0][idx]) &&
+	    !READ_ONCE(node_pending[0][nidx]))
+		return false;
+
+	return (READ_ONCE(seat_pending[0][idx]) &&
 		scx_bpf_dsq_nr_queued(cpu2dsq(cpu))) ||
-	       scx_bpf_dsq_nr_queued(node);
+	       (READ_ONCE(node_pending[0][nidx]) &&
+		scx_bpf_dsq_nr_queued(node));
 }
 
 /*
@@ -698,6 +705,14 @@ void BPF_STRUCT_OPS(baby_enqueue, struct task_struct *p, u64 enq_flags)
 	if (!tctx)
 		return;
 
+	/*
+	 * Whatever queued this task next, it is not in a tagged queue any
+	 * more: the wake, the preemption requeue and the rescue reenqueue
+	 * all re-enter here, and the pending count of the queue it left
+	 * must fall with the first of them or with the run that follows.
+	 */
+	baby_untag(tctx);
+
 	tctx->last_acc_at = now;
 
 	/*
@@ -845,8 +860,9 @@ void BPF_STRUCT_OPS(baby_enqueue, struct task_struct *p, u64 enq_flags)
 		slice = backlog_deep(lane_backlog) && !tctx->tick_preempted
 			? 4 * deadline_ns : task_slice(tctx);
 
-		scx_bpf_dsq_insert_vtime(p, dsq, slice, tctx->deadline,
-					 enq_flags);
+		baby_insert_vtime(p, tctx, dsq, slice, tctx->deadline,
+				  enq_flags,
+				  baby_tag(1, lat, (u32)node));
 		stamp_wait(tctx, now, lane_backlog, true);
 	}
 
@@ -879,6 +895,7 @@ void BPF_STRUCT_OPS(baby_dispatch, s32 cpu, struct task_struct *prev)
 	u64 bulk_seat_dsq = cpu2dsq(cpu);
 	struct task_struct *fl_wq, *fl_q, *wq, *q;
 	u64 fl_wq_dl, fl_g_dl, wq_dl, g_dl, fl_dl, bulk_dl, best_dl;
+	u64 seat_bulk, seat_fast, node_bulk, node_fast;
 	u64 now = bpf_ktime_get_ns();
 	bool has_fl, has_bulk, fl_allowed, serve_fl;
 	/*
@@ -909,11 +926,23 @@ void BPF_STRUCT_OPS(baby_dispatch, s32 cpu, struct task_struct *prev)
 	 * heads are the first task this CPU can run, not the queue head:
 	 * an affinity-restricted head must neither read as the lane's
 	 * next deadline here nor hide the tasks behind it.
+	 *
+	 * A lane whose pending count is zero held nothing when this
+	 * dispatch read it, so its peek is skipped: on a machine that
+	 * spreads wakeups across idle CPUs both lanes read zero on almost
+	 * every dispatch, and the peek is a queue lookup. A count a
+	 * departure the scheduler never observed left high costs the peek
+	 * and changes nothing else.
 	 */
-	fl_wq = __COMPAT_scx_bpf_dsq_peek(fl_seat_dsq);
-	fl_q = dsq_peek_allowed(fl_node_dsq, cpu);
-	wq = __COMPAT_scx_bpf_dsq_peek(bulk_seat_dsq);
-	q = dsq_peek_allowed(node, cpu);
+	seat_bulk = READ_ONCE(seat_pending[0][idx]);
+	seat_fast = READ_ONCE(seat_pending[1][idx]);
+	node_bulk = READ_ONCE(node_pending[0][nidx]);
+	node_fast = READ_ONCE(node_pending[1][nidx]);
+
+	fl_wq = seat_fast ? __COMPAT_scx_bpf_dsq_peek(fl_seat_dsq) : NULL;
+	fl_q = node_fast ? dsq_peek_allowed(fl_node_dsq, cpu) : NULL;
+	wq = seat_bulk ? __COMPAT_scx_bpf_dsq_peek(bulk_seat_dsq) : NULL;
+	q = node_bulk ? dsq_peek_allowed(node, cpu) : NULL;
 
 	fl_wq_dl = fl_wq ? fl_wq->scx.dsq_vtime : ULLONG_MAX;
 	fl_g_dl = fl_q ? fl_q->scx.dsq_vtime : ULLONG_MAX;
@@ -1138,7 +1167,7 @@ void BPF_STRUCT_OPS(baby_dispatch, s32 cpu, struct task_struct *prev)
 		 */
 		s32 from = q ? scx_bpf_task_cpu(q) : -1;
 
-		if (scx_bpf_dsq_move_to_local(node, 0)) {
+		if (node_bulk && scx_bpf_dsq_move_to_local(node, 0)) {
 			if (now - node_service_at[0][nidx] >
 			    NSEC_PER_MSEC)
 				node_service_at[0][nidx] = now;
@@ -1147,7 +1176,7 @@ void BPF_STRUCT_OPS(baby_dispatch, s32 cpu, struct task_struct *prev)
 					&nr_pull_land[cpu_dist(cpu, from)], 1);
 			return;
 		}
-		if (scx_bpf_dsq_move_to_local(bulk_seat_dsq, 0)) {
+		if (seat_bulk && scx_bpf_dsq_move_to_local(bulk_seat_dsq, 0)) {
 			seat_service_at[0][idx] = now;
 			if (seat_used[0][idx] &&
 			    !scx_bpf_dsq_nr_queued(bulk_seat_dsq))
@@ -1155,14 +1184,14 @@ void BPF_STRUCT_OPS(baby_dispatch, s32 cpu, struct task_struct *prev)
 			return;
 		}
 	} else {
-		if (scx_bpf_dsq_move_to_local(bulk_seat_dsq, 0)) {
+		if (seat_bulk && scx_bpf_dsq_move_to_local(bulk_seat_dsq, 0)) {
 			seat_service_at[0][idx] = now;
 			if (seat_used[0][idx] &&
 			    !scx_bpf_dsq_nr_queued(bulk_seat_dsq))
 				seat_used[0][idx] = 0;
 			return;
 		}
-		if (scx_bpf_dsq_move_to_local(node, 0)) {
+		if (node_bulk && scx_bpf_dsq_move_to_local(node, 0)) {
 			if (now - node_service_at[0][nidx] >
 			    NSEC_PER_MSEC)
 				node_service_at[0][nidx] = now;
@@ -1231,6 +1260,14 @@ void BPF_STRUCT_OPS(baby_dispatch, s32 cpu, struct task_struct *prev)
 		 * already pulled its node queue; the fast lane's serve and
 		 * fallback both require the peek, so a task past the bound
 		 * would otherwise leave this CPU idle.
+		 *
+		 * These two pulls are the last thing before the CPU idles,
+		 * so they stay unconditional even when the pending counts
+		 * above said both lanes were empty: they are what closes the
+		 * one race a count cannot, an insert that commits between
+		 * the count's read and this point. A pull with nothing
+		 * behind it costs a queue lookup, which is what the counts
+		 * save on every other dispatch.
 		 */
 		if (scx_bpf_dsq_move_to_local(fl_node_dsq, 0)) {
 			if (node_preempt_claim[nidx])
@@ -1550,6 +1587,13 @@ void BPF_STRUCT_OPS(baby_running, struct task_struct *p)
 	if (!tctx)
 		return;
 
+	/*
+	 * The pull that delivered this task has emptied its queue of it:
+	 * lower the pending count of the queue the arrival was tagged
+	 * with, so a lane that has gone quiet reads zero again.
+	 */
+	baby_untag(tctx);
+
 	tctx->tick_preempted = false;
 	tctx->last_acc_at = now;
 
@@ -1623,6 +1667,12 @@ s32 BPF_STRUCT_OPS(baby_init_task, struct task_struct *p,
 
 	now = bpf_ktime_get_ns();
 	class_init_task(tctx, p, now);
+	/*
+	 * A fresh task is in no tagged queue. Task storage arrives zeroed,
+	 * but the untag path must never see a tag that no insert raised,
+	 * so the invariant is stated here rather than assumed.
+	 */
+	tctx->queued_tag = 0;
 
 	return 0;
 }
