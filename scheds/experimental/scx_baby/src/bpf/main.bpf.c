@@ -21,6 +21,12 @@ const volatile u64 deadline_ns = 1180000ULL;
 const volatile bool debug;
 
 /*
+ * Gaming profile: a latency-critical wake behind a foreground resident
+ * joins the shared fast-lane queue instead of the resident's warm seat.
+ */
+const volatile bool gaming;
+
+/*
  * Big and little CPU sets, published by userspace at startup. They drive
  * the hybrid compaction below; both stay empty on a single-tier machine,
  * which disables every hybrid path.

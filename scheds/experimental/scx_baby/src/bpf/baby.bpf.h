@@ -97,6 +97,12 @@ extern const volatile u64 deadline_ns;
 extern const volatile bool debug;
 
 /*
+ * Gaming profile: a latency-critical wake behind a foreground resident
+ * joins the shared fast-lane queue instead of the resident's warm seat.
+ */
+extern const volatile bool gaming;
+
+/*
  * The wait/census instrument and the distance histograms run; set
  * from --stats at load.
  */

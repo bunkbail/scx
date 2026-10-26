@@ -33,6 +33,16 @@ Task classes are measured, not declared. A task's runtime history and its
 wake frequency set its slice length, its wake-preemption eligibility and
 its lane.
 
+### Profiles
+
+The scheduler runs one of two profiles. The default is the placement
+described here. The gaming profile (`--profile gaming`, or `--game`) keeps
+a latency-critical wake out of a foreground resident's warm seat: the
+arrival joins the shared fast-lane queue, where the earliest deadline
+wins, instead of waiting out the resident's fourfold slice. It trades
+throughput under saturation for lower frame latency. Both profiles share
+one binary and one BPF program; the profile is a rodata flag.
+
 ## Design
 
 ### Deadline and time slice

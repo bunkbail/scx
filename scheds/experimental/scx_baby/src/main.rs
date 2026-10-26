@@ -205,6 +205,23 @@ struct Opts {
     )]
     perf_lvl: i64,
 
+    /// Scheduling profile. `default` keeps the throughput-first
+    /// placement. `gaming` keeps a latency-critical wake out of a
+    /// foreground resident's warm seat, trading throughput under
+    /// saturation for lower frame latency.
+    #[clap(
+        long,
+        default_value = "default",
+        value_parser = clap::builder::PossibleValuesParser::new([
+            "default", "gaming"
+        ])
+    )]
+    profile: String,
+
+    /// Shorthand for --profile gaming.
+    #[clap(long, action = clap::ArgAction::SetTrue)]
+    game: bool,
+
     /// Enable stats monitoring with the specified interval.
     #[clap(long)]
     stats: Option<f64>,
@@ -359,6 +376,13 @@ impl<'a> Scheduler<'a> {
             }
         );
         rodata.cpuperf_lvl = opts.perf_lvl;
+
+        // Scheduling profile: the default keeps the warm seat; the
+        // gaming profile sends a latency-critical wake behind a
+        // foreground resident to the shared fast-lane queue.
+        let gaming = opts.game || opts.profile == "gaming";
+        info!("profile: {}", if gaming { "gaming" } else { "default" });
+        rodata.gaming = gaming;
 
         // Set scheduler flags.
         //
