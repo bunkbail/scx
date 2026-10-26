@@ -136,33 +136,12 @@ _Static_assert(BABY_FL_NODE_DSQ_BASE + BABY_MAX_NODES <= BABY_CPU_DSQ_BASE,
  * Per-CPU running-class residency, stamped in ops.running() and cleared
  * in ops.stopping(). Queue depth cannot answer whether a CPU runs a
  * tick-cuttable bulk resident: CPU-bound workers never queue, so bulk
- * depth can read zero while bulk residency is total. The warm gate and
- * the relocation filter read this instead.
+ * depth can read zero while bulk residency is total. The fast-lane
+ * oversubscription gate, the fast-lane budget and the dispatch keep
+ * read this instead.
  */
 extern bool cpu_is_lat[BABY_MAX_CPUS];
 extern bool cpu_running[BABY_MAX_CPUS];
-
-/*
- * The CPU's recent fast-lane owner (see main.bpf.c): the task that last
- * ran there in the fast lane and when. It carries the co-location fact
- * across the sleep that separates two pipeline stages, which the
- * instantaneous residency bit above cannot.
- */
-extern u32 cpu_lat_pid[BABY_MAX_CPUS];
-extern u64 cpu_lat_at[BABY_MAX_CPUS];
-
-/*
- * Whether @cpu's fast lane belongs to another task right now: a
- * fast-lane resident, or a different fast-lane task that ran there
- * inside the lease window. A wakee that lands on such a CPU shares its
- * time budget instead of getting a CPU of its own.
- */
-static __always_inline bool cpu_owned_by_other_lat(u32 idx, u32 pid, u64 now)
-{
-	return cpu_is_lat[idx] ||
-	       (cpu_lat_pid[idx] && cpu_lat_pid[idx] != pid &&
-		now - cpu_lat_at[idx] < 2 * deadline_ns);
-}
 
 /*
  * Per-queue service clocks for the starve rescue (see main.bpf.c). They

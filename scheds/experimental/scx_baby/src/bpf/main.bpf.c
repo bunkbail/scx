@@ -97,20 +97,6 @@ static u64 cpu_running_at[BABY_MAX_CPUS];
 bool cpu_is_lat[BABY_MAX_CPUS];
 
 /*
- * The CPU's recent fast-lane owner: the task that last ran there in the
- * fast lane, and when. The residency bit above only describes what runs
- * on the CPU at this instant. A serial pipeline hands over between its
- * stages by sleeping, so the bit is already clear (and a bulk task has
- * usually taken the CPU) by the time the next stage wakes. Without this
- * stamp, two stages could alternate on one CPU and silently share that
- * CPU's fast-lane budget, each seeing only a bulk resident in front of
- * it. The lease holds for two base slices, a little over one frame at
- * the rates this matters for.
- */
-u32 cpu_lat_pid[BABY_MAX_CPUS];
-u64 cpu_lat_at[BABY_MAX_CPUS];
-
-/*
  * One anti-herd claim per node: the high 32 bits hold the waiter's pid,
  * the low 32 bits the claim time with its low bit forced to one, so a
  * zero word means unclaimed. A claim suppresses another CPU's tick only
@@ -514,11 +500,7 @@ s32 BPF_STRUCT_OPS(baby_select_cpu, struct task_struct *p,
 						       cast_mask(mask));
 
 		if (allowed) {
-			bool other_owner =
-				cpu_owned_by_other_lat(pidx, (u32)p->pid, now);
-
-			if (!other_owner &&
-			    scx_bpf_test_and_clear_cpu_idle(prev_cpu)) {
+			if (scx_bpf_test_and_clear_cpu_idle(prev_cpu)) {
 				scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL,
 						   task_slice(tctx), 0);
 				if (stats_enabled)
@@ -528,14 +510,13 @@ s32 BPF_STRUCT_OPS(baby_select_cpu, struct task_struct *p,
 			}
 
 			/*
-			 * Neither the lease nor the residency floor can
-			 * change while the queues are probed, and both
-			 * veto the cut on their own. Test them first: a
-			 * wakee behind another latency-critical owner, or
-			 * one that arrives inside the floor, leaves every
-			 * queue and the resident's context untouched.
+			 * The residency floor cannot change while the
+			 * queues are probed, and it vetoes the cut on its
+			 * own. Test it first: a wakee that arrives inside
+			 * the floor leaves every queue and the resident's
+			 * context untouched.
 			 */
-			if (!other_owner) {
+			{
 				u64 ran_at = cpu_running_at[pidx];
 
 				if (ran_at &&
@@ -652,8 +633,7 @@ s32 BPF_STRUCT_OPS(baby_select_cpu, struct task_struct *p,
 			tctx->wake_gate_miss = BABY_WG_M4_DEGEN;
 			return cpu;
 		}
-		if (is_lat_cri(cctx) ||
-		    cpu_owned_by_other_lat(pcpu_idx, (u32)p->pid, now)) {
+		if (is_lat_cri(cctx)) {
 			tctx->wake_gate_miss = BABY_WG_M4_VICTIM_LAT;
 			/*
 			 * The previous CPU runs another latency-critical
@@ -1560,12 +1540,8 @@ void BPF_STRUCT_OPS(baby_running, struct task_struct *p)
 		cpu_running_at[cpu_idx] = now;
 		cpu_running[cpu_idx] = true;
 		cpu_is_lat[cpu_idx] = tctx && is_lat_cri(tctx);
-		if (cpu_is_lat[cpu_idx]) {
-			cpu_lat_pid[cpu_idx] = (u32)p->pid;
-			cpu_lat_at[cpu_idx] = now;
-		} else {
+		if (!cpu_is_lat[cpu_idx])
 			cpu_bulk_at[cpu_idx] = now;
-		}
 		/*
 		 * The fast-lane clock. A non-zero stamp means the CPU's last
 		 * run was fast-lane work and no bulk run or idle dispatch

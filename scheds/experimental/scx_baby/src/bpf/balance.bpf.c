@@ -79,7 +79,7 @@ __hidden bool balance_try_warm_seat(struct task_struct *p, struct task_ctx *tctx
 			u64 q_nr = seat_used[1][ci] ?
 					   scx_bpf_dsq_nr_queued(fl_cpu2dsq(i)) : 0;
 			u64 nr = lat ? q_nr : b_nr;
-			bool i_lat = cpu_owned_by_other_lat(ci, (u32)p->pid, now);
+			bool i_lat = cpu_is_lat[ci];
 
 			b_warm += b_nr;
 			q_warm += q_nr;
@@ -87,7 +87,7 @@ __hidden bool balance_try_warm_seat(struct task_struct *p, struct task_ctx *tctx
 				lat_running++;
 
 			if ((s32)i == target ||
-			    (target_nr < 2 && (!vlat || i_lat)) ||
+			    (target_nr < 2 && !vlat) ||
 			    !(enq_flags & SCX_ENQ_WAKEUP) ||
 			    !bpf_cpumask_test_cpu((s32)i, p->cpus_ptr))
 				continue;
@@ -121,11 +121,9 @@ __hidden bool balance_try_warm_seat(struct task_struct *p, struct task_ctx *tctx
 			 * CPU runs another latency-critical task gets an
 			 * effective depth of two and relocates to the
 			 * nearest CPU with a shallow fast-lane seat and a
-			 * cuttable bulk resident. For shallow seats the
-			 * scan skips latency-critical residents, since
-			 * relocating onto one is a pure migration. A pure
-			 * latency-critical swarm filters out every CPU, so
-			 * no relocation happens there.
+			 * cuttable bulk resident. A pure latency-critical
+			 * swarm filters out every CPU, so no relocation
+			 * happens there.
 			 */
 			u64 eff_nr = target_nr + (vlat ? 2 : 0);
 			u64 dsq, slice;
