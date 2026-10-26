@@ -126,7 +126,7 @@ these gates:
   own warm seat or the shared queue;
 - the victim is not itself latency-critical, so homogeneous batch workers
   never preempt each other;
-- the victim has held the CPU for at least 200us, so a task that just got
+- the victim has held the CPU for at least 50us, so a task that just got
   the CPU keeps it;
 - for a shared-queue waiter, one CPU at a time claims it, since the
   synchronized per-CPU ticks would otherwise all preempt for the same
@@ -212,15 +212,17 @@ cannot say whether a CPU runs a cuttable bulk resident: at full saturation
 the CPU-bound workers never queue, so bulk depth reads zero exactly where
 bulk residency is total.
 
-The same residency array filters the tick preemption's relocation scan:
-below a two-deep seat, a latency-critical wake relocates only onto a CPU
-running cuttable bulk, since a relocation onto another latency-critical
-resident is a pure migration. Two slice rules stay lane-specific: the
-warm-seat depth rung is bulk-only, because a non-foreground
-latency-critical arrival granted the fourfold slice becomes a long resident
-that no preemption path can cut, and the shared-node rung drops its lane
-condition because foreground tasks already earn the fourfold slice in
-`task_slice()`.
+The same residency array feeds the fast-lane oversubscription clause. A
+latency-critical arrival that would stack behind another latency-critical
+resident spreads to a seat at least two tasks shallower; an ordinary
+arrival moves off its own seat only when that seat is already two deep. The
+seat kick preempts a bulk resident only, since displacing another
+latency-critical resident is a pure migration. Two slice rules stay
+lane-specific: the warm-seat depth rung is bulk-only, because a
+non-foreground latency-critical arrival granted the fourfold slice becomes
+a long resident that no preemption path can cut, and the shared-node rung
+drops its lane condition because foreground tasks already earn the
+fourfold slice in `task_slice()`.
 
 ### Hybrid placement
 
@@ -260,14 +262,15 @@ deadline is earlier.
 
 ### CPU frequency
 
-Frequency is driven with `scx_bpf_cpuperf_set()` from each CPU's
-utilization, smoothed and applied with hysteresis, because
+The scheduler requests a frequency level with `scx_bpf_cpuperf_set()` from
+each CPU's utilization, smoothed and applied with hysteresis, because
 utilization-based frequency governors are blind under sched_ext. A proven
-consumer or foreground task gets the boost clock immediately when it starts
-running. A core that goes idle drops its performance level, so blippery
-cores, the housekeeping CPU included, ramp down instead of holding a high
-floor. `-p` overrides the level; `-p -2` leaves the platform's cpufreq
-setup alone.
+consumer or foreground task requests the boost clock immediately when it
+starts running. A core that goes idle drops its request, so blippery cores,
+the housekeeping CPU included, ramp down instead of holding a high floor.
+The requests are advisory: the platform's cpufreq integration decides how
+to apply them. `-p, --perf-lvl` overrides the level; `-p -2` leaves the
+platform's cpufreq setup alone.
 
 ### RT and deadline leases
 
@@ -322,10 +325,16 @@ policy.
   microseconds, default 1180 (the original `DEADLINE_NS`), accepted range
   100 to 100000. Above 10000 the tick is the only preemption source for a
   full slice; the scheduler warns.
-- `-p, --perf <LEVEL>`: CPU frequency performance level, -2 to 1024. Level
-  0 is the minimum and 1024 the maximum. The default -1 scales each CPU's
-  level from its utilization; -2 leaves the platform's cpufreq setup
+- `-p, --perf-lvl <LEVEL>`: CPU frequency performance level, -2 to 1024.
+  Level 0 is the minimum and 1024 the maximum. The default -1 scales each
+  CPU's level from its utilization; -2 leaves the platform's cpufreq setup
   alone.
+- `--profile <default|gaming>`: scheduling profile. `default` is the
+  throughput-first placement described above. `gaming` keeps a
+  latency-critical wake out of a foreground resident's warm seat and sends
+  it to the shared fast-lane queue, trading throughput under saturation for
+  lower frame latency.
+- `--game`: shorthand for `--profile gaming`.
 - `--stats <SECS>`: enable the stats report and run normally.
 - `--monitor <SECS>`: run in stats monitoring mode without launching the
   scheduler.
@@ -361,6 +370,7 @@ The binary lands in `target/release/scx_baby`.
 
 ```sh
 scx_baby                  # run with defaults
+scx_baby --game           # gaming profile: latency over throughput
 scx_baby -d 500           # 500us deadline and base slice
 scx_baby --stats 1        # print scheduling statistics every second
 ```
