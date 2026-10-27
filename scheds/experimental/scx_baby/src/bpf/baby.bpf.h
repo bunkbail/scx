@@ -82,6 +82,17 @@ static __always_inline u64 fl_node2dsq(s32 node)
 #define LAT_CRI_WAKE_FREQ	5
 #define FOREGROUND_WAKE_FREQ	10
 #define WAKE_SANE_MIN		4
+
+/*
+ * The two bars are a hierarchy, not independent knobs: the foreground
+ * class also earns the fourfold slice, so it has to stay strictly
+ * narrower than the latency class, and no bar may sit above the wake
+ * sample's cap (100 wakes per 100ms), or no task could ever reach it.
+ */
+_Static_assert(FOREGROUND_WAKE_FREQ > LAT_CRI_WAKE_FREQ,
+	       "the foreground bar must stay above the latency bar");
+_Static_assert(FOREGROUND_WAKE_FREQ <= 100,
+	       "the wake sample is capped at 100, so a higher bar is unreachable");
 #define MIN_NICE		(-20)
 #define MAX_NICE		19
 #define MAX_RT_PRIO		100

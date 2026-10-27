@@ -738,6 +738,30 @@ mod tests {
     }
 
     #[test]
+    fn the_two_bars_stay_distinct() {
+        // The bug this pins: LAT_CRI_WAKE_FREQ and FOREGROUND_WAKE_FREQ
+        // were both 5, so is_foreground() collapsed into "latency
+        // critical with real work" and every 60Hz-class poller earned
+        // the fourfold slice. The bars live in the BPF header, which
+        // userspace cannot read; baby.bpf.h carries static assertions
+        // for the relationship, and this test pins the consequence: a
+        // 60Hz cadence (six wakes per 100ms) clears the latency bar and
+        // stays below the foreground bar, a 100Hz cadence clears both.
+        let sixty = class_peak_after(&[6; 16]);
+        assert!(sixty >= 5, "60Hz must clear the latency bar, got {sixty}");
+        assert!(
+            sixty < 10,
+            "60Hz must not reach the foreground bar, got {sixty}"
+        );
+
+        let hundred = class_peak_after(&[10; 16]);
+        assert!(
+            hundred >= 10,
+            "100Hz must reach the foreground bar, got {hundred}"
+        );
+    }
+
+    #[test]
     fn sixty_hz_clears_the_wake_bar() {
         // 60Hz is six wakes per 100ms: above the class bar of 5. The
         // foreground test adds the runtime floor on top of the bar,
