@@ -166,10 +166,13 @@ frame rate, which is the state the credit exists for.
 - **Interactive**: used some CPU in its previous window but less than a
   quarter of one, and has not crossed the same bar in its current window.
   UI blips and event loops. Eligible to preempt on wakeup.
-- **Foreground**: clears the same 5-wake bar and does real work, more
+- **Foreground**: clears a 10-wake bar (100Hz) and does real work, more
   than one twentieth of the window. A browser renderer or an audio
   thread: too much CPU for the interactive class, but latency-bound all
   the same. Eligible to preempt on wakeup and granted the fourfold slice.
+  The bar sits above the latency one on purpose: the fourfold slice
+  exists for work that is issued a hundred times a second, and a thread
+  at the latency bar is already covered by the class above.
   There is no upper burst bound: a heavy waker that also does real work
   stays foreground, so the hybrid compaction still lets foreground beat
   the heavy pin. Every foreground task is also latency-critical;
