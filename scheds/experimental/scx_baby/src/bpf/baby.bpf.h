@@ -80,7 +80,7 @@ static __always_inline u64 fl_node2dsq(s32 node)
  * foreground bar are needed before the peak can reach 10.
  */
 #define LAT_CRI_WAKE_FREQ	5
-#define FOREGROUND_WAKE_FREQ	5
+#define FOREGROUND_WAKE_FREQ	10
 #define WAKE_SANE_MIN		4
 #define MIN_NICE		(-20)
 #define MAX_NICE		19
