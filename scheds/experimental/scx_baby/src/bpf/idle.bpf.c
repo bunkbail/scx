@@ -46,31 +46,41 @@ __hidden s32 pick_idle_cpu(struct task_struct *p, s32 prev_cpu,
  * refill of a migration, so the warm-seat fast paths must check it
  * before keeping a wakee on its previous CPU.
  *
+ * Moving off the warm CPU pays only when a wholly idle core is
+ * available: with every core occupied, the wake would land on another
+ * half core and lose both the warm seat and the fast-path preempt. The
+ * idle SMT mask answers both questions at once.
+ *
  * Platforms without SMT, and CPUs whose topology is not published, have
  * no sibling and report false.
  */
 __hidden bool cpu_smt_shared(s32 cpu)
 {
-	const struct cpumask *idle;
-	bool shared = false;
-	s32 i;
+	const struct cpumask *idle_smt, *idle;
+	bool shared;
+	s32 sib;
 
 	if (cpu < 0 || (u32)cpu >= nr_cpu_ids)
 		return false;
+
+	sib = cpu_smt_sibling(cpu);
+	if (sib < 0)
+		return false;
+
+	idle_smt = scx_bpf_get_idle_smtmask();
+	if (!idle_smt || bpf_cpumask_empty(idle_smt) ||
+	    bpf_cpumask_test_cpu(cpu, idle_smt)) {
+		if (idle_smt)
+			scx_bpf_put_cpumask(idle_smt);
+		return false;
+	}
+	scx_bpf_put_cpumask(idle_smt);
 
 	idle = scx_bpf_get_idle_cpumask();
 	if (!idle)
 		return false;
 
-	bpf_for(i, 0, nr_cpu_ids) {
-		if (i == cpu || cpu_dist(cpu, i) != BABY_DIST_SIBLING)
-			continue;
-		if (!bpf_cpumask_test_cpu(i, idle)) {
-			shared = true;
-			break;
-		}
-	}
-
+	shared = !bpf_cpumask_test_cpu(sib, idle);
 	scx_bpf_put_cpumask(idle);
 
 	return shared;

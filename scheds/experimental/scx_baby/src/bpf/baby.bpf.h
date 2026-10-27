@@ -131,6 +131,7 @@ extern const volatile u32 topo_node[BABY_MAX_CPUS];
 extern const volatile u32 topo_llc[BABY_MAX_CPUS];
 extern const volatile u32 topo_l2[BABY_MAX_CPUS];
 extern const volatile u32 topo_core[BABY_MAX_CPUS];
+extern const volatile u32 topo_sibling[BABY_MAX_CPUS];
 extern const volatile u64 nr_little_cpus, nr_big_cpus;
 
 _Static_assert(BABY_CPU_DSQ_BASE + BABY_MAX_CPUS <= BABY_FL_CPU_DSQ_BASE,
@@ -783,6 +784,7 @@ __hidden void class_init_task(struct task_ctx *tctx, struct task_struct *p, u64 
 __hidden s32 pick_idle_cpu(struct task_struct *p, s32 prev_cpu, u64 wake_flags,
 			  bool *is_idle);
 __hidden bool cpu_smt_shared(s32 cpu);
+__hidden s32 cpu_smt_sibling(s32 cpu);
 __hidden bool try_direct_dispatch(struct task_struct *p, struct task_ctx *tctx,
 				 s32 prev_cpu, u64 enq_flags, bool is_running);
 

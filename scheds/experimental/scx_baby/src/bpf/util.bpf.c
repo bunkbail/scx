@@ -35,6 +35,25 @@ const volatile u32 topo_node[BABY_MAX_CPUS];
 const volatile u32 topo_llc[BABY_MAX_CPUS];
 const volatile u32 topo_l2[BABY_MAX_CPUS];
 const volatile u32 topo_core[BABY_MAX_CPUS];
+const volatile u32 topo_sibling[BABY_MAX_CPUS];
+
+/*
+ * The SMT sibling of @cpu, or -1 on a CPU without one. Userspace fills
+ * one entry per CPU from the same core ids the distance ladder uses;
+ * the stored value is offset by one so an unfilled entry stays 0.
+ */
+__hidden s32 cpu_smt_sibling(s32 cpu)
+{
+	u32 i, v;
+
+	if (cpu < 0 || (u32)cpu >= nr_cpu_ids)
+		return -1;
+
+	i = (u32)cpu & (BABY_MAX_CPUS - 1);
+	v = topo_sibling[i];
+
+	return v ? (s32)(v - 1) : -1;
+}
 
 /*
  * A single cached comparison per queue in the warm-seat scan keeps the

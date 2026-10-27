@@ -341,11 +341,23 @@ impl<'a> Scheduler<'a> {
         // to a filled one. Entries are indexed by CPU id, so an
         // offline CPU leaves its entry unfilled instead of shifting
         // the table under the following CPUs.
+        let mut by_core: std::collections::HashMap<usize, Vec<usize>> =
+            std::collections::HashMap::new();
+        for cpu in topo.all_cpus.values() {
+            by_core
+                .entry(cpu.core_id as usize)
+                .or_default()
+                .push(cpu.id);
+        }
         for cpu in topo.all_cpus.values() {
             rodata.topo_node[cpu.id] = cpu.node_id as u32 + 1;
             rodata.topo_llc[cpu.id] = cpu.llc_id as u32 + 1;
             rodata.topo_l2[cpu.id] = cpu.l2_id as u32 + 1;
             rodata.topo_core[cpu.id] = cpu.core_id as u32 + 1;
+            let sib = by_core
+                .get(&(cpu.core_id as usize))
+                .and_then(|v| v.iter().copied().find(|&c| c != cpu.id));
+            rodata.topo_sibling[cpu.id] = sib.map(|c| c as u32 + 1).unwrap_or(0);
         }
         info!(
             "distance ladder: smt={} l2s={} llcs={} nodes={}",

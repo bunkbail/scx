@@ -54,7 +54,8 @@ __hidden bool balance_try_warm_seat(struct task_struct *p, struct task_ctx *tctx
 						      fl_cpu2dsq(target) :
 						      cpu2dsq(target));
 		u64 b_warm = 0, q_warm = 0, lat_running = 0;
-		u64 best_nr = BABY_MAX_CPUS, i, n_running = 0;
+		u64 best_nr = BABY_MAX_CPUS, best_cmp = BABY_MAX_CPUS;
+		u64 i, n_running = 0;
 		u32 best_rank = BABY_DIST_NR, rank;
 		s32 best = target;
 
@@ -93,10 +94,25 @@ __hidden bool balance_try_warm_seat(struct task_struct *p, struct task_ctx *tctx
 				continue;
 
 			rank = cpu_dist(prev_cpu, i);
-			if (nr < best_nr ||
-			    (nr == best_nr && rank < best_rank)) {
+			/*
+			 * A seat whose SMT sibling runs a latency-critical
+			 * task is half a core for that resident. Rank it
+			 * behind a whole core so a displaced task, or the
+			 * victim of a fast-lane collision, does not land
+			 * beside the frame producer.
+			 */
+			u64 cmp = nr;
+			s32 sib = cpu_smt_sibling((s32)i);
+
+			if (sib >= 0 &&
+			    cpu_is_lat[(u32)sib & (BABY_MAX_CPUS - 1)])
+				cmp += 2;
+
+			if (cmp < best_cmp ||
+			    (cmp == best_cmp && rank < best_rank)) {
 				best = (s32)i;
 				best_nr = nr;
+				best_cmp = cmp;
 				best_rank = rank;
 			}
 		}
