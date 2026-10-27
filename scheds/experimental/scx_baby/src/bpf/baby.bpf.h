@@ -781,7 +781,8 @@ __hidden void class_init_task(struct task_ctx *tctx, struct task_struct *p, u64 
  * idle.bpf.c: idle-CPU acquisition and direct dispatch.
  */
 __hidden s32 pick_idle_cpu(struct task_struct *p, s32 prev_cpu, u64 wake_flags,
-		  bool *is_idle);
+			  bool *is_idle);
+__hidden bool cpu_smt_shared(s32 cpu);
 __hidden bool try_direct_dispatch(struct task_struct *p, struct task_ctx *tctx,
 				 s32 prev_cpu, u64 enq_flags, bool is_running);
 

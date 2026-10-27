@@ -38,6 +38,45 @@ __hidden s32 pick_idle_cpu(struct task_struct *p, s32 prev_cpu,
 }
 
 /*
+ * Is @cpu sharing its physical core with a running task?
+ *
+ * A CPU whose SMT sibling is busy is only half a core: a task placed
+ * there executes alongside the sibling's resident and loses a large
+ * share of the core's execution units. That costs more than the cache
+ * refill of a migration, so the warm-seat fast paths must check it
+ * before keeping a wakee on its previous CPU.
+ *
+ * Platforms without SMT, and CPUs whose topology is not published, have
+ * no sibling and report false.
+ */
+__hidden bool cpu_smt_shared(s32 cpu)
+{
+	const struct cpumask *idle;
+	bool shared = false;
+	s32 i;
+
+	if (cpu < 0 || (u32)cpu >= nr_cpu_ids)
+		return false;
+
+	idle = scx_bpf_get_idle_cpumask();
+	if (!idle)
+		return false;
+
+	bpf_for(i, 0, nr_cpu_ids) {
+		if (i == cpu || cpu_dist(cpu, i) != BABY_DIST_SIBLING)
+			continue;
+		if (!bpf_cpumask_test_cpu(i, idle)) {
+			shared = true;
+			break;
+		}
+	}
+
+	scx_bpf_put_cpumask(idle);
+
+	return shared;
+}
+
+/*
  * Attempt to dispatch a task directly to an idle CPU.
  *
  * Return true if the task is dispatched, false otherwise.

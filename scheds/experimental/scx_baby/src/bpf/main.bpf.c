@@ -487,6 +487,13 @@ s32 BPF_STRUCT_OPS(baby_select_cpu, struct task_struct *p,
 	 * move. Its cache-warm CPU is the placement the spread has to beat,
 	 * not the other way around.
 	 *
+	 * The warm CPU is worth keeping only when its sibling is idle too.
+	 * An idle CPU whose SMT sibling runs another task is half a core,
+	 * and a wakee placed there loses a large share of the core's
+	 * execution units, far more than a refill costs. A shared core is
+	 * left to the kernel selector below, which knows the SMT topology
+	 * and prefers a wholly idle core.
+	 *
 	 * Usable means idle and allowed, or busy with a cuttable bulk
 	 * resident: the same preempt the wake gate below performs, but
 	 * reached before an idle CPU elsewhere wins the wake. A latency-
@@ -496,7 +503,8 @@ s32 BPF_STRUCT_OPS(baby_select_cpu, struct task_struct *p,
 	 * returns where it has already placed the task.
 	 */
 	if (tctx && is_lat_cri(tctx) &&
-	    bpf_cpumask_test_cpu(prev_cpu, p->cpus_ptr)) {
+	    bpf_cpumask_test_cpu(prev_cpu, p->cpus_ptr) &&
+	    !cpu_smt_shared(prev_cpu)) {
 		u32 pidx = (u32)prev_cpu & (BABY_MAX_CPUS - 1);
 		bool allowed = true;
 		struct bpf_cpumask *mask = non_lp_cpumask;
