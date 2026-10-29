@@ -206,9 +206,11 @@ struct Opts {
     perf_lvl: i64,
 
     /// Scheduling profile. `default` keeps the throughput-first
-    /// placement. `gaming` keeps a latency-critical wake out of a
-    /// foreground resident's warm seat, trading throughput under
-    /// saturation for lower frame latency.
+    /// placement. `gaming` adds frame-path handling: a latency-critical
+    /// wake stays out of a foreground resident's warm seat, and a task
+    /// woken by a fast-lane task inherits the lane for a bounded amount
+    /// of runtime, trading throughput under saturation for lower frame
+    /// latency.
     #[clap(
         long,
         default_value = "default",
@@ -512,6 +514,7 @@ impl<'a> Scheduler<'a> {
             nr_seat_self: bss_data.nr_seat_self,
             nr_seat_move: Ranks::of(&bss_data.nr_seat_move),
             nr_pull_land: Ranks::of(&bss_data.nr_pull_land),
+            nr_wake_boosts: bss_data.nr_wake_boosts,
             // The per-type arrival array is the single source: a seat
             // arrival is type * 2, a shared arrival type * 2 + 1.
             nr_arr_seat: bss_data.nr_arr_type[0] + bss_data.nr_arr_type[2],

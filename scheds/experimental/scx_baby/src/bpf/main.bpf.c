@@ -436,6 +436,14 @@ s32 BPF_STRUCT_OPS(baby_select_cpu, struct task_struct *p,
 	if (tctx) {
 		tctx->wake_gate_miss = BABY_WG_NO_GATE;
 		roll_burst_window(tctx, now);
+		/*
+		 * The game profile's wake boost: this hook runs in the
+		 * waker's context before any placement reads the class,
+		 * so a wakee woken by a fast-lane task is already in the
+		 * lane when the warm-CPU and idle picks below decide.
+		 */
+		if (wake_flags & SCX_WAKE_TTWU)
+			class_try_wake_boost(p, tctx);
 	}
 
 	/*
@@ -1331,15 +1339,32 @@ void BPF_STRUCT_OPS(baby_tick, struct task_struct *p)
 	 * charge point, so the stop that follows charges only the
 	 * remainder.
 	 */
-	if (is_lat_cri(tctx)) {
+	{
 		s32 cpu = scx_bpf_task_cpu(p);
 		u32 idx = (u32)cpu & (BABY_MAX_CPUS - 1);
 
-		refill_fl_budget(idx, now);
-		charge_fl_runtime(idx, now, bulk_waiting(cpu));
-	}
+		if (is_lat_cri(tctx)) {
+			refill_fl_budget(idx, now);
+			charge_fl_runtime(idx, now, bulk_waiting(cpu));
+		}
 
-	update_bursts(tctx, now);
+		update_bursts(tctx, now);
+
+		/*
+		 * A wake boost can run out inside update_bursts(). The
+		 * interval that just ended was charged above as fast
+		 * lane; what follows is bulk work, so the CPU's class
+		 * stamp and the fast-lane clock follow the class rather
+		 * than charging the bulk run to the budget at the next
+		 * stop.
+		 */
+		if (cpu_is_lat[idx] && !is_lat_cri(tctx)) {
+			cpu_is_lat[idx] = false;
+			cpu_fl_running_at[idx] = 0;
+			cpu_bulk_at[idx] = now;
+			cpu_bulk_wait[idx] = false;
+		}
+	}
 
 	cpuperf_on_tick(p, now,
 			is_heavy_proven(tctx) || is_foreground(tctx));
@@ -1500,6 +1525,15 @@ void BPF_STRUCT_OPS(baby_stopping, struct task_struct *p, bool runnable)
 
 	update_bursts(tctx, now);
 
+	/*
+	 * A wake boost lasts until the boosted task blocks: the work it
+	 * was woken for is done or has yielded, and the next run must
+	 * earn the lane again. A budget that runs out mid-run clears in
+	 * update_bursts() above.
+	 */
+	if (!runnable)
+		tctx->wake_boost_ns = 0;
+
 	class_boost_on_sleep(p, tctx, runnable, now);
 
 	/*
@@ -1527,7 +1561,7 @@ void BPF_STRUCT_OPS(baby_runnable, struct task_struct *p, u64 enq_flags)
 		return;
 
 	now = bpf_ktime_get_ns();
-	class_on_runnable(tctx, enq_flags, now);
+	class_on_runnable(p, tctx, enq_flags, now);
 }
 
 /*

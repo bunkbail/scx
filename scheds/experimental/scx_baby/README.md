@@ -36,12 +36,23 @@ its lane.
 ### Profiles
 
 The scheduler runs one of two profiles. The default is the placement
-described here. The gaming profile (`--profile gaming`, or `--game`) keeps
-a latency-critical wake out of a foreground resident's warm seat: the
-arrival joins the shared fast-lane queue, where the earliest deadline
-wins, instead of waiting out the resident's fourfold slice. It trades
-throughput under saturation for lower frame latency. Both profiles share
-one binary and one BPF program; the profile is a rodata flag.
+described here. The gaming profile (`--profile gaming`, or `--game`) adds
+frame-path handling on top.
+
+A latency-critical wake stays out of a foreground resident's warm seat:
+the arrival joins the shared fast-lane queue, where the earliest deadline
+wins, instead of waiting out the resident's fourfold slice.
+
+A task woken by a fast-lane task also inherits the lane for up to four
+milliseconds of CPU time. A frame thread's helpers and its submission
+path are on the frame's critical path but may wake too rarely to earn the
+class on their own; the boost runs them ahead of bulk instead of behind
+it. The budget is charged as the task runs and cleared when it blocks, so
+a task that keeps running without sleeping drops back to its own class.
+
+The profile trades throughput under saturation for lower frame latency.
+Both profiles share one binary and one BPF program; the profile is a
+rodata flag.
 
 ## Design
 

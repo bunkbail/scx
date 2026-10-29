@@ -8,6 +8,8 @@
  * slice and the nice-driven deadline shift.
  */
 #include "baby.bpf.h"
+/* bpf_in_task(): the wake boost must not read a waker in interrupt context. */
+#include <bpf_experimental.h>
 
 /*
  * Deadline offset applied by the task's nice level: the original
@@ -88,6 +90,17 @@ __hidden void update_bursts(struct task_ctx *tctx, u64 now)
 	if (delta) {
 		account_bursts(tctx, delta, now);
 		tctx->last_acc_at = now;
+		/*
+		 * The wake boost is a CPU-time budget, so it is consumed by
+		 * the runtime it was granted for. Charging it here covers
+		 * every accounting point (tick, stop and both dispatch
+		 * keeps), and each call consumes only the delta since the
+		 * previous one, so no interval is charged twice.
+		 */
+		if (tctx->wake_boost_ns)
+			tctx->wake_boost_ns =
+				delta >= tctx->wake_boost_ns ?
+					0 : tctx->wake_boost_ns - delta;
 	}
 }
 
@@ -150,11 +163,59 @@ __hidden bool is_interactive(const struct task_ctx *tctx)
 }
 
 /*
+ * Game profile wake boost: a task woken by a fast-lane task joins the
+ * fast lane for a bounded amount of CPU time, even when its own wake
+ * rate does not earn the class. A frame thread's helpers and its
+ * submission path are on the frame's critical path but may wake too
+ * rarely to clear the class bar on their own; running them behind bulk
+ * work is the stall the profile exists to remove.
+ *
+ * Only a wake in task context carries a waker. A cross-CPU wake queued
+ * as an IPI runs this in interrupt context, where the current task is
+ * whatever the interrupt landed on, so the helper rejects it. Kernel
+ * threads do not boost either: kworkers and ksoftirqd wake ordinary
+ * tasks for every finished disk read and network packet.
+ *
+ * The budget is several base slices on purpose. One slice would hand a
+ * helper too little time to finish the piece it was woken for; it then
+ * falls back behind bulk with its work half done, and its next request
+ * waits a whole round. A task that keeps being woken by a fast-lane
+ * task re-arms the budget on every such wake: it is on the critical
+ * path every time. A task that only runs without sleeping consumes the
+ * budget and drops back to its own class.
+ */
+#define BABY_WAKE_BOOST_NS	(4ULL * NSEC_PER_MSEC)
+
+__hidden void class_try_wake_boost(struct task_struct *p,
+				   struct task_ctx *tctx)
+{
+	struct task_struct *waker;
+	struct task_ctx *wctx;
+
+	if (!gaming || is_lat_cri(tctx) || !bpf_in_task())
+		return;
+
+	waker = bpf_get_current_task_btf();
+	if (!waker || waker == p ||
+	    (waker->flags & (PF_KTHREAD | PF_IDLE)))
+		return;
+
+	wctx = try_lookup_task_ctx(waker);
+	if (!wctx || !is_lat_cri(wctx))
+		return;
+
+	tctx->wake_boost_ns = BABY_WAKE_BOOST_NS;
+	if (stats_enabled)
+		__sync_fetch_and_add(&nr_wake_boosts, 1);
+}
+
+/*
  * The task has become runnable: stamp the arrival-type bit the wait
  * instrument files waits under, then track how often the task wakes.
  * Frequent wakers with real work to do are foreground tasks.
  */
-__hidden void class_on_runnable(struct task_ctx *tctx, u64 enq_flags, u64 now)
+__hidden void class_on_runnable(struct task_struct *p, struct task_ctx *tctx,
+				u64 enq_flags, u64 now)
 {
 	tctx->arrival_is_wake = (enq_flags & SCX_ENQ_WAKEUP) ? 1 : 0;
 
@@ -166,6 +227,16 @@ __hidden void class_on_runnable(struct task_ctx *tctx, u64 enq_flags, u64 now)
 	 */
 	if (!(enq_flags & SCX_ENQ_WAKEUP))
 		return;
+
+	/*
+	 * The wake boost is normally armed in ops.select_cpu(), which
+	 * runs in the waker's context before this hook and before any
+	 * placement reads the class. A wake that skipped it (a task
+	 * pinned to one CPU) still arms it here; the cross-CPU IPI case
+	 * is filtered in the helper.
+	 */
+	if (gaming && !tctx->wake_boost_ns)
+		class_try_wake_boost(p, tctx);
 
 	/*
 	 * A wake that skipped ops.select_cpu() still needs the burst
@@ -315,6 +386,7 @@ __hidden void class_init_task(struct task_ctx *tctx, struct task_struct *p, u64 
 	tctx->peak_freq = 0;
 	tctx->wake_samples = 0;
 	tctx->prev_bursts = 0;
+	tctx->wake_boost_ns = 0;
 	{
 		struct task_struct *parent = p->real_parent;
 		struct task_ctx *ptctx;

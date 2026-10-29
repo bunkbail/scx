@@ -89,6 +89,12 @@ volatile u64 nr_seat_move[BABY_DIST_NR];
 volatile u64 nr_pull_land[BABY_DIST_NR];
 
 /*
+ * Game-profile wake boosts: a task was woken by a fast-lane task and
+ * inherited the lane for the run that follows.
+ */
+volatile u64 nr_wake_boosts;
+
+/*
  * Wait-at-depth instrument. An enqueue that parks a task in a seat or
  * the shared queue stamps the arrival time and the depth it waits
  * behind (0, 1, 2, 3+). ops.running() charges the realized wait to that
