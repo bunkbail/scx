@@ -153,6 +153,9 @@ static void collect_sys_stat(void)
 		c->nr_queued_task += cpdomc->nr_queued_task;
 	}
 
+	/* Refresh one CPU's schedutil rate limit per interval, in turn. */
+	update_next_cpufreq_rate_limit();
+
 	/*
 	 * Collect statistics for each CPU (phase 1).
 	 *
@@ -402,12 +405,6 @@ static void collect_sys_stat(void)
 		cpuc->avg_util_invr = calc_asym_avg(cpuc->avg_util_invr, cpuc->cur_util_invr);
 
 		/*
-		 * Both utilization signals are now up to date, so recompute
-		 * the performance target. ops.running() only commits it.
-		 */
-		calc_cpuperf_target(cpuc);
-
-		/*
 		 * Calculate domain-pinned task utilization. Clamp both
 		 * snapshots to compute_wall. For wall time, this guards against
 		 * cross-interval contamination (last_measured_*_clk is sampled
@@ -489,6 +486,17 @@ static void collect_sys_stat(void)
 		update_effective_capacity(cpuc);
 
 		/*
+		 * Both utilization signals were updated in the first pass, so
+		 * recompute the performance target. A busy CPU sends it itself
+		 * from ops.running() and ops.tick(). An idle CPU runs neither,
+		 * so lower its frequency from here as its target decays. This
+		 * stays out of the first pass, which exceeds the verifier's
+		 * instruction limit with these calls inside it.
+		 */
+		calc_cpuperf_target(cpuc);
+		decay_idle_cpuperf_target(cpuc, c->now);
+
+		/*
 		 * Accumulate statistics.
 		 */
 		if (cpuc->big_core) {
@@ -533,6 +541,7 @@ static void collect_sys_stat(void)
 		struct bpf_cpumask *steady;
 		struct cpdom_ctx *cpu_cpdomc;
 		struct cpu_ctx *cpuc = get_cpu_ctx_id(cpu);
+
 		if (!cpuc) {
 			c->compute_total_wall = 0;
 			break;
@@ -565,6 +574,20 @@ static void collect_sys_stat(void)
 			else
 				bpf_cpumask_clear_cpu(cpu, steady);
 		}
+
+		/*
+		 * Repair idle hints: a busy CPU loses its bit (bypass mode
+		 * skips ops.update_idle()); an idle CPU without one is kicked
+		 * and re-marks itself in ops.dispatch() if it really repicks
+		 * idle, so a CPU whose claim is in flight is not re-advertised.
+		 * A force-idled CPU (core scheduling) keeps work in its local
+		 * DSQ and never reaches ops.dispatch(); leave it alone.
+		 */
+		if (!cpuc->is_online || !is_cpu_idle_now(cpu))
+			clear_cpu_idle_state(cpuc, cpu);
+		else if (!is_cpu_hinted_idle(cpuc) &&
+			 !scx_bpf_dsq_nr_queued(SCX_DSQ_LOCAL_ON | cpu))
+			scx_bpf_kick_cpu(cpu, SCX_KICK_IDLE);
 		bpf_rcu_read_unlock();
 
 		/*

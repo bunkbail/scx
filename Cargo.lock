@@ -5977,6 +5977,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "scx_catalog"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "xattr",
+]
+
+[[package]]
 name = "scx_chaos"
 version = "1.1.4"
 dependencies = [
@@ -6379,6 +6390,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "scx_reevdf"
+version = "1.1.4"
+dependencies = [
+ "anyhow",
+ "clap",
+ "libbpf-rs 0.27.2",
+ "log",
+ "scx_rustsched_abi",
+ "scx_rustsched_build",
+ "scx_rustsched_loader",
+ "scx_stats",
+ "scx_stats_derive",
+ "serde",
+]
+
+[[package]]
 name = "scx_rlfifo"
 version = "1.1.4"
 dependencies = [
@@ -6596,6 +6623,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "scxcli"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "scx_catalog",
+ "serde_json",
+]
+
+[[package]]
 name = "scxtop"
 version = "1.1.4"
 dependencies = [
@@ -6640,17 +6676,15 @@ dependencies = [
 
 [[package]]
 name = "scxtui"
-version = "1.1.4"
+version = "2.0.0"
 dependencies = [
  "anyhow",
  "chrono",
+ "inotify",
  "ratatui",
  "serde",
  "serde_json",
  "shell-words",
- "tempfile",
- "toml",
- "xattr",
 ]
 
 [[package]]

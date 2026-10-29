@@ -2569,7 +2569,7 @@ impl<'a> Scheduler<'a> {
                 .distance
                 .iter()
                 .enumerate()
-                .filter(|&(nid, _)| nid != node_id)
+                .filter(|&(nid, _)| nid != node_id && topo.nodes.contains_key(&nid))
                 .map(|(nid, &dist)| (nid, dist))
                 .collect();
             order.sort_by_key(|&(_, dist)| dist);
@@ -2624,13 +2624,25 @@ impl<'a> Scheduler<'a> {
         let nr_layers = layer_specs.len();
         let mut disable_topology = opts.disable_topology.unwrap_or(false);
 
-        let topo = Arc::new(if disable_topology {
+        let mut topo = if disable_topology {
             Topology::with_flattened_llc_node()?
         } else if opts.topology.virt_llc.is_some() {
             Topology::with_args(&opts.topology)?
         } else {
             Topology::new()?
-        });
+        };
+
+        // Memory-only nodes, such as GPU or CXL memory nodes, never run
+        // tasks but would count against MAX_NUMA_NODES.
+        topo.split_cpuless_nodes();
+        if topo.nodes.len() > bpf_intf::consts_MAX_NUMA_NODES as usize {
+            bail!(
+                "{} NUMA nodes exceed the maximum of {}",
+                topo.nodes.len(),
+                bpf_intf::consts_MAX_NUMA_NODES
+            );
+        }
+        let topo = Arc::new(topo);
 
         /*
          * FIXME: scx_layered incorrectly assumes that node, LLC and CPU IDs
@@ -3138,13 +3150,18 @@ impl<'a> Scheduler<'a> {
         }
 
         for (iface, netdev) in self.netdevs.iter_mut() {
-            let node = self
-                .topo
-                .nodes
-                .values()
-                .find(|n| n.id == netdev.node())
-                .ok_or_else(|| anyhow!("Failed to get netdev node"))?;
-            let node_cpus = node.span.clone();
+            // Without a known NUMA node, consider all the CPUs local.
+            let node_cpus = match netdev.node() {
+                Some(id) => self
+                    .topo
+                    .nodes
+                    .values()
+                    .find(|n| n.id == id)
+                    .ok_or_else(|| anyhow!("Failed to get netdev node"))?
+                    .span
+                    .clone(),
+                None => self.topo.span.clone(),
+            };
             for (irq, irqmask) in netdev.irqs.iter_mut() {
                 irqmask.clear_all();
                 for cpu in available_cpus.iter() {
