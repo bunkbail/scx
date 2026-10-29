@@ -224,12 +224,6 @@ extern volatile u64 nr_seat_move[BABY_DIST_NR];
 extern volatile u64 nr_pull_land[BABY_DIST_NR];
 
 /*
- * Wake boosts armed by the game profile (a wake from a fast-lane task
- * lifted the wakee into the lane).
- */
-extern volatile u64 nr_wake_boosts;
-
-/*
  * Wait-at-depth instrument: the wait a task actually served, filed by the
  * depth it waited behind (0, 1, 2, 3+).
  */
@@ -413,15 +407,6 @@ struct task_ctx {
 	 * sleeping before consuming its deadline.
 	 */
 	u32 boost;
-
-	/*
-	 * Game profile: remaining CPU time of a wake boost, in ns. A task
-	 * woken by a fast-lane task joins the fast lane for this much
-	 * runtime even when its own wake rate does not earn the class.
-	 * Charged by update_bursts() as the task runs, cleared when it
-	 * blocks. Zero outside the game profile.
-	 */
-	u64 wake_boost_ns;
 
 	/*
 	 * Set by sched_yield: the task is pushed behind every task queued
@@ -622,17 +607,11 @@ static __always_inline bool is_heavy_proven(const struct task_ctx *tctx)
  * never leaves runnable state (preempted, slice-expired) never re-runs
  * the wake-rate EWMA, so a preempted batch victim cannot pass as a
  * waker.
- *
- * A wake boost grants the lane without the credit, for as long as its
- * CPU-time budget lasts: in the game profile a task woken by a
- * fast-lane task inherits the lane for the critical-path run that
- * follows (class_try_wake_boost()).
  */
 static __always_inline bool is_lat_cri(const struct task_ctx *tctx)
 {
-	return tctx->wake_boost_ns ||
-	       (tctx->wake_samples >= WAKE_SANE_MIN &&
-		tctx->peak_freq >= LAT_CRI_WAKE_FREQ);
+	return tctx->wake_samples >= WAKE_SANE_MIN &&
+	       tctx->peak_freq >= LAT_CRI_WAKE_FREQ;
 }
 
 /*
@@ -803,10 +782,7 @@ __hidden bool can_resched(const struct task_ctx *tctx);
 __hidden bool is_interactive(const struct task_ctx *tctx);
 __hidden u64 calc_deadline(const struct task_struct *p, struct task_ctx *tctx,
 		  u64 now);
-__hidden void class_on_runnable(struct task_struct *p, struct task_ctx *tctx,
-				u64 enq_flags, u64 now);
-__hidden void class_try_wake_boost(struct task_struct *p,
-				   struct task_ctx *tctx);
+__hidden void class_on_runnable(struct task_ctx *tctx, u64 enq_flags, u64 now);
 __hidden void class_on_running(struct task_struct *p, struct task_ctx *tctx,
 			       u64 now);
 __hidden void class_boost_on_sleep(struct task_struct *p, struct task_ctx *tctx,

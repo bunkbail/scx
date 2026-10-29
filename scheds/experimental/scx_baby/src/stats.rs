@@ -683,8 +683,6 @@ pub struct Metrics {
     pub nr_seat_move: Ranks,
     #[stat(desc = "Bulk shared-queue pulls, by distance")]
     pub nr_pull_land: Ranks,
-    #[stat(desc = "Wakes that inherited a fast-lane task's lane (game profile)")]
-    pub nr_wake_boosts: u64,
     #[stat(desc = "Waiting arrivals parked in a warm seat")]
     pub nr_arr_seat: u64,
     #[stat(desc = "Waiting arrivals parked in the shared queue")]
@@ -727,7 +725,7 @@ impl Metrics {
         }
         writeln!(
             w,
-            "[{}] tasks -> r: {:>2} | dispatch -> d: {:<5} s: {:<5} | preempt: {:<5} tick: {:<4}+{:<4} tkref: {:<4} | d1pull: {:<4}+{:<4} | bkstop: {:<4} | wkpre: {:<5} | lease: {:<4}/{:<4} | boost: {:<4} | sticky: {:<5} | warm: {:<5} | cold: {:<5} | wboost: {:<4}",
+            "[{}] tasks -> r: {:>2} | dispatch -> d: {:<5} s: {:<5} | preempt: {:<5} tick: {:<4}+{:<4} tkref: {:<4} | d1pull: {:<4}+{:<4} | bkstop: {:<4} | wkpre: {:<5} | lease: {:<4}/{:<4} | boost: {:<4} | sticky: {:<5} | warm: {:<5} | cold: {:<5}",
             crate::SCHEDULER_NAME,
             self.nr_running,
             self.nr_direct_dispatches,
@@ -746,7 +744,6 @@ impl Metrics {
             self.nr_sticky,
             self.nr_arr_seat,
             self.nr_coldspreads,
-            self.nr_wake_boosts,
         )?;
         writeln!(
             w,
@@ -989,7 +986,6 @@ impl Metrics {
             nr_seat_self: self.nr_seat_self.saturating_sub(rhs.nr_seat_self),
             nr_seat_move: self.nr_seat_move.sub(&rhs.nr_seat_move),
             nr_pull_land: self.nr_pull_land.sub(&rhs.nr_pull_land),
-            nr_wake_boosts: self.nr_wake_boosts.saturating_sub(rhs.nr_wake_boosts),
             nr_arr_seat: self.nr_arr_seat.saturating_sub(rhs.nr_arr_seat),
             nr_arr_shared: self.nr_arr_shared.saturating_sub(rhs.nr_arr_shared),
             wait_n: self.wait_n.sub(&rhs.wait_n),
