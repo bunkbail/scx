@@ -741,6 +741,28 @@ pub struct Metrics {
     pub census: Census,
 }
 
+/// Build `Metrics::delta` from four field lists: saturating counters,
+/// copied snapshot values, `vec_sub` vectors and sub-structs with their
+/// own `sub()`. The copy list keeps the maxima rule explicit: a maximum
+/// is the interval's own value and is never subtracted.
+macro_rules! metrics_delta {
+    (
+        sub: $($sub:ident),* ;
+        copy: $($copy:ident),* ;
+        vec: $($vec:ident),* ;
+        nested: $($nested:ident),* $(,)?
+    ) => {
+        fn delta(&self, rhs: &Self) -> Self {
+            Self {
+                $( $sub: self.$sub.saturating_sub(rhs.$sub), )*
+                $( $copy: self.$copy, )*
+                $( $vec: vec_sub(&self.$vec, &rhs.$vec), )*
+                $( $nested: self.$nested.sub(&rhs.$nested), )*
+            }
+        }
+    };
+}
+
 impl Metrics {
     fn format<W: Write>(&self, w: &mut W) -> Result<()> {
         if self.stats_enabled == 0 {
@@ -910,57 +932,19 @@ impl Metrics {
         Ok(())
     }
 
-    fn delta(&self, rhs: &Self) -> Self {
-        Self {
-            nr_running: self.nr_running,
-            stats_enabled: self.stats_enabled,
-            nr_direct_dispatches: self
-                .nr_direct_dispatches
-                .saturating_sub(rhs.nr_direct_dispatches),
-            nr_preemptions: self.nr_preemptions.saturating_sub(rhs.nr_preemptions),
-            nr_boosts: self.nr_boosts.saturating_sub(rhs.nr_boosts),
-            nr_sticky: self.nr_sticky.saturating_sub(rhs.nr_sticky),
-            nr_coldspreads: self.nr_coldspreads.saturating_sub(rhs.nr_coldspreads),
-            nr_class: vec_sub(&self.nr_class, &rhs.nr_class),
-            nr_lane: vec_sub(&self.nr_lane, &rhs.nr_lane),
-            nr_tick_preempts: self.nr_tick_preempts.saturating_sub(rhs.nr_tick_preempts),
-            nr_tick_preempts_warm: self
-                .nr_tick_preempts_warm
-                .saturating_sub(rhs.nr_tick_preempts_warm),
-            nr_tick_cut_refused: self
-                .nr_tick_cut_refused
-                .saturating_sub(rhs.nr_tick_cut_refused),
-            nr_lease_requeues: self.nr_lease_requeues.saturating_sub(rhs.nr_lease_requeues),
-            nr_home_takebacks: self.nr_home_takebacks.saturating_sub(rhs.nr_home_takebacks),
-            nr_depth1_pulls: self.nr_depth1_pulls.saturating_sub(rhs.nr_depth1_pulls),
-            nr_depth1_pulls_seat: self
-                .nr_depth1_pulls_seat
-                .saturating_sub(rhs.nr_depth1_pulls_seat),
-            nr_bulk_backstop: self.nr_bulk_backstop.saturating_sub(rhs.nr_bulk_backstop),
-            nr_wake_preempts: self.nr_wake_preempts.saturating_sub(rhs.nr_wake_preempts),
-            nr_land: self.nr_land.sub(&rhs.nr_land),
-            nr_wake_land: self.nr_wake_land.sub(&rhs.nr_wake_land),
-            nr_seat_self: self.nr_seat_self.saturating_sub(rhs.nr_seat_self),
-            nr_seat_move: self.nr_seat_move.sub(&rhs.nr_seat_move),
-            nr_pull_land: self.nr_pull_land.sub(&rhs.nr_pull_land),
-            nr_arr_seat: self.nr_arr_seat.saturating_sub(rhs.nr_arr_seat),
-            nr_arr_shared: self.nr_arr_shared.saturating_sub(rhs.nr_arr_shared),
-            wait_n: self.wait_n.sub(&rhs.wait_n),
-            wait_ns: self.wait_ns.sub(&rhs.wait_ns),
-            wait_max: self.wait_max,
-            wait_slow: self.wait_slow.sub(&rhs.wait_slow),
-            wait_cls: self.wait_cls.sub(&rhs.wait_cls),
-            wait_type: self.wait_type.sub(&rhs.wait_type),
-            wait_lcri: self.wait_lcri.sub(&rhs.wait_lcri),
-            wait_wg: self.wait_wg.sub(&rhs.wait_wg),
-            nr_arr_wake_seat: self.nr_arr_wake_seat.saturating_sub(rhs.nr_arr_wake_seat),
-            nr_arr_wake_shared: self
-                .nr_arr_wake_shared
-                .saturating_sub(rhs.nr_arr_wake_shared),
-            nr_arr_rot_seat: self.nr_arr_rot_seat.saturating_sub(rhs.nr_arr_rot_seat),
-            nr_arr_rot_shared: self.nr_arr_rot_shared.saturating_sub(rhs.nr_arr_rot_shared),
-            census: self.census.sub(&rhs.census),
-        }
+    metrics_delta! {
+        sub: nr_direct_dispatches, nr_preemptions, nr_boosts, nr_sticky,
+             nr_coldspreads, nr_tick_preempts, nr_tick_preempts_warm,
+             nr_tick_cut_refused, nr_lease_requeues, nr_home_takebacks,
+             nr_depth1_pulls, nr_depth1_pulls_seat, nr_bulk_backstop,
+             nr_wake_preempts, nr_seat_self, nr_arr_seat, nr_arr_shared,
+             nr_arr_wake_seat, nr_arr_wake_shared, nr_arr_rot_seat,
+             nr_arr_rot_shared;
+        copy: nr_running, stats_enabled, wait_max;
+        vec: nr_class, nr_lane;
+        nested: nr_land, nr_wake_land, nr_seat_move, nr_pull_land, wait_n,
+                wait_ns, wait_slow, wait_cls, wait_type, wait_lcri,
+                wait_wg, census,
     }
 }
 
@@ -1275,6 +1259,9 @@ mod tests {
         prev.wait_lcri.lat_max[0] = u64::MAX;
         prev.wait_wg.n[5] = u64::MAX;
         prev.wait_wg.max[0] = u64::MAX;
+        prev.wait_max.b0 = u64::MAX;
+        prev.nr_running = cur.nr_running + 3;
+        prev.stats_enabled = cur.stats_enabled + 1;
 
         let delta = cur.delta(&prev);
 
@@ -1288,5 +1275,7 @@ mod tests {
         assert_eq!(delta.wait_wg.n[5], 0);
         assert_eq!(delta.wait_wg.max[0], cur.wait_wg.max[0]);
         assert_eq!(delta.wait_max.b0, cur.wait_max.b0);
+        assert_eq!(delta.nr_running, cur.nr_running);
+        assert_eq!(delta.stats_enabled, cur.stats_enabled);
     }
 }
