@@ -868,6 +868,35 @@ void BPF_STRUCT_OPS(baby_enqueue, struct task_struct *p, u64 enq_flags)
 }
 
 /*
+ * Pull @dsq's head to the local DSQ and do the bookkeeping for that pull.
+ * @lane is a literal: a fast-lane node pull (1) clears the node's tick
+ * claim. Node clocks advance at most once per 1 ms, seat clocks on every
+ * pull. Call outside RCU; the caller keeps the stats.
+ */
+static __always_inline bool pull_node(u64 dsq, u32 lane, u32 nidx, u64 now)
+{
+	if (!scx_bpf_dsq_move_to_local(dsq, 0))
+		return false;
+	nidx &= BABY_NODE_CLOCK_NR - 1;
+	if (lane && node_preempt_claim[nidx])
+		node_preempt_claim[nidx] = 0;
+	if (now - node_service_at[lane & 1][nidx] > NSEC_PER_MSEC)
+		node_service_at[lane & 1][nidx] = now;
+	return true;
+}
+
+static __always_inline bool pull_seat(u64 dsq, u32 lane, u32 idx, u64 now)
+{
+	if (!scx_bpf_dsq_move_to_local(dsq, 0))
+		return false;
+	idx &= BABY_MAX_CPUS - 1;
+	seat_service_at[lane & 1][idx] = now;
+	if (seat_used[lane & 1][idx] && !scx_bpf_dsq_nr_queued(dsq))
+		seat_used[lane & 1][idx] = 0;
+	return true;
+}
+
+/*
  * Dispatch the earliest-deadline task to the CPU.
  *
  * The lanes arbitrate per dispatch: the fast lane is served whenever it
@@ -1100,12 +1129,7 @@ void BPF_STRUCT_OPS(baby_dispatch, s32 cpu, struct task_struct *prev)
 		if (fl_g_dl < fl_wq_dl) {
 			s32 from = fl_q ? scx_bpf_task_cpu(fl_q) : -1;
 
-			if (scx_bpf_dsq_move_to_local(fl_node_dsq, 0)) {
-				if (node_preempt_claim[nidx])
-					node_preempt_claim[nidx] = 0;
-				if (now - node_service_at[1][nidx] >
-				    NSEC_PER_MSEC)
-					node_service_at[1][nidx] = now;
+			if (pull_node(fl_node_dsq, 1, nidx, now)) {
 				if (has_bulk) {
 					if (stats_enabled)
 						__sync_fetch_and_add(
@@ -1119,11 +1143,7 @@ void BPF_STRUCT_OPS(baby_dispatch, s32 cpu, struct task_struct *prev)
 				return;
 			}
 		}
-		if (scx_bpf_dsq_move_to_local(fl_seat_dsq, 0)) {
-			seat_service_at[1][idx] = now;
-			if (seat_used[1][idx] &&
-			    !scx_bpf_dsq_nr_queued(fl_seat_dsq))
-				seat_used[1][idx] = 0;
+		if (pull_seat(fl_seat_dsq, 1, idx, now)) {
 			if (has_bulk) {
 				if (stats_enabled)
 					__sync_fetch_and_add(
@@ -1131,12 +1151,7 @@ void BPF_STRUCT_OPS(baby_dispatch, s32 cpu, struct task_struct *prev)
 			}
 			return;
 		}
-		if (scx_bpf_dsq_move_to_local(fl_node_dsq, 0)) {
-			if (node_preempt_claim[nidx])
-				node_preempt_claim[nidx] = 0;
-			if (now - node_service_at[1][nidx] >
-			    NSEC_PER_MSEC)
-				node_service_at[1][nidx] = now;
+		if (pull_node(fl_node_dsq, 1, nidx, now)) {
 			if (has_bulk) {
 				if (stats_enabled)
 					__sync_fetch_and_add(
@@ -1160,36 +1175,19 @@ void BPF_STRUCT_OPS(baby_dispatch, s32 cpu, struct task_struct *prev)
 		 */
 		s32 from = q ? scx_bpf_task_cpu(q) : -1;
 
-		if (node_bulk && scx_bpf_dsq_move_to_local(node, 0)) {
-			if (now - node_service_at[0][nidx] >
-			    NSEC_PER_MSEC)
-				node_service_at[0][nidx] = now;
+		if (node_bulk && pull_node(node, 0, nidx, now)) {
 			if (stats_enabled)
 				__sync_fetch_and_add(
 					&nr_pull_land[cpu_dist(cpu, from)], 1);
 			return;
 		}
-		if (seat_bulk && scx_bpf_dsq_move_to_local(bulk_seat_dsq, 0)) {
-			seat_service_at[0][idx] = now;
-			if (seat_used[0][idx] &&
-			    !scx_bpf_dsq_nr_queued(bulk_seat_dsq))
-				seat_used[0][idx] = 0;
+		if (seat_bulk && pull_seat(bulk_seat_dsq, 0, idx, now))
 			return;
-		}
 	} else {
-		if (seat_bulk && scx_bpf_dsq_move_to_local(bulk_seat_dsq, 0)) {
-			seat_service_at[0][idx] = now;
-			if (seat_used[0][idx] &&
-			    !scx_bpf_dsq_nr_queued(bulk_seat_dsq))
-				seat_used[0][idx] = 0;
+		if (seat_bulk && pull_seat(bulk_seat_dsq, 0, idx, now))
 			return;
-		}
-		if (node_bulk && scx_bpf_dsq_move_to_local(node, 0)) {
-			if (now - node_service_at[0][nidx] >
-			    NSEC_PER_MSEC)
-				node_service_at[0][nidx] = now;
+		if (node_bulk && pull_node(node, 0, nidx, now))
 			return;
-		}
 	}
 
 	/*
@@ -1201,21 +1199,10 @@ void BPF_STRUCT_OPS(baby_dispatch, s32 cpu, struct task_struct *prev)
 	 * last accounting left it and bulk waits its turn afterwards.
 	 */
 	if (has_fl && !serve_fl) {
-		if (scx_bpf_dsq_move_to_local(fl_seat_dsq, 0)) {
-			seat_service_at[1][idx] = now;
-			if (seat_used[1][idx] &&
-			    !scx_bpf_dsq_nr_queued(fl_seat_dsq))
-				seat_used[1][idx] = 0;
+		if (pull_seat(fl_seat_dsq, 1, idx, now))
 			return;
-		}
-		if (scx_bpf_dsq_move_to_local(fl_node_dsq, 0)) {
-			if (node_preempt_claim[nidx])
-				node_preempt_claim[nidx] = 0;
-			if (now - node_service_at[1][nidx] >
-			    NSEC_PER_MSEC)
-				node_service_at[1][nidx] = now;
+		if (pull_node(fl_node_dsq, 1, nidx, now))
 			return;
-		}
 	}
 
 	if (need_running) {
@@ -1262,18 +1249,10 @@ void BPF_STRUCT_OPS(baby_dispatch, s32 cpu, struct task_struct *prev)
 		 * behind it costs a queue lookup, which is what the counts
 		 * save on every other dispatch.
 		 */
-		if (scx_bpf_dsq_move_to_local(fl_node_dsq, 0)) {
-			if (node_preempt_claim[nidx])
-				node_preempt_claim[nidx] = 0;
-			if (now - node_service_at[1][nidx] > NSEC_PER_MSEC)
-				node_service_at[1][nidx] = now;
+		if (pull_node(fl_node_dsq, 1, nidx, now))
 			return;
-		}
-		if (scx_bpf_dsq_move_to_local(node, 0)) {
-			if (now - node_service_at[0][nidx] > NSEC_PER_MSEC)
-				node_service_at[0][nidx] = now;
+		if (pull_node(node, 0, nidx, now))
 			return;
-		}
 		/*
 		 * The CPU is going idle: drop its performance level. The
 		 * write happens once, when the level changes; see the
