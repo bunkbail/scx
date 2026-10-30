@@ -39,6 +39,62 @@ fn vec_sub(a: &[u64], b: &[u64]) -> Vec<u64> {
         .collect()
 }
 
+/// The mean wait in microseconds, or a dash when nothing was counted.
+fn mean_us(ns: u64, n: u64) -> String {
+    if n > 0 {
+        format!("{:.0}", ns as f64 / n as f64 / 1000.0)
+    } else {
+        "-".into()
+    }
+}
+
+/// The interval maximum in nanoseconds, or a dash when nothing was
+/// counted. The BPF maxima are reset after every snapshot, so a value is
+/// this interval's maximum.
+fn max_ns(max: u64, n: u64) -> String {
+    if n > 0 { max.to_string() } else { "-".into() }
+}
+
+/// One wait-at-depth row. Every row shares the same four buckets and the
+/// same mean/max layout; only the tag and the optional arrival tail
+/// differ.
+fn fmt_wait_row<W: Write>(
+    w: &mut W,
+    tag: &str,
+    n: [u64; WDEPTH],
+    ns: [u64; WDEPTH],
+    max: [u64; WDEPTH],
+    slow: &[u64],
+    arr: Option<(u64, u64)>,
+) -> Result<()> {
+    write!(
+        w,
+        "  {} n[{} {} {} {}] mean_us[{} {} {} {}] max_ns[{} {} {} {}] slow5ms[{} {} {} {}]",
+        tag,
+        n[0],
+        n[1],
+        n[2],
+        n[3],
+        mean_us(ns[0], n[0]),
+        mean_us(ns[1], n[1]),
+        mean_us(ns[2], n[2]),
+        mean_us(ns[3], n[3]),
+        max_ns(max[0], n[0]),
+        max_ns(max[1], n[1]),
+        max_ns(max[2], n[2]),
+        max_ns(max[3], n[3]),
+        slow[0],
+        slow[1],
+        slow[2],
+        slow[3],
+    )?;
+    if let Some((seat, shared)) = arr {
+        write!(w, " arr(seat {} shared {})", seat, shared)?;
+    }
+    writeln!(w)?;
+    Ok(())
+}
+
 /// One placement-distance histogram: landings bucketed by the distance
 /// rank between the task's previous CPU and where it actually went
 /// (self, SMT sibling, same L2, same LLC, same node, beyond).
@@ -251,12 +307,6 @@ impl WaitCls {
     }
 
     fn sub(&self, rhs: &Self) -> Self {
-        let vsub = |a: &Vec<u64>, b: &Vec<u64>| -> Vec<u64> {
-            a.iter()
-                .zip(b.iter())
-                .map(|(x, y)| x.saturating_sub(*y))
-                .collect()
-        };
         WaitCls {
             fg_b0: self.fg_b0.saturating_sub(rhs.fg_b0),
             fg_b1: self.fg_b1.saturating_sub(rhs.fg_b1),
@@ -272,7 +322,7 @@ impl WaitCls {
             fg_max_b1: self.fg_max_b1,
             fg_max_b2: self.fg_max_b2,
             fg_max_b3: self.fg_max_b3,
-            fg_slow: vsub(&self.fg_slow, &rhs.fg_slow),
+            fg_slow: vec_sub(&self.fg_slow, &rhs.fg_slow),
             other_b0: self.other_b0.saturating_sub(rhs.other_b0),
             other_b1: self.other_b1.saturating_sub(rhs.other_b1),
             other_b2: self.other_b2.saturating_sub(rhs.other_b2),
@@ -285,7 +335,7 @@ impl WaitCls {
             other_max_b1: self.other_max_b1,
             other_max_b2: self.other_max_b2,
             other_max_b3: self.other_max_b3,
-            other_slow: vsub(&self.other_slow, &rhs.other_slow),
+            other_slow: vec_sub(&self.other_slow, &rhs.other_slow),
         }
     }
 }
@@ -398,12 +448,6 @@ impl WaitType {
     }
 
     fn sub(&self, rhs: &Self) -> Self {
-        let vsub = |a: &Vec<u64>, b: &Vec<u64>| -> Vec<u64> {
-            a.iter()
-                .zip(b.iter())
-                .map(|(x, y)| x.saturating_sub(*y))
-                .collect()
-        };
         WaitType {
             wk_b0: self.wk_b0.saturating_sub(rhs.wk_b0),
             wk_b1: self.wk_b1.saturating_sub(rhs.wk_b1),
@@ -417,7 +461,7 @@ impl WaitType {
             wk_max_b1: self.wk_max_b1,
             wk_max_b2: self.wk_max_b2,
             wk_max_b3: self.wk_max_b3,
-            wk_slow: vsub(&self.wk_slow, &rhs.wk_slow),
+            wk_slow: vec_sub(&self.wk_slow, &rhs.wk_slow),
             rot_b0: self.rot_b0.saturating_sub(rhs.rot_b0),
             rot_b1: self.rot_b1.saturating_sub(rhs.rot_b1),
             rot_b2: self.rot_b2.saturating_sub(rhs.rot_b2),
@@ -430,7 +474,7 @@ impl WaitType {
             rot_max_b1: self.rot_max_b1,
             rot_max_b2: self.rot_max_b2,
             rot_max_b3: self.rot_max_b3,
-            rot_slow: vsub(&self.rot_slow, &rhs.rot_slow),
+            rot_slow: vec_sub(&self.rot_slow, &rhs.rot_slow),
         }
     }
 }
@@ -486,21 +530,15 @@ impl WaitLCRI {
     }
 
     fn sub(&self, rhs: &Self) -> Self {
-        let vsub = |a: &Vec<u64>, b: &Vec<u64>| -> Vec<u64> {
-            a.iter()
-                .zip(b.iter())
-                .map(|(x, y)| x.saturating_sub(*y))
-                .collect()
-        };
         WaitLCRI {
-            lat_n: vsub(&self.lat_n, &rhs.lat_n),
-            lat_ns: vsub(&self.lat_ns, &rhs.lat_ns),
+            lat_n: vec_sub(&self.lat_n, &rhs.lat_n),
+            lat_ns: vec_sub(&self.lat_ns, &rhs.lat_ns),
             lat_max: self.lat_max.clone(),
-            lat_slow: vsub(&self.lat_slow, &rhs.lat_slow),
-            other_n: vsub(&self.other_n, &rhs.other_n),
-            other_ns: vsub(&self.other_ns, &rhs.other_ns),
+            lat_slow: vec_sub(&self.lat_slow, &rhs.lat_slow),
+            other_n: vec_sub(&self.other_n, &rhs.other_n),
+            other_ns: vec_sub(&self.other_ns, &rhs.other_ns),
             other_max: self.other_max.clone(),
-            other_slow: vsub(&self.other_slow, &rhs.other_slow),
+            other_slow: vec_sub(&self.other_slow, &rhs.other_slow),
         }
     }
 }
@@ -543,17 +581,11 @@ impl WaitGateMiss {
     }
 
     fn sub(&self, rhs: &Self) -> Self {
-        let vsub = |a: &Vec<u64>, b: &Vec<u64>| -> Vec<u64> {
-            a.iter()
-                .zip(b.iter())
-                .map(|(x, y)| x.saturating_sub(*y))
-                .collect()
-        };
         WaitGateMiss {
-            n: vsub(&self.n, &rhs.n),
-            ns: vsub(&self.ns, &rhs.ns),
+            n: vec_sub(&self.n, &rhs.n),
+            ns: vec_sub(&self.ns, &rhs.ns),
             max: self.max.clone(),
-            slow: vsub(&self.slow, &rhs.slow),
+            slow: vec_sub(&self.slow, &rhs.slow),
         }
     }
 
@@ -593,15 +625,9 @@ impl Census {
     }
 
     fn sub(&self, rhs: &Self) -> Self {
-        let vsub = |a: &Vec<u64>, b: &Vec<u64>| -> Vec<u64> {
-            a.iter()
-                .zip(b.iter())
-                .map(|(x, y)| x.saturating_sub(*y))
-                .collect()
-        };
         Census {
-            seat: vsub(&self.seat, &rhs.seat),
-            shared: vsub(&self.shared, &rhs.shared),
+            seat: vec_sub(&self.seat, &rhs.seat),
+            shared: vec_sub(&self.shared, &rhs.shared),
         }
     }
 
@@ -762,132 +788,63 @@ impl Metrics {
         write!(w, " | pull: ")?;
         self.nr_pull_land.format(w)?;
         writeln!(w)?;
-        let mean = |ns: u64, n: u64| -> String {
-            if n > 0 {
-                format!("{:.0}", ns as f64 / n as f64 / 1000.0)
-            } else {
-                "-".into()
-            }
-        };
-        // The BPF maxima are reset after every snapshot, so a value is
-        // this interval's maximum; suppress it when the interval had no
-        // waits.
-        let smax = |m: u64, n: u64| -> String { if n > 0 { m.to_string() } else { "-".into() } };
         let (wn, wns, wmax, wsl) = (&self.wait_n, &self.wait_ns, &self.wait_max, &self.wait_slow);
-        writeln!(
+        fmt_wait_row(
             w,
-            "  wait n[{} {} {} {}] mean_us[{} {} {} {}] max_ns[{} {} {} {}] slow5ms[{} {} {} {}] arr(seat {} shared {})",
-            wn.b0,
-            wn.b1,
-            wn.b2,
-            wn.b3,
-            mean(wns.b0, wn.b0),
-            mean(wns.b1, wn.b1),
-            mean(wns.b2, wn.b2),
-            mean(wns.b3, wn.b3),
-            smax(wmax.b0, wn.b0),
-            smax(wmax.b1, wn.b1),
-            smax(wmax.b2, wn.b2),
-            smax(wmax.b3, wn.b3),
-            wsl.b0,
-            wsl.b1,
-            wsl.b2,
-            wsl.b3,
-            self.nr_arr_seat,
-            self.nr_arr_shared,
+            "wait",
+            [wn.b0, wn.b1, wn.b2, wn.b3],
+            [wns.b0, wns.b1, wns.b2, wns.b3],
+            [wmax.b0, wmax.b1, wmax.b2, wmax.b3],
+            &[wsl.b0, wsl.b1, wsl.b2, wsl.b3],
+            Some((self.nr_arr_seat, self.nr_arr_shared)),
         )?;
         let wc = &self.wait_cls;
-        let fmean = |ns: u64, n: u64| -> String {
-            if n > 0 {
-                format!("{:.0}", ns as f64 / n as f64 / 1000.0)
-            } else {
-                "-".into()
-            }
-        };
-        writeln!(
+        fmt_wait_row(
             w,
-            "  waitfg n[{} {} {} {}] mean_us[{} {} {} {}] max_ns[{} {} {} {}] slow5ms[{} {} {} {}]",
-            wc.fg_b0,
-            wc.fg_b1,
-            wc.fg_b2,
-            wc.fg_b3,
-            fmean(wc.fg_ns_b0, wc.fg_b0),
-            fmean(wc.fg_ns_b1, wc.fg_b1),
-            fmean(wc.fg_ns_b2, wc.fg_b2),
-            fmean(wc.fg_ns_b3, wc.fg_b3),
-            smax(wc.fg_max_b0, wc.fg_b0),
-            smax(wc.fg_max_b1, wc.fg_b1),
-            smax(wc.fg_max_b2, wc.fg_b2),
-            smax(wc.fg_max_b3, wc.fg_b3),
-            wc.fg_slow[0],
-            wc.fg_slow[1],
-            wc.fg_slow[2],
-            wc.fg_slow[3],
+            "waitfg",
+            [wc.fg_b0, wc.fg_b1, wc.fg_b2, wc.fg_b3],
+            [wc.fg_ns_b0, wc.fg_ns_b1, wc.fg_ns_b2, wc.fg_ns_b3],
+            [wc.fg_max_b0, wc.fg_max_b1, wc.fg_max_b2, wc.fg_max_b3],
+            &wc.fg_slow,
+            None,
         )?;
-        writeln!(
+        fmt_wait_row(
             w,
-            "  waitot n[{} {} {} {}] mean_us[{} {} {} {}] max_ns[{} {} {} {}] slow5ms[{} {} {} {}]",
-            wc.other_b0,
-            wc.other_b1,
-            wc.other_b2,
-            wc.other_b3,
-            fmean(wc.other_ns_b0, wc.other_b0),
-            fmean(wc.other_ns_b1, wc.other_b1),
-            fmean(wc.other_ns_b2, wc.other_b2),
-            fmean(wc.other_ns_b3, wc.other_b3),
-            smax(wc.other_max_b0, wc.other_b0),
-            smax(wc.other_max_b1, wc.other_b1),
-            smax(wc.other_max_b2, wc.other_b2),
-            smax(wc.other_max_b3, wc.other_b3),
-            wc.other_slow[0],
-            wc.other_slow[1],
-            wc.other_slow[2],
-            wc.other_slow[3],
+            "waitot",
+            [wc.other_b0, wc.other_b1, wc.other_b2, wc.other_b3],
+            [
+                wc.other_ns_b0,
+                wc.other_ns_b1,
+                wc.other_ns_b2,
+                wc.other_ns_b3,
+            ],
+            [
+                wc.other_max_b0,
+                wc.other_max_b1,
+                wc.other_max_b2,
+                wc.other_max_b3,
+            ],
+            &wc.other_slow,
+            None,
         )?;
         let wt = &self.wait_type;
-        writeln!(
+        fmt_wait_row(
             w,
-            "  waitwk n[{} {} {} {}] mean_us[{} {} {} {}] max_ns[{} {} {} {}] slow5ms[{} {} {} {}] arr(seat {} shared {})",
-            wt.wk_b0,
-            wt.wk_b1,
-            wt.wk_b2,
-            wt.wk_b3,
-            fmean(wt.wk_ns_b0, wt.wk_b0),
-            fmean(wt.wk_ns_b1, wt.wk_b1),
-            fmean(wt.wk_ns_b2, wt.wk_b2),
-            fmean(wt.wk_ns_b3, wt.wk_b3),
-            smax(wt.wk_max_b0, wt.wk_b0),
-            smax(wt.wk_max_b1, wt.wk_b1),
-            smax(wt.wk_max_b2, wt.wk_b2),
-            smax(wt.wk_max_b3, wt.wk_b3),
-            wt.wk_slow[0],
-            wt.wk_slow[1],
-            wt.wk_slow[2],
-            wt.wk_slow[3],
-            self.nr_arr_wake_seat,
-            self.nr_arr_wake_shared,
+            "waitwk",
+            [wt.wk_b0, wt.wk_b1, wt.wk_b2, wt.wk_b3],
+            [wt.wk_ns_b0, wt.wk_ns_b1, wt.wk_ns_b2, wt.wk_ns_b3],
+            [wt.wk_max_b0, wt.wk_max_b1, wt.wk_max_b2, wt.wk_max_b3],
+            &wt.wk_slow,
+            Some((self.nr_arr_wake_seat, self.nr_arr_wake_shared)),
         )?;
-        writeln!(
+        fmt_wait_row(
             w,
-            "  waitrot n[{} {} {} {}] mean_us[{} {} {} {}] max_ns[{} {} {} {}] slow5ms[{} {} {} {}] arr(seat {} shared {})",
-            wt.rot_b0,
-            wt.rot_b1,
-            wt.rot_b2,
-            wt.rot_b3,
-            fmean(wt.rot_ns_b0, wt.rot_b0),
-            fmean(wt.rot_ns_b1, wt.rot_b1),
-            fmean(wt.rot_ns_b2, wt.rot_b2),
-            fmean(wt.rot_ns_b3, wt.rot_b3),
-            smax(wt.rot_max_b0, wt.rot_b0),
-            smax(wt.rot_max_b1, wt.rot_b1),
-            smax(wt.rot_max_b2, wt.rot_b2),
-            smax(wt.rot_max_b3, wt.rot_b3),
-            wt.rot_slow[0],
-            wt.rot_slow[1],
-            wt.rot_slow[2],
-            wt.rot_slow[3],
-            self.nr_arr_rot_seat,
-            self.nr_arr_rot_shared,
+            "waitrot",
+            [wt.rot_b0, wt.rot_b1, wt.rot_b2, wt.rot_b3],
+            [wt.rot_ns_b0, wt.rot_ns_b1, wt.rot_ns_b2, wt.rot_ns_b3],
+            [wt.rot_max_b0, wt.rot_max_b1, wt.rot_max_b2, wt.rot_max_b3],
+            &wt.rot_slow,
+            Some((self.nr_arr_rot_seat, self.nr_arr_rot_shared)),
         )?;
         let wl = &self.wait_lcri;
         let vmean = |ns: &[u64], n: &[u64]| -> Vec<String> {
@@ -1303,5 +1260,33 @@ mod tests {
             .unwrap();
         // 1999ns over two waits is 0.9995us, which rounds to 1.
         assert!(line.contains("mean_us[1 "), "{line}");
+    }
+
+    #[test]
+    fn delta_subtracts_counts_and_keeps_maxima() {
+        let cur = sample_metrics();
+        let mut prev = sample_metrics();
+        prev.wait_cls.fg_b0 = cur.wait_cls.fg_b0 + 5;
+        prev.wait_cls.other_ns_b3 = cur.wait_cls.other_ns_b3 + 7;
+        prev.wait_cls.fg_max_b0 = u64::MAX;
+        prev.wait_type.wk_b0 = cur.wait_type.wk_b0 + 5;
+        prev.wait_type.rot_max_b0 = u64::MAX;
+        prev.wait_lcri.lat_n[0] = 0;
+        prev.wait_lcri.lat_max[0] = u64::MAX;
+        prev.wait_wg.n[5] = u64::MAX;
+        prev.wait_wg.max[0] = u64::MAX;
+
+        let delta = cur.delta(&prev);
+
+        assert_eq!(delta.wait_cls.fg_b0, 0);
+        assert_eq!(delta.wait_cls.other_ns_b3, 0);
+        assert_eq!(delta.wait_cls.fg_max_b0, cur.wait_cls.fg_max_b0);
+        assert_eq!(delta.wait_type.wk_b0, 0);
+        assert_eq!(delta.wait_type.rot_max_b0, cur.wait_type.rot_max_b0);
+        assert_eq!(delta.wait_lcri.lat_n[0], cur.wait_lcri.lat_n[0]);
+        assert_eq!(delta.wait_lcri.lat_max[0], cur.wait_lcri.lat_max[0]);
+        assert_eq!(delta.wait_wg.n[5], 0);
+        assert_eq!(delta.wait_wg.max[0], cur.wait_wg.max[0]);
+        assert_eq!(delta.wait_max.b0, cur.wait_max.b0);
     }
 }
