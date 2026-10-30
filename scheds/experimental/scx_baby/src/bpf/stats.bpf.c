@@ -194,6 +194,23 @@ __hidden void stamp_wait(struct task_ctx *tctx, u64 now, u64 depth, bool shared)
 }
 
 /*
+ * File one wait into a count/ns/max/slow row. The caller has already
+ * masked the index to its array; the helper is inlined so the verifier
+ * sees the same offsets as the open-coded form.
+ */
+static __always_inline void charge_one(volatile u64 *n, volatile u64 *ns,
+				       volatile u64 *max, volatile u64 *slow,
+				       u32 i, u64 wait)
+{
+	__sync_fetch_and_add(&n[i], 1);
+	__sync_fetch_and_add(&ns[i], wait);
+	if (wait > max[i])
+		max[i] = wait;
+	if (wait > BABY_WAIT_SLOW_NS)
+		__sync_fetch_and_add(&slow[i], 1);
+}
+
+/*
  * Charge the wait a task actually served to the depth bucket its
  * arrival was stamped with. The index is masked because a reloaded u8
  * proves nothing to the verifier; the stored value is already clamped,
@@ -227,38 +244,22 @@ __hidden void charge_wait(struct task_ctx *tctx, u64 now)
 		u32 c = tctx->wait_cls & (BABY_WCLS_NR - 1);
 		u32 i = c * BABY_WDEPTH_NR + b;
 
-		__sync_fetch_and_add(&nr_wait_n[b], 1);
-		__sync_fetch_and_add(&nr_wait_ns[b], wait);
-		if (wait > nr_wait_max[b])
-			nr_wait_max[b] = wait;
-		if (wait > BABY_WAIT_SLOW_NS)
-			__sync_fetch_and_add(&nr_wait_slow[b], 1);
-		__sync_fetch_and_add(&nr_wait_cls_n[i], 1);
-		__sync_fetch_and_add(&nr_wait_cls_ns[i], wait);
-		if (wait > nr_wait_cls_max[i])
-			nr_wait_cls_max[i] = wait;
-		if (wait > BABY_WAIT_SLOW_NS)
-			__sync_fetch_and_add(&nr_wait_cls_slow[i], 1);
+		charge_one(nr_wait_n, nr_wait_ns, nr_wait_max, nr_wait_slow, b,
+			   wait);
+		charge_one(nr_wait_cls_n, nr_wait_cls_ns, nr_wait_cls_max,
+			   nr_wait_cls_slow, i, wait);
 
 		u32 t = tctx->arrival_is_wake & 1;
 		u32 ti = t * BABY_WDEPTH_NR + b;
 
-		__sync_fetch_and_add(&nr_wait_type_n[ti], 1);
-		__sync_fetch_and_add(&nr_wait_type_ns[ti], wait);
-		if (wait > nr_wait_type_max[ti])
-			nr_wait_type_max[ti] = wait;
-		if (wait > BABY_WAIT_SLOW_NS)
-			__sync_fetch_and_add(&nr_wait_type_slow[ti], 1);
+		charge_one(nr_wait_type_n, nr_wait_type_ns, nr_wait_type_max,
+			   nr_wait_type_slow, ti, wait);
 
 		u32 l = is_lat_cri(tctx) ? 1 : 0;
 		u32 li = l * BABY_WDEPTH_NR + b;
 
-		__sync_fetch_and_add(&nr_wait_lcri_n[li], 1);
-		__sync_fetch_and_add(&nr_wait_lcri_ns[li], wait);
-		if (wait > nr_wait_lcri_max[li])
-			nr_wait_lcri_max[li] = wait;
-		if (wait > BABY_WAIT_SLOW_NS)
-			__sync_fetch_and_add(&nr_wait_lcri_slow[li], 1);
+		charge_one(nr_wait_lcri_n, nr_wait_lcri_ns, nr_wait_lcri_max,
+			   nr_wait_lcri_slow, li, wait);
 
 		if (l) {
 			u32 r = (tctx->arrival_is_wake & 1) ?
@@ -269,12 +270,8 @@ __hidden void charge_wait(struct task_ctx *tctx, u64 now)
 
 			u32 wi = b * BABY_WG_NR + r;
 
-			__sync_fetch_and_add(&nr_wait_wg_n[wi], 1);
-			__sync_fetch_and_add(&nr_wait_wg_ns[wi], wait);
-			if (wait > nr_wait_wg_max[wi])
-				nr_wait_wg_max[wi] = wait;
-			if (wait > BABY_WAIT_SLOW_NS)
-				__sync_fetch_and_add(&nr_wait_wg_slow[wi], 1);
+			charge_one(nr_wait_wg_n, nr_wait_wg_ns,
+				   nr_wait_wg_max, nr_wait_wg_slow, wi, wait);
 		}
 	}
 }
