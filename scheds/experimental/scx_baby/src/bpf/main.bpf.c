@@ -303,6 +303,41 @@ static int init_cpumask(struct bpf_cpumask **cpumask)
 }
 
 /*
+ * Claim an idle CPU from @mask for @pref, previous CPU first, then the
+ * lowest-numbered bit. @test_prev_mask is a literal: the second pass
+ * accepts the previous CPU from the plain idle mask without testing it
+ * against the SMT mask again. Stores the claimed CPU in *@cpu and leaves
+ * it untouched when no bit could be claimed.
+ */
+static __always_inline void claim_idle_cpu(struct task_struct *p, s32 prev_cpu,
+					  struct bpf_cpumask *pref,
+					  const struct cpumask *mask,
+					  bool test_prev_mask, s32 *cpu)
+{
+	s32 i;
+
+	if (bpf_cpumask_test_cpu(prev_cpu, cast_mask(pref)) &&
+	    (!test_prev_mask ||
+	     bpf_cpumask_test_cpu(prev_cpu, mask)) &&
+	    bpf_cpumask_test_cpu(prev_cpu, p->cpus_ptr) &&
+	    scx_bpf_test_and_clear_cpu_idle(prev_cpu)) {
+		*cpu = prev_cpu;
+		return;
+	}
+
+	bpf_for(i, 0, nr_cpu_ids) {
+		if (!bpf_cpumask_test_cpu(i, cast_mask(pref)) ||
+		    !bpf_cpumask_test_cpu(i, mask) ||
+		    !bpf_cpumask_test_cpu(i, p->cpus_ptr))
+			continue;
+		if (scx_bpf_test_and_clear_cpu_idle(i)) {
+			*cpu = i;
+			break;
+		}
+	}
+}
+
+/*
  * Pick the lowest-numbered idle CPU of the given tier, preferring a
  * wholly idle physical core and then the previous CPU. Stacking
  * wakeups on the same few cores lets the rest of the tier idle at its
@@ -319,56 +354,14 @@ static __always_inline s32 pick_idle_pref(struct task_struct *p,
 {
 	const struct cpumask *idle_smt, *idle;
 	s32 cpu = -1;
-	s32 i;
 
 	bpf_rcu_read_lock();
 	idle_smt = scx_bpf_get_idle_smtmask();
 	idle = scx_bpf_get_idle_cpumask();
 	if (pref && idle_smt && idle) {
-		/*
-		 * Pass 1: a wholly idle physical core, previous CPU first.
-		 */
-		if (bpf_cpumask_test_cpu(prev_cpu, cast_mask(pref)) &&
-		    bpf_cpumask_test_cpu(prev_cpu, idle_smt) &&
-		    bpf_cpumask_test_cpu(prev_cpu, p->cpus_ptr) &&
-		    scx_bpf_test_and_clear_cpu_idle(prev_cpu))
-			cpu = prev_cpu;
-
-		if (cpu < 0) {
-			bpf_for(i, 0, nr_cpu_ids) {
-				if (!bpf_cpumask_test_cpu(i, cast_mask(pref)) ||
-				    !bpf_cpumask_test_cpu(i, idle_smt) ||
-				    !bpf_cpumask_test_cpu(i, p->cpus_ptr))
-					continue;
-				if (scx_bpf_test_and_clear_cpu_idle(i)) {
-					cpu = i;
-					break;
-				}
-			}
-		}
-
-		/*
-		 * Pass 2: any idle CPU in the tier, previous CPU first.
-		 */
-		if (cpu < 0) {
-			if (bpf_cpumask_test_cpu(prev_cpu, cast_mask(pref)) &&
-			    bpf_cpumask_test_cpu(prev_cpu, p->cpus_ptr) &&
-			    scx_bpf_test_and_clear_cpu_idle(prev_cpu))
-				cpu = prev_cpu;
-
-			if (cpu < 0) {
-				bpf_for(i, 0, nr_cpu_ids) {
-					if (!bpf_cpumask_test_cpu(i, cast_mask(pref)) ||
-					    !bpf_cpumask_test_cpu(i, idle) ||
-					    !bpf_cpumask_test_cpu(i, p->cpus_ptr))
-						continue;
-					if (scx_bpf_test_and_clear_cpu_idle(i)) {
-						cpu = i;
-						break;
-					}
-				}
-			}
-		}
+		claim_idle_cpu(p, prev_cpu, pref, idle_smt, true, &cpu);
+		if (cpu < 0)
+			claim_idle_cpu(p, prev_cpu, pref, idle, false, &cpu);
 	}
 	if (idle_smt)
 		scx_bpf_put_cpumask(idle_smt);
