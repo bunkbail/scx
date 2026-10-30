@@ -1067,4 +1067,241 @@ mod tests {
         assert_eq!(delta.wait_n.b0, 1);
         assert_eq!(delta.wait_max.b0, 42);
     }
+
+    /// A snapshot with every wait row populated, so a formatting change
+    /// that drops or moves a value shows up in the golden text.
+    fn sample_metrics() -> Metrics {
+        Metrics {
+            nr_running: 7,
+            stats_enabled: 1,
+            nr_direct_dispatches: 11,
+            nr_preemptions: 17,
+            nr_boosts: 59,
+            nr_sticky: 61,
+            nr_coldspreads: 71,
+            nr_class: vec![1, 2, 3, 4],
+            nr_lane: vec![5, 6],
+            nr_tick_preempts: 19,
+            nr_tick_preempts_warm: 23,
+            nr_tick_cut_refused: 29,
+            nr_lease_requeues: 47,
+            nr_home_takebacks: 53,
+            nr_depth1_pulls: 31,
+            nr_depth1_pulls_seat: 37,
+            nr_bulk_backstop: 41,
+            nr_wake_preempts: 43,
+            nr_land: Ranks {
+                r_self: 1,
+                r_sib: 2,
+                r_l2: 3,
+                r_llc: 4,
+                r_node: 5,
+                r_far: 6,
+            },
+            nr_wake_land: Ranks {
+                r_self: 2,
+                r_sib: 3,
+                r_l2: 4,
+                r_llc: 5,
+                r_node: 6,
+                r_far: 7,
+            },
+            nr_seat_self: 67,
+            nr_seat_move: Ranks {
+                r_self: 3,
+                r_sib: 4,
+                r_l2: 5,
+                r_llc: 6,
+                r_node: 7,
+                r_far: 8,
+            },
+            nr_pull_land: Ranks {
+                r_self: 4,
+                r_sib: 5,
+                r_l2: 6,
+                r_llc: 7,
+                r_node: 8,
+                r_far: 9,
+            },
+            nr_arr_seat: 73,
+            nr_arr_shared: 79,
+            wait_n: WaitB {
+                b0: 3,
+                b1: 2,
+                b2: 1,
+                b3: 4,
+            },
+            wait_ns: WaitB {
+                b0: 3_000,
+                b1: 6_000,
+                b2: 9_000,
+                b3: 12_000,
+            },
+            wait_max: WaitB {
+                b0: 111,
+                b1: 222,
+                b2: 333,
+                b3: 444,
+            },
+            wait_slow: WaitB {
+                b0: 1,
+                b1: 2,
+                b2: 3,
+                b3: 4,
+            },
+            wait_cls: WaitCls {
+                fg_b0: 1,
+                fg_b1: 2,
+                fg_b2: 3,
+                fg_b3: 4,
+                fg_ns_b0: 1_000,
+                fg_ns_b1: 2_000,
+                fg_ns_b2: 3_000,
+                fg_ns_b3: 4_000,
+                fg_max_b0: 10,
+                fg_max_b1: 20,
+                fg_max_b2: 30,
+                fg_max_b3: 40,
+                fg_slow: vec![1, 2, 3, 4],
+                other_b0: 4,
+                other_b1: 3,
+                other_b2: 2,
+                other_b3: 1,
+                other_ns_b0: 8_000,
+                other_ns_b1: 6_000,
+                other_ns_b2: 4_000,
+                other_ns_b3: 2_000,
+                other_max_b0: 80,
+                other_max_b1: 60,
+                other_max_b2: 40,
+                other_max_b3: 20,
+                other_slow: vec![4, 3, 2, 1],
+            },
+            wait_type: WaitType {
+                wk_b0: 2,
+                wk_b1: 3,
+                wk_b2: 4,
+                wk_b3: 5,
+                wk_ns_b0: 2_000,
+                wk_ns_b1: 3_000,
+                wk_ns_b2: 4_000,
+                wk_ns_b3: 5_000,
+                wk_max_b0: 20,
+                wk_max_b1: 30,
+                wk_max_b2: 40,
+                wk_max_b3: 50,
+                wk_slow: vec![1, 2, 3, 4],
+                rot_b0: 5,
+                rot_b1: 4,
+                rot_b2: 3,
+                rot_b3: 2,
+                rot_ns_b0: 5_000,
+                rot_ns_b1: 4_000,
+                rot_ns_b2: 3_000,
+                rot_ns_b3: 2_000,
+                rot_max_b0: 50,
+                rot_max_b1: 40,
+                rot_max_b2: 30,
+                rot_max_b3: 20,
+                rot_slow: vec![4, 3, 2, 1],
+            },
+            wait_lcri: WaitLCRI {
+                lat_n: vec![1, 2, 3, 4],
+                lat_ns: vec![1_000, 2_000, 3_000, 4_000],
+                lat_max: vec![10, 20, 30, 40],
+                lat_slow: vec![1, 2, 3, 4],
+                other_n: vec![4, 3, 2, 1],
+                other_ns: vec![4_000, 3_000, 2_000, 1_000],
+                other_max: vec![40, 30, 20, 10],
+                other_slow: vec![4, 3, 2, 1],
+            },
+            wait_wg: WaitGateMiss {
+                n: (1..=40).collect(),
+                ns: (1..=40).map(|i| i * 1_000).collect(),
+                max: (1..=40).map(|i| i * 10).collect(),
+                slow: (0..40).map(|i| i % 5).collect(),
+            },
+            nr_arr_wake_seat: 83,
+            nr_arr_wake_shared: 89,
+            nr_arr_rot_seat: 97,
+            nr_arr_rot_shared: 101,
+            census: Census {
+                seat: vec![1, 2, 3, 4, 5, 6, 7, 10],
+                shared: vec![10, 7, 6, 5, 4, 3, 2, 1],
+            },
+        }
+    }
+
+    /// The recorded output of `sample_metrics()`. The trailing spaces on
+    /// the summary line are part of the format and are spelled out.
+    const GOLDEN: &str = concat!(
+        "[scx_baby] tasks -> r:  7 | dispatch -> d: 11    s: 79    | preempt: 17    tick: 19  +23   tkref: 29   | d1pull: 31  +37   | bkstop: 41   | wkpre: 43    | lease: 47  /53   | boost: 59   | sticky: 61    | warm: 73    | cold: 71\x20\x20\x20\n",
+        "  class[[1, 2, 3, 4]] lane[bulk 5 fast 6]\n",
+        "  land: self 4.8% sib 9.5% l2 14.3% llc 19.0% node 23.8% far 28.6% | wake: self 7.4% sib 11.1% l2 14.8% llc 18.5% node 22.2% far 25.9%\n",
+        "  seatmove: self 9.1% sib 12.1% l2 15.2% llc 18.2% node 21.2% far 24.2% | pull: self 10.3% sib 12.8% l2 15.4% llc 17.9% node 20.5% far 23.1%\n",
+        "  wait n[3 2 1 4] mean_us[1 3 9 3] max_ns[111 222 333 444] slow5ms[1 2 3 4] arr(seat 73 shared 79)\n",
+        "  waitfg n[1 2 3 4] mean_us[1 1 1 1] max_ns[10 20 30 40] slow5ms[1 2 3 4]\n",
+        "  waitot n[4 3 2 1] mean_us[2 2 2 2] max_ns[80 60 40 20] slow5ms[4 3 2 1]\n",
+        "  waitwk n[2 3 4 5] mean_us[1 1 1 1] max_ns[20 30 40 50] slow5ms[1 2 3 4] arr(seat 83 shared 89)\n",
+        "  waitrot n[5 4 3 2] mean_us[1 1 1 1] max_ns[50 40 30 20] slow5ms[4 3 2 1] arr(seat 97 shared 101)\n",
+        "  wlcri lat n[[1, 2, 3, 4]] mean_us[[\"1\", \"1\", \"1\", \"1\"]] max_ns[[\"10\", \"20\", \"30\", \"40\"]] slow5ms[[1, 2, 3, 4]]\n",
+        "  wlcri other n[[4, 3, 2, 1]] mean_us[[\"1\", \"1\", \"1\", \"1\"]] max_ns[[\"40\", \"30\", \"20\", \"10\"]] slow5ms[[4, 3, 2, 1]]\n",
+        "  wg d0 n[[1, 2, 3, 4, 5, 6, 7, 8, 9, 10]] mean_us[[\"1\", \"1\", \"1\", \"1\", \"1\", \"1\", \"1\", \"1\", \"1\", \"1\"]] max_ns[[\"10\", \"20\", \"30\", \"40\", \"50\", \"60\", \"70\", \"80\", \"90\", \"100\"]] slow5ms[[0, 1, 2, 3, 4, 0, 1, 2, 3, 4]]\n",
+        "  wg d1 n[[11, 12, 13, 14, 15, 16, 17, 18, 19, 20]] mean_us[[\"1\", \"1\", \"1\", \"1\", \"1\", \"1\", \"1\", \"1\", \"1\", \"1\"]] max_ns[[\"110\", \"120\", \"130\", \"140\", \"150\", \"160\", \"170\", \"180\", \"190\", \"200\"]] slow5ms[[0, 1, 2, 3, 4, 0, 1, 2, 3, 4]]\n",
+        "  wg d2 n[[21, 22, 23, 24, 25, 26, 27, 28, 29, 30]] mean_us[[\"1\", \"1\", \"1\", \"1\", \"1\", \"1\", \"1\", \"1\", \"1\", \"1\"]] max_ns[[\"210\", \"220\", \"230\", \"240\", \"250\", \"260\", \"270\", \"280\", \"290\", \"300\"]] slow5ms[[0, 1, 2, 3, 4, 0, 1, 2, 3, 4]]\n",
+        "  wg d3 n[[31, 32, 33, 34, 35, 36, 37, 38, 39, 40]] mean_us[[\"1\", \"1\", \"1\", \"1\", \"1\", \"1\", \"1\", \"1\", \"1\", \"1\"]] max_ns[[\"310\", \"320\", \"330\", \"340\", \"350\", \"360\", \"370\", \"380\", \"390\", \"400\"]] slow5ms[[0, 1, 2, 3, 4, 0, 1, 2, 3, 4]]\n",
+        "  census: seat[2.6% 5.3% 7.9% 10.5% 13.2% 15.8% 18.4% 26.3%] shared[26.3% 18.4% 15.8% 13.2% 10.5% 7.9% 5.3% 2.6%]\n",
+    );
+
+    fn format_text(metrics: &Metrics) -> String {
+        let mut out = Vec::new();
+        metrics.format(&mut out).unwrap();
+        String::from_utf8(out).unwrap()
+    }
+
+    #[test]
+    fn format_matches_the_recorded_output() {
+        assert_eq!(format_text(&sample_metrics()), GOLDEN);
+    }
+
+    #[test]
+    fn zero_waits_print_a_dash() {
+        let mut metrics = sample_metrics();
+        metrics.wait_n = WaitB::default();
+        metrics.wait_ns = WaitB {
+            b0: 1_000,
+            ..Default::default()
+        };
+        metrics.wait_max = WaitB {
+            b0: 500,
+            ..Default::default()
+        };
+        let text = format_text(&metrics);
+        let line = text
+            .lines()
+            .find(|line| line.starts_with("  wait n["))
+            .unwrap();
+        assert!(line.contains("mean_us[- - - -]"), "{line}");
+        assert!(line.contains("max_ns[- - - -]"), "{line}");
+    }
+
+    #[test]
+    fn wait_mean_rounds_to_the_nearest_microsecond() {
+        let mut metrics = sample_metrics();
+        metrics.wait_n = WaitB {
+            b0: 2,
+            ..Default::default()
+        };
+        metrics.wait_ns = WaitB {
+            b0: 1_999,
+            ..Default::default()
+        };
+        let text = format_text(&metrics);
+        let line = text
+            .lines()
+            .find(|line| line.starts_with("  wait n["))
+            .unwrap();
+        // 1999ns over two waits is 0.9995us, which rounds to 1.
+        assert!(line.contains("mean_us[1 "), "{line}");
+    }
 }
