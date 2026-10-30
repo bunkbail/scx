@@ -169,6 +169,20 @@ extern bool cpu_running[BABY_MAX_CPUS];
  */
 #define BABY_NODE_CLOCK_NR	64
 
+/*
+ * The per-CPU tables and the node clock table are sized to powers of
+ * two; these masks keep an id from a kernel helper inside the table.
+ */
+static __always_inline u32 cpu_idx(u32 cpu)
+{
+	return cpu & (BABY_MAX_CPUS - 1);
+}
+
+static __always_inline u32 node_idx(u32 node)
+{
+	return node & (BABY_NODE_CLOCK_NR - 1);
+}
+
 extern u64 seat_service_at[2][BABY_MAX_CPUS];
 extern u64 node_service_at[2][BABY_NODE_CLOCK_NR];
 
@@ -705,19 +719,16 @@ static __always_inline s32 any_allowed_cpu(const struct task_struct *p,
 }
 
 /*
- * Peek a shared queue for @cpu and hide a head the CPU cannot run.
- * An affinity-restricted head otherwise poisons the lane for every CPU
- * that can reach it: dispatch treats it as the lane's next deadline,
- * and the tick preempts bulk work for a waiter the CPU cannot pull.
- */
-/*
- * The first task in @dsq that can run on @cpu. A plain peek stops at
- * the head, so an affinity-restricted head hides every task behind it:
- * a CPU that could run one of them reads the lane as empty, dispatches
- * nothing and goes idle, and the stranded work waits for an unrelated
- * wakeup. Peek the head locklessly first; only a head this CPU cannot
- * run needs the bounded scan, which keeps the verifier's trip count
- * constant and leaves work past the bound to the pull.
+ * The first task in @dsq that can run on @cpu, hiding a head the CPU
+ * cannot run. An affinity-restricted head otherwise poisons the lane for
+ * every CPU that can reach it: dispatch treats it as the lane's next
+ * deadline, and the tick preempts bulk work for a waiter the CPU cannot
+ * pull. A plain peek also stops at that head, so it hides every task
+ * behind it: a CPU that could run one of them reads the lane as empty,
+ * dispatches nothing and goes idle, and the stranded work waits for an
+ * unrelated wakeup. Peek the head locklessly first; only a head this CPU
+ * cannot run needs the bounded scan, which keeps the verifier's trip
+ * count constant and leaves work past the bound to the pull.
  */
 #define BABY_DSQ_PEEK_NR	16
 

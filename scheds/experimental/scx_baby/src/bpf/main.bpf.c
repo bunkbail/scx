@@ -219,8 +219,8 @@ static __always_inline void refill_fl_budget(u32 idx, u64 now)
 static __always_inline bool bulk_waiting(s32 cpu)
 {
 	s32 node = __COMPAT_scx_bpf_cpu_node(cpu);
-	u32 idx = (u32)cpu & (BABY_MAX_CPUS - 1);
-	u32 nidx = (u32)node & (BABY_NODE_CLOCK_NR - 1);
+	u32 idx = cpu_idx(cpu);
+	u32 nidx = node_idx(node);
 
 	/*
 	 * Both counts at zero prove nothing was waiting on either bulk
@@ -505,7 +505,7 @@ s32 BPF_STRUCT_OPS(baby_select_cpu, struct task_struct *p,
 	if (tctx && is_lat_cri(tctx) &&
 	    bpf_cpumask_test_cpu(prev_cpu, p->cpus_ptr) &&
 	    !cpu_smt_shared(prev_cpu)) {
-		u32 pidx = (u32)prev_cpu & (BABY_MAX_CPUS - 1);
+		u32 pidx = cpu_idx(prev_cpu);
 		bool allowed = true;
 		struct bpf_cpumask *mask = non_lp_cpumask;
 
@@ -605,7 +605,7 @@ s32 BPF_STRUCT_OPS(baby_select_cpu, struct task_struct *p,
 		 */
 		struct task_struct *curr;
 		struct task_ctx *cctx;
-		u32 pcpu_idx = (u32)prev_cpu & (BABY_MAX_CPUS - 1);
+		u32 pcpu_idx = cpu_idx(prev_cpu);
 		u64 ran_at;
 
 		if (!tctx)
@@ -848,8 +848,7 @@ void BPF_STRUCT_OPS(baby_enqueue, struct task_struct *p, u64 enq_flags)
 		 * empty; a queue that is already served does not need it.
 		 */
 		if (!lane_backlog)
-			node_service_at[lat & 1][node &
-						 (BABY_NODE_CLOCK_NR - 1)] = now;
+			node_service_at[lat & 1][node_idx(node)] = now;
 
 		slice = backlog_deep(lane_backlog) && !tctx->tick_preempted
 			? 4 * deadline_ns : task_slice(tctx);
@@ -882,8 +881,8 @@ void BPF_STRUCT_OPS(baby_dispatch, s32 cpu, struct task_struct *prev)
 	struct task_ctx *tctx;
 	bool need_running = prev && is_queued(prev);
 	s32 node = __COMPAT_scx_bpf_cpu_node(cpu);
-	u32 idx = (u32)cpu & (BABY_MAX_CPUS - 1);
-	u32 nidx = (u32)node & (BABY_NODE_CLOCK_NR - 1);
+	u32 idx = cpu_idx(cpu);
+	u32 nidx = node_idx(node);
 	u64 fl_seat_dsq = fl_cpu2dsq(cpu);
 	u64 fl_node_dsq = fl_node2dsq(node);
 	u64 bulk_seat_dsq = cpu2dsq(cpu);
@@ -1304,8 +1303,8 @@ void BPF_STRUCT_OPS(baby_cpu_release, s32 cpu,
 	 * is shimmed to void through the compat layer on others; call it
 	 * as void, the re-enqueue happens either way.
 	 */
-	cpu_fl_running_at[(u32)cpu & (BABY_MAX_CPUS - 1)] = 0;
-	cpu_bulk_wait[(u32)cpu & (BABY_MAX_CPUS - 1)] = false;
+	cpu_fl_running_at[cpu_idx(cpu)] = 0;
+	cpu_bulk_wait[cpu_idx(cpu)] = false;
 	scx_bpf_reenqueue_local();
 }
 
@@ -1333,7 +1332,7 @@ void BPF_STRUCT_OPS(baby_tick, struct task_struct *p)
 	 */
 	if (is_lat_cri(tctx)) {
 		s32 cpu = scx_bpf_task_cpu(p);
-		u32 idx = (u32)cpu & (BABY_MAX_CPUS - 1);
+		u32 idx = cpu_idx(cpu);
 
 		refill_fl_budget(idx, now);
 		charge_fl_runtime(idx, now, bulk_waiting(cpu));
@@ -1358,7 +1357,7 @@ void BPF_STRUCT_OPS(baby_tick, struct task_struct *p)
 	 */
 	if (!is_lat_cri(tctx)) {
 		s32 cpu = scx_bpf_task_cpu(p);
-		u32 idx = (u32)cpu & (BABY_MAX_CPUS - 1);
+		u32 idx = cpu_idx(cpu);
 		u64 ran_at = cpu_running_at[idx];
 
 		if (now - ran_at >= BABY_TICK_PREEMPT_PROTECT_NS) {
@@ -1381,8 +1380,7 @@ void BPF_STRUCT_OPS(baby_tick, struct task_struct *p)
 					dsq_peek_allowed(fl_node2dsq(node), cpu);
 
 				if (head) {
-					u32 idx = (u32)node &
-						  (BABY_NODE_CLOCK_NR - 1);
+					u32 idx = node_idx(node);
 					u32 pid = (u32)head->pid;
 					u64 now32 = (u32)now | 1;
 					u64 claim = ((u64)pid << 32) | now32;
@@ -1452,7 +1450,7 @@ void BPF_STRUCT_OPS(baby_stopping, struct task_struct *p, bool runnable)
 						  scx_bpf_task_cpu(p);
 	now = bpf_ktime_get_ns();
 	{
-		u32 idx = (u32)last_cpu & (BABY_MAX_CPUS - 1);
+		u32 idx = cpu_idx(last_cpu);
 
 		/*
 		 * Account the contested fast-lane runtime actually
@@ -1549,13 +1547,13 @@ void BPF_STRUCT_OPS(baby_running, struct task_struct *p)
 	 */
 	{
 		s32 cpu = scx_bpf_task_cpu(p);
-		u32 cpu_idx = (u32)cpu & (BABY_MAX_CPUS - 1);
+		u32 cidx = cpu_idx(cpu);
 
-		cpu_running_at[cpu_idx] = now;
-		cpu_running[cpu_idx] = true;
-		cpu_is_lat[cpu_idx] = tctx && is_lat_cri(tctx);
-		if (!cpu_is_lat[cpu_idx])
-			cpu_bulk_at[cpu_idx] = now;
+		cpu_running_at[cidx] = now;
+		cpu_running[cidx] = true;
+		cpu_is_lat[cidx] = tctx && is_lat_cri(tctx);
+		if (!cpu_is_lat[cidx])
+			cpu_bulk_at[cidx] = now;
 		/*
 		 * The fast-lane clock. A non-zero stamp means the CPU's last
 		 * run was fast-lane work and no bulk run or idle dispatch
@@ -1564,12 +1562,11 @@ void BPF_STRUCT_OPS(baby_running, struct task_struct *p)
 		 * starts, whether it is bulk or fast-lane work. A bulk run
 		 * or an idle dispatch clears the stamp.
 		 */
-		if (cpu_fl_running_at[cpu_idx]) {
-			refill_fl_budget(cpu_idx, now);
-			charge_fl_runtime(cpu_idx, now,
-					  cpu_bulk_wait[cpu_idx]);
+		if (cpu_fl_running_at[cidx]) {
+			refill_fl_budget(cidx, now);
+			charge_fl_runtime(cidx, now, cpu_bulk_wait[cidx]);
 		}
-		cpu_fl_running_at[cpu_idx] = cpu_is_lat[cpu_idx] ? now : 0;
+		cpu_fl_running_at[cidx] = cpu_is_lat[cidx] ? now : 0;
 		if (tctx)
 			tctx->last_cpu = cpu;
 	}
@@ -1723,7 +1720,7 @@ static int rescue_timerfn(void *map, int *key, struct bpf_timer *timer)
 
 	if (__COMPAT_has_generic_reenq()) {
 		bpf_for(cpu, 0, nr_cpu_ids) {
-			u32 idx = (u32)cpu & (BABY_MAX_CPUS - 1);
+			u32 idx = cpu_idx(cpu);
 
 			if (rescue_one_dsq(cpu2dsq(cpu),
 					   seat_service_at[0][idx], now))
@@ -1733,7 +1730,7 @@ static int rescue_timerfn(void *map, int *key, struct bpf_timer *timer)
 				seat_used[1][idx] = 0;
 		}
 		bpf_for(node, 0, nr_node_ids) {
-			u32 idx = (u32)node & (BABY_NODE_CLOCK_NR - 1);
+			u32 idx = node_idx(node);
 
 			rescue_one_dsq(node, node_service_at[0][idx], now);
 			rescue_one_dsq(fl_node2dsq(node),
@@ -1888,11 +1885,11 @@ SCX_OPS_DEFINE(baby_ops,
 	       .tick			= (void *)baby_tick,
 	       .running			= (void *)baby_running,
 	       .runnable		= (void *)baby_runnable,
-		       .stopping		= (void *)baby_stopping,
-		       .yield			= (void *)baby_yield,
-		       .cpu_release		= (void *)baby_cpu_release,
-		       .init_task		= (void *)baby_init_task,
-		       .init			= (void *)baby_init,
+	       .stopping		= (void *)baby_stopping,
+	       .yield			= (void *)baby_yield,
+	       .cpu_release		= (void *)baby_cpu_release,
+	       .init_task		= (void *)baby_init_task,
+	       .init			= (void *)baby_init,
 	       .exit			= (void *)baby_exit,
 	       .timeout_ms		= 5000,
 	       .name			= "baby");

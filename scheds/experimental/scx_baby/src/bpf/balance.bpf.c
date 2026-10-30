@@ -60,6 +60,11 @@ __hidden bool balance_try_warm_seat(struct task_struct *p, struct task_ctx *tctx
 		s32 best = target;
 
 		bpf_for(i, 0, nr_cpu_ids) {
+			/*
+			 * Mask the induction variable inline: passing it to
+			 * cpu_idx() changes this loop's stack layout in the
+			 * compiled object.
+			 */
 			u32 ci = (u32)i & (BABY_MAX_CPUS - 1);
 			/*
 			 * The scan is the only reader of the runnable
@@ -105,7 +110,7 @@ __hidden bool balance_try_warm_seat(struct task_struct *p, struct task_ctx *tctx
 			s32 sib = cpu_smt_sibling((s32)i);
 
 			if (sib >= 0 &&
-			    cpu_is_lat[(u32)sib & (BABY_MAX_CPUS - 1)])
+			    cpu_is_lat[cpu_idx(sib)])
 				cmp += 2;
 
 			if (cmp < best_cmp ||
@@ -190,14 +195,14 @@ __hidden bool balance_try_warm_seat(struct task_struct *p, struct task_ctx *tctx
 				4 * deadline_ns : task_slice(tctx);
 
 			dsq = lat ? fl_cpu2dsq(target) : cpu2dsq(target);
-						/*
+			/*
 			 * Seed the rescue clock when the target seat was
 			 * empty; a seat that is being served needs none.
 			 * Mark the seat for the scan's occupancy hint on
 			 * every insertion, idempotently.
 			 */
 			{
-				u32 tidx = (u32)target & (BABY_MAX_CPUS - 1);
+				u32 tidx = cpu_idx(target);
 				u32 lane = lat ? 1 : 0;
 
 				if (!target_nr)

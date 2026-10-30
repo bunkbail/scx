@@ -49,7 +49,7 @@ __hidden s32 cpu_smt_sibling(s32 cpu)
 	if (cpu < 0 || (u32)cpu >= nr_cpu_ids)
 		return -1;
 
-	i = (u32)cpu & (BABY_MAX_CPUS - 1);
+	i = cpu_idx(cpu);
 	v = topo_sibling[i];
 
 	return v ? (s32)(v - 1) : -1;
@@ -71,8 +71,8 @@ __hidden u32 cpu_dist(s32 a, s32 b)
 	if (a == b)
 		return BABY_DIST_SELF;
 
-	ia = (u32)a & (BABY_MAX_CPUS - 1);
-	ib = (u32)b & (BABY_MAX_CPUS - 1);
+	ia = cpu_idx(a);
+	ib = cpu_idx(b);
 
 	if (topo_core[ia] && topo_core[ia] == topo_core[ib])
 		return BABY_DIST_SIBLING;
