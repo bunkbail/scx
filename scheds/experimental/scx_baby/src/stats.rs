@@ -116,6 +116,24 @@ macro_rules! sub_fields {
     };
 }
 
+/// The named wait fields assume exactly four depth buckets.
+const _: () = assert!(WDEPTH == 4);
+
+/// One depth row of a flat depth-major array.
+fn row(a: &[u64], r: usize) -> [u64; WDEPTH] {
+    std::array::from_fn(|b| a[r * WDEPTH + b])
+}
+
+/// The sum of two depth rows.
+fn sum2(a: &[u64], r0: usize, r1: usize) -> [u64; WDEPTH] {
+    std::array::from_fn(|b| a[r0 * WDEPTH + b] + a[r1 * WDEPTH + b])
+}
+
+/// The elementwise maximum of two depth rows.
+fn max2(a: &[u64], r0: usize, r1: usize) -> [u64; WDEPTH] {
+    std::array::from_fn(|b| a[r0 * WDEPTH + b].max(a[r1 * WDEPTH + b]))
+}
+
 /// One placement-distance histogram: landings bucketed by the distance
 /// rank between the task's previous CPU and where it actually went
 /// (self, SMT sibling, same L2, same LLC, same node, beyond).
@@ -285,38 +303,40 @@ impl WaitCls {
         a_max: &[u64; WDEPTH * WCLS],
         a_slow: &[u64; WDEPTH * WCLS],
     ) -> Self {
-        let mut fg_slow = Vec::with_capacity(WDEPTH);
-        let mut other_slow = Vec::with_capacity(WDEPTH);
-        for b in 0..WDEPTH {
-            fg_slow.push(a_slow[2 * WDEPTH + b] + a_slow[3 * WDEPTH + b]);
-            other_slow.push(a_slow[b] + a_slow[WDEPTH + b]);
-        }
+        let [fg_b0, fg_b1, fg_b2, fg_b3] = sum2(a_n, 2, 3);
+        let [fg_ns_b0, fg_ns_b1, fg_ns_b2, fg_ns_b3] = sum2(a_ns, 2, 3);
+        let [fg_max_b0, fg_max_b1, fg_max_b2, fg_max_b3] = max2(a_max, 2, 3);
+        let fg_slow = sum2(a_slow, 2, 3).to_vec();
+        let [other_b0, other_b1, other_b2, other_b3] = sum2(a_n, 0, 1);
+        let [other_ns_b0, other_ns_b1, other_ns_b2, other_ns_b3] = sum2(a_ns, 0, 1);
+        let [other_max_b0, other_max_b1, other_max_b2, other_max_b3] = max2(a_max, 0, 1);
+        let other_slow = sum2(a_slow, 0, 1).to_vec();
         WaitCls {
-            fg_b0: a_n[2 * WDEPTH] + a_n[3 * WDEPTH],
-            fg_b1: a_n[2 * WDEPTH + 1] + a_n[3 * WDEPTH + 1],
-            fg_b2: a_n[2 * WDEPTH + 2] + a_n[3 * WDEPTH + 2],
-            fg_b3: a_n[2 * WDEPTH + 3] + a_n[3 * WDEPTH + 3],
-            fg_ns_b0: a_ns[2 * WDEPTH] + a_ns[3 * WDEPTH],
-            fg_ns_b1: a_ns[2 * WDEPTH + 1] + a_ns[3 * WDEPTH + 1],
-            fg_ns_b2: a_ns[2 * WDEPTH + 2] + a_ns[3 * WDEPTH + 2],
-            fg_ns_b3: a_ns[2 * WDEPTH + 3] + a_ns[3 * WDEPTH + 3],
-            fg_max_b0: a_max[2 * WDEPTH].max(a_max[3 * WDEPTH]),
-            fg_max_b1: a_max[2 * WDEPTH + 1].max(a_max[3 * WDEPTH + 1]),
-            fg_max_b2: a_max[2 * WDEPTH + 2].max(a_max[3 * WDEPTH + 2]),
-            fg_max_b3: a_max[2 * WDEPTH + 3].max(a_max[3 * WDEPTH + 3]),
+            fg_b0,
+            fg_b1,
+            fg_b2,
+            fg_b3,
+            fg_ns_b0,
+            fg_ns_b1,
+            fg_ns_b2,
+            fg_ns_b3,
+            fg_max_b0,
+            fg_max_b1,
+            fg_max_b2,
+            fg_max_b3,
             fg_slow,
-            other_b0: a_n[0] + a_n[WDEPTH],
-            other_b1: a_n[1] + a_n[WDEPTH + 1],
-            other_b2: a_n[2] + a_n[WDEPTH + 2],
-            other_b3: a_n[3] + a_n[WDEPTH + 3],
-            other_ns_b0: a_ns[0] + a_ns[WDEPTH],
-            other_ns_b1: a_ns[1] + a_ns[WDEPTH + 1],
-            other_ns_b2: a_ns[2] + a_ns[WDEPTH + 2],
-            other_ns_b3: a_ns[3] + a_ns[WDEPTH + 3],
-            other_max_b0: a_max[0].max(a_max[WDEPTH]),
-            other_max_b1: a_max[1].max(a_max[WDEPTH + 1]),
-            other_max_b2: a_max[2].max(a_max[WDEPTH + 2]),
-            other_max_b3: a_max[3].max(a_max[WDEPTH + 3]),
+            other_b0,
+            other_b1,
+            other_b2,
+            other_b3,
+            other_ns_b0,
+            other_ns_b1,
+            other_ns_b2,
+            other_ns_b3,
+            other_max_b0,
+            other_max_b1,
+            other_max_b2,
+            other_max_b3,
             other_slow,
         }
     }
@@ -404,38 +424,40 @@ impl WaitType {
         a_max: &[u64; WDEPTH * WTYPE],
         a_slow: &[u64; WDEPTH * WTYPE],
     ) -> Self {
-        let mut wk_slow = Vec::with_capacity(WDEPTH);
-        let mut rot_slow = Vec::with_capacity(WDEPTH);
-        for b in 0..WDEPTH {
-            wk_slow.push(a_slow[WDEPTH + b]);
-            rot_slow.push(a_slow[b]);
-        }
+        let [wk_b0, wk_b1, wk_b2, wk_b3] = row(a_n, 1);
+        let [wk_ns_b0, wk_ns_b1, wk_ns_b2, wk_ns_b3] = row(a_ns, 1);
+        let [wk_max_b0, wk_max_b1, wk_max_b2, wk_max_b3] = row(a_max, 1);
+        let wk_slow = row(a_slow, 1).to_vec();
+        let [rot_b0, rot_b1, rot_b2, rot_b3] = row(a_n, 0);
+        let [rot_ns_b0, rot_ns_b1, rot_ns_b2, rot_ns_b3] = row(a_ns, 0);
+        let [rot_max_b0, rot_max_b1, rot_max_b2, rot_max_b3] = row(a_max, 0);
+        let rot_slow = row(a_slow, 0).to_vec();
         WaitType {
-            wk_b0: a_n[WDEPTH],
-            wk_b1: a_n[WDEPTH + 1],
-            wk_b2: a_n[WDEPTH + 2],
-            wk_b3: a_n[WDEPTH + 3],
-            wk_ns_b0: a_ns[WDEPTH],
-            wk_ns_b1: a_ns[WDEPTH + 1],
-            wk_ns_b2: a_ns[WDEPTH + 2],
-            wk_ns_b3: a_ns[WDEPTH + 3],
-            wk_max_b0: a_max[WDEPTH],
-            wk_max_b1: a_max[WDEPTH + 1],
-            wk_max_b2: a_max[WDEPTH + 2],
-            wk_max_b3: a_max[WDEPTH + 3],
+            wk_b0,
+            wk_b1,
+            wk_b2,
+            wk_b3,
+            wk_ns_b0,
+            wk_ns_b1,
+            wk_ns_b2,
+            wk_ns_b3,
+            wk_max_b0,
+            wk_max_b1,
+            wk_max_b2,
+            wk_max_b3,
             wk_slow,
-            rot_b0: a_n[0],
-            rot_b1: a_n[1],
-            rot_b2: a_n[2],
-            rot_b3: a_n[3],
-            rot_ns_b0: a_ns[0],
-            rot_ns_b1: a_ns[1],
-            rot_ns_b2: a_ns[2],
-            rot_ns_b3: a_ns[3],
-            rot_max_b0: a_max[0],
-            rot_max_b1: a_max[1],
-            rot_max_b2: a_max[2],
-            rot_max_b3: a_max[3],
+            rot_b0,
+            rot_b1,
+            rot_b2,
+            rot_b3,
+            rot_ns_b0,
+            rot_ns_b1,
+            rot_ns_b2,
+            rot_ns_b3,
+            rot_max_b0,
+            rot_max_b1,
+            rot_max_b2,
+            rot_max_b3,
             rot_slow,
         }
     }
@@ -1246,5 +1268,89 @@ mod tests {
         assert_eq!(delta.stats_enabled, cur.stats_enabled);
         assert_eq!(delta.census.seat[0], 0);
         assert_eq!(delta.census.shared[7], cur.census.shared[7]);
+    }
+
+    #[test]
+    fn wait_constructors_map_rows_exactly() {
+        // Every cell is distinct and the maxima are not the row sums, so
+        // a swapped class/type row or a sum used as a maximum fails.
+        let n: [u64; WDEPTH * WCLS] = std::array::from_fn(|i| i as u64 + 1);
+        let ns: [u64; WDEPTH * WCLS] = std::array::from_fn(|i| (i as u64 + 1) * 100);
+        let max: [u64; WDEPTH * WCLS] = std::array::from_fn(|i| {
+            // Alternate which row wins per depth, so dropping either row
+            // of max2 or substituting another row fails.
+            let (r, d) = (i / WDEPTH, i % WDEPTH);
+            if (r + d) % 2 == 0 {
+                50_000 + i as u64 * 1000
+            } else {
+                i as u64 * 1000 + 7
+            }
+        });
+        let slow: [u64; WDEPTH * WCLS] = std::array::from_fn(|i| (i as u64 + 1) * 10);
+
+        let cls = WaitCls::of(&n, &ns, &max, &slow);
+        assert_eq!(
+            [cls.fg_b0, cls.fg_b1, cls.fg_b2, cls.fg_b3],
+            [22, 24, 26, 28]
+        );
+        assert_eq!(
+            [cls.fg_ns_b0, cls.fg_ns_b1, cls.fg_ns_b2, cls.fg_ns_b3],
+            [2200, 2400, 2600, 2800]
+        );
+        assert_eq!(
+            [cls.fg_max_b0, cls.fg_max_b1, cls.fg_max_b2, cls.fg_max_b3],
+            [58000, 63000, 60000, 65000]
+        );
+        assert_eq!(cls.fg_slow, vec![220, 240, 260, 280]);
+        assert_eq!(
+            [cls.other_b0, cls.other_b1, cls.other_b2, cls.other_b3],
+            [6, 8, 10, 12]
+        );
+        assert_eq!(
+            [
+                cls.other_max_b0,
+                cls.other_max_b1,
+                cls.other_max_b2,
+                cls.other_max_b3
+            ],
+            [50000, 55000, 52000, 57000]
+        );
+        assert_eq!(
+            [
+                cls.other_ns_b0,
+                cls.other_ns_b1,
+                cls.other_ns_b2,
+                cls.other_ns_b3
+            ],
+            [600, 800, 1000, 1200]
+        );
+        assert_eq!(cls.other_slow, vec![60, 80, 100, 120]);
+
+        let n: [u64; WDEPTH * WTYPE] = std::array::from_fn(|i| i as u64 + 1);
+        let ns: [u64; WDEPTH * WTYPE] = std::array::from_fn(|i| (i as u64 + 1) * 100);
+        let max: [u64; WDEPTH * WTYPE] = std::array::from_fn(|i| (i as u64 + 1) * 1000 + 7);
+        let slow: [u64; WDEPTH * WTYPE] = std::array::from_fn(|i| (i as u64 + 1) * 10);
+
+        let ty = WaitType::of(&n, &ns, &max, &slow);
+        assert_eq!([ty.wk_b0, ty.wk_b1, ty.wk_b2, ty.wk_b3], [5, 6, 7, 8]);
+        assert_eq!(
+            [ty.wk_ns_b0, ty.wk_ns_b1, ty.wk_ns_b2, ty.wk_ns_b3],
+            [500, 600, 700, 800]
+        );
+        assert_eq!(
+            [ty.wk_max_b0, ty.wk_max_b1, ty.wk_max_b2, ty.wk_max_b3],
+            [5007, 6007, 7007, 8007]
+        );
+        assert_eq!(ty.wk_slow, vec![50, 60, 70, 80]);
+        assert_eq!([ty.rot_b0, ty.rot_b1, ty.rot_b2, ty.rot_b3], [1, 2, 3, 4]);
+        assert_eq!(
+            [ty.rot_max_b0, ty.rot_max_b1, ty.rot_max_b2, ty.rot_max_b3],
+            [1007, 2007, 3007, 4007]
+        );
+        assert_eq!(
+            [ty.rot_ns_b0, ty.rot_ns_b1, ty.rot_ns_b2, ty.rot_ns_b3],
+            [100, 200, 300, 400]
+        );
+        assert_eq!(ty.rot_slow, vec![10, 20, 30, 40]);
     }
 }
