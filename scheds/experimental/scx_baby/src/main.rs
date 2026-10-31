@@ -101,17 +101,21 @@ fn scaled_prio_offsets(deadline_ns: u64) -> [i64; consts_BABY_PRIO_OFFSET_NR as 
     table
 }
 
+/// Read one unsigned value from a sysfs file.
+fn read_sysfs_u32(path: &str) -> Option<u32> {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|s| s.trim().parse::<u32>().ok())
+}
+
 /// Classify the cores from the topology and the sysfs capacity and
 /// frequency ladders. Pure over its inputs, so the tier counts can be
 /// written as rodata before load.
 fn classify_cores(topo: &Topology) -> (CoreClasses, tiers::TierSource) {
     // The kernel's own per-CPU capacity, exported by hybrid and ARM
-    // parts.
-    let capacity = |id: usize| {
-        std::fs::read_to_string(format!("/sys/devices/system/cpu/cpu{id}/cpu_capacity"))
-            .ok()
-            .and_then(|s| s.trim().parse::<u32>().ok())
-    };
+    // parts. A zero capacity is real input and must not be filtered.
+    let capacity =
+        |id: usize| read_sysfs_u32(&format!("/sys/devices/system/cpu/cpu{id}/cpu_capacity"));
     // The core types as scx_utils derived them from its capacity
     // ladder; the input of the fallback branch.
     let is_big_core_type = |id: usize| {
@@ -121,13 +125,12 @@ fn classify_cores(topo: &Topology) -> (CoreClasses, tiers::TierSource) {
     };
     // The hardware maximum frequency: the corroboration input that
     // keeps a claimed core-type split from being a ranking artifact
-    // (see tiers::classify).
+    // (see tiers::classify). An unreadable or zero frequency is no
+    // input.
     let max_freq = |id: usize| {
-        std::fs::read_to_string(format!(
+        read_sysfs_u32(&format!(
             "/sys/devices/system/cpu/cpu{id}/cpufreq/cpuinfo_max_freq"
         ))
-        .ok()
-        .and_then(|s| s.trim().parse::<u32>().ok())
         .filter(|freq| *freq > 0)
     };
 
@@ -426,14 +429,14 @@ impl<'a> Scheduler<'a> {
     }
 
     fn publish_core_classes(skel: &mut BpfSkel<'_>, classes: &CoreClasses) -> Result<()> {
-        for id in &classes.big {
-            Self::enable_core_class(skel, *id, core_tier_CORE_TIER_BIG)?;
-        }
-        for id in &classes.little {
-            Self::enable_core_class(skel, *id, core_tier_CORE_TIER_LITTLE)?;
-        }
-        for id in &classes.lp {
-            Self::enable_core_class(skel, *id, core_tier_CORE_TIER_LP)?;
+        for (ids, tier) in [
+            (&classes.big, core_tier_CORE_TIER_BIG),
+            (&classes.little, core_tier_CORE_TIER_LITTLE),
+            (&classes.lp, core_tier_CORE_TIER_LP),
+        ] {
+            for id in ids {
+                Self::enable_core_class(skel, *id, tier)?;
+            }
         }
         Ok(())
     }
