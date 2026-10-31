@@ -80,6 +80,16 @@ static struct cpu_ctx *try_lookup_cpu_ctx(s32 cpu)
 }
 
 /*
+ * The per-CPU performance context, but only while this module drives
+ * the platform request dynamically (cpuperf_lvl == -1). A fixed level
+ * (>= 0) or a platform left alone (< -1) has no context to update.
+ */
+static __always_inline struct cpu_ctx *cpuperf_ctx(s32 cpu)
+{
+	return cpuperf_lvl == -1 ? try_lookup_cpu_ctx(cpu) : NULL;
+}
+
+/*
  * Update the CPU load and scale its target performance level accordingly,
  * using the utilization observed in the last window, smoothed and applied
  * with hysteresis. A caller that knows the CPU is about to be saturated
@@ -154,7 +164,7 @@ static void update_cpuperf(struct cpu_ctx *cctx, s32 cpu, u64 now, bool max_floo
 /*
  * Initialize the CPU frequency performance level on all online CPUs.
  */
-static void init_cpuperf_target(void)
+__hidden void cpuperf_init(void)
 {
 	const struct cpumask *online_cpumask;
 	u64 perf_lvl;
@@ -177,12 +187,6 @@ static void init_cpuperf_target(void)
 	scx_bpf_put_cpumask(online_cpumask);
 }
 
-__hidden void cpuperf_init(void)
-{
-	/* Initialize the CPU frequency performance level. */
-	init_cpuperf_target();
-}
-
 /*
  * Advance the CPU runtime ledger and re-evaluate the performance floor
  * from it. The floor must not depend on ops.running() alone: a
@@ -195,16 +199,17 @@ __hidden void cpuperf_init(void)
  */
 __hidden void cpuperf_on_tick(struct task_struct *p, u64 now, bool max_floor)
 {
-	if (cpuperf_lvl == -1) {
-		struct cpu_ctx *cctx;
-		s32 cpu = scx_bpf_task_cpu(p);
+	struct cpu_ctx *cctx;
+	s32 cpu;
 
-		cctx = try_lookup_cpu_ctx(cpu);
-		if (cctx) {
-			cctx->tot_runtime += now - cctx->last_running;
-			update_cpuperf(cctx, cpu, now, max_floor);
-		}
-	}
+	if (cpuperf_lvl != -1)
+		return;
+	cpu = scx_bpf_task_cpu(p);
+	cctx = try_lookup_cpu_ctx(cpu);
+	if (!cctx)
+		return;
+	cctx->tot_runtime += now - cctx->last_running;
+	update_cpuperf(cctx, cpu, now, max_floor);
 }
 
 /*
@@ -215,27 +220,22 @@ __hidden void cpuperf_on_tick(struct task_struct *p, u64 now, bool max_floor)
  */
 __hidden void cpuperf_on_running(s32 cpu, u64 now, bool max_floor)
 {
-	if (cpuperf_lvl == -1) {
-		struct cpu_ctx *cctx;
+	struct cpu_ctx *cctx = cpuperf_ctx(cpu);
 
-		cctx = try_lookup_cpu_ctx(cpu);
-		if (cctx) {
-			/*
-			 * A long idle ends the previous utilization window.
-			 * Drop its runtime instead of charging it to the
-			 * window that starts with this run; a short idle
-			 * keeps it, and the cap in update_cpuperf() stops a
-			 * brief sleep from diluting it.
-			 */
-			if (cctx->idle_since &&
-			    now - cctx->idle_since > 4 * deadline_ns) {
-				cctx->last_running = now;
-				cctx->prev_runtime = cctx->tot_runtime;
-			}
-			cctx->idle_since = 0;
-			update_cpuperf(cctx, cpu, now, max_floor);
-		}
+	if (!cctx)
+		return;
+	/*
+	 * A long idle ends the previous utilization window. Drop its
+	 * runtime instead of charging it to the window that starts with
+	 * this run; a short idle keeps it, and the cap in update_cpuperf()
+	 * stops a brief sleep from diluting it.
+	 */
+	if (cctx->idle_since && now - cctx->idle_since > 4 * deadline_ns) {
+		cctx->last_running = now;
+		cctx->prev_runtime = cctx->tot_runtime;
 	}
+	cctx->idle_since = 0;
+	update_cpuperf(cctx, cpu, now, max_floor);
 }
 
 /*
@@ -244,13 +244,10 @@ __hidden void cpuperf_on_running(s32 cpu, u64 now, bool max_floor)
  */
 __hidden void cpuperf_on_stopping(s32 cpu, u64 now)
 {
-	if (cpuperf_lvl == -1) {
-		struct cpu_ctx *cctx;
+	struct cpu_ctx *cctx = cpuperf_ctx(cpu);
 
-		cctx = try_lookup_cpu_ctx(cpu);
-		if (cctx)
-			cctx->tot_runtime += now - cctx->last_running;
-	}
+	if (cctx)
+		cctx->tot_runtime += now - cctx->last_running;
 }
 
 /*
@@ -259,15 +256,13 @@ __hidden void cpuperf_on_stopping(s32 cpu, u64 now)
  */
 __hidden void cpuperf_on_idle(s32 cpu)
 {
-	if (cpuperf_lvl == -1) {
-		struct cpu_ctx *cctx = try_lookup_cpu_ctx(cpu);
+	struct cpu_ctx *cctx = cpuperf_ctx(cpu);
 
-		if (cctx) {
-			cctx->idle_since = bpf_ktime_get_ns();
-			if (cctx->perf_req) {
-				scx_bpf_cpuperf_set(cpu, 0);
-				cctx->perf_req = 0;
-			}
-		}
+	if (!cctx)
+		return;
+	cctx->idle_since = bpf_ktime_get_ns();
+	if (cctx->perf_req) {
+		scx_bpf_cpuperf_set(cpu, 0);
+		cctx->perf_req = 0;
 	}
 }
