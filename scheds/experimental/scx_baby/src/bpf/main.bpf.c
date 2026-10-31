@@ -303,41 +303,6 @@ static int init_cpumask(struct bpf_cpumask **cpumask)
 }
 
 /*
- * Claim an idle CPU from @mask for @pref, previous CPU first, then the
- * lowest-numbered bit. @test_prev_mask is a literal: the second pass
- * accepts the previous CPU from the plain idle mask without testing it
- * against the SMT mask again. Stores the claimed CPU in *@cpu and leaves
- * it untouched when no bit could be claimed.
- */
-static __always_inline void claim_idle_cpu(struct task_struct *p, s32 prev_cpu,
-					  struct bpf_cpumask *pref,
-					  const struct cpumask *mask,
-					  bool test_prev_mask, s32 *cpu)
-{
-	s32 i;
-
-	if (bpf_cpumask_test_cpu(prev_cpu, cast_mask(pref)) &&
-	    (!test_prev_mask ||
-	     bpf_cpumask_test_cpu(prev_cpu, mask)) &&
-	    bpf_cpumask_test_cpu(prev_cpu, p->cpus_ptr) &&
-	    scx_bpf_test_and_clear_cpu_idle(prev_cpu)) {
-		*cpu = prev_cpu;
-		return;
-	}
-
-	bpf_for(i, 0, nr_cpu_ids) {
-		if (!bpf_cpumask_test_cpu(i, cast_mask(pref)) ||
-		    !bpf_cpumask_test_cpu(i, mask) ||
-		    !bpf_cpumask_test_cpu(i, p->cpus_ptr))
-			continue;
-		if (scx_bpf_test_and_clear_cpu_idle(i)) {
-			*cpu = i;
-			break;
-		}
-	}
-}
-
-/*
  * Pick the lowest-numbered idle CPU of the given tier, preferring a
  * wholly idle physical core and then the previous CPU. Stacking
  * wakeups on the same few cores lets the rest of the tier idle at its
@@ -354,14 +319,56 @@ static __always_inline s32 pick_idle_pref(struct task_struct *p,
 {
 	const struct cpumask *idle_smt, *idle;
 	s32 cpu = -1;
+	s32 i;
 
 	bpf_rcu_read_lock();
 	idle_smt = scx_bpf_get_idle_smtmask();
 	idle = scx_bpf_get_idle_cpumask();
 	if (pref && idle_smt && idle) {
-		claim_idle_cpu(p, prev_cpu, pref, idle_smt, true, &cpu);
-		if (cpu < 0)
-			claim_idle_cpu(p, prev_cpu, pref, idle, false, &cpu);
+		/*
+		 * Pass 1: a wholly idle physical core, previous CPU first.
+		 */
+		if (bpf_cpumask_test_cpu(prev_cpu, cast_mask(pref)) &&
+		    bpf_cpumask_test_cpu(prev_cpu, idle_smt) &&
+		    bpf_cpumask_test_cpu(prev_cpu, p->cpus_ptr) &&
+		    scx_bpf_test_and_clear_cpu_idle(prev_cpu))
+			cpu = prev_cpu;
+
+		if (cpu < 0) {
+			bpf_for(i, 0, nr_cpu_ids) {
+				if (!bpf_cpumask_test_cpu(i, cast_mask(pref)) ||
+				    !bpf_cpumask_test_cpu(i, idle_smt) ||
+				    !bpf_cpumask_test_cpu(i, p->cpus_ptr))
+					continue;
+				if (scx_bpf_test_and_clear_cpu_idle(i)) {
+					cpu = i;
+					break;
+				}
+			}
+		}
+
+		/*
+		 * Pass 2: any idle CPU in the tier, previous CPU first.
+		 */
+		if (cpu < 0) {
+			if (bpf_cpumask_test_cpu(prev_cpu, cast_mask(pref)) &&
+			    bpf_cpumask_test_cpu(prev_cpu, p->cpus_ptr) &&
+			    scx_bpf_test_and_clear_cpu_idle(prev_cpu))
+				cpu = prev_cpu;
+
+			if (cpu < 0) {
+				bpf_for(i, 0, nr_cpu_ids) {
+					if (!bpf_cpumask_test_cpu(i, cast_mask(pref)) ||
+					    !bpf_cpumask_test_cpu(i, idle) ||
+					    !bpf_cpumask_test_cpu(i, p->cpus_ptr))
+						continue;
+					if (scx_bpf_test_and_clear_cpu_idle(i)) {
+						cpu = i;
+						break;
+					}
+				}
+			}
+		}
 	}
 	if (idle_smt)
 		scx_bpf_put_cpumask(idle_smt);
@@ -847,35 +854,6 @@ void BPF_STRUCT_OPS(baby_enqueue, struct task_struct *p, u64 enq_flags)
 }
 
 /*
- * Pull @dsq's head to the local DSQ and do the bookkeeping for that pull.
- * @lane is a literal: a fast-lane node pull (1) clears the node's tick
- * claim. Node clocks advance at most once per 1 ms, seat clocks on every
- * pull. Call outside RCU; the caller keeps the stats.
- */
-static __always_inline bool pull_node(u64 dsq, u32 lane, u32 nidx, u64 now)
-{
-	if (!scx_bpf_dsq_move_to_local(dsq, 0))
-		return false;
-	nidx &= BABY_NODE_CLOCK_NR - 1;
-	if (lane && node_preempt_claim[nidx])
-		node_preempt_claim[nidx] = 0;
-	if (now - node_service_at[lane & 1][nidx] > NSEC_PER_MSEC)
-		node_service_at[lane & 1][nidx] = now;
-	return true;
-}
-
-static __always_inline bool pull_seat(u64 dsq, u32 lane, u32 idx, u64 now)
-{
-	if (!scx_bpf_dsq_move_to_local(dsq, 0))
-		return false;
-	idx &= BABY_MAX_CPUS - 1;
-	seat_service_at[lane & 1][idx] = now;
-	if (seat_used[lane & 1][idx] && !scx_bpf_dsq_nr_queued(dsq))
-		seat_used[lane & 1][idx] = 0;
-	return true;
-}
-
-/*
  * Dispatch the earliest-deadline task to the CPU.
  *
  * The lanes arbitrate per dispatch: the fast lane is served whenever it
@@ -1104,7 +1082,12 @@ void BPF_STRUCT_OPS(baby_dispatch, s32 cpu, struct task_struct *prev)
 		if (fl_g_dl < fl_wq_dl) {
 			s32 from = fl_q ? scx_bpf_task_cpu(fl_q) : -1;
 
-			if (pull_node(fl_node_dsq, 1, nidx, now)) {
+			if (scx_bpf_dsq_move_to_local(fl_node_dsq, 0)) {
+				if (node_preempt_claim[nidx])
+					node_preempt_claim[nidx] = 0;
+				if (now - node_service_at[1][nidx] >
+				    NSEC_PER_MSEC)
+					node_service_at[1][nidx] = now;
 				if (has_bulk) {
 					STAT_INC(nr_depth1_pulls);
 				} else if (stats_enabled) {
@@ -1116,12 +1099,21 @@ void BPF_STRUCT_OPS(baby_dispatch, s32 cpu, struct task_struct *prev)
 				return;
 			}
 		}
-		if (pull_seat(fl_seat_dsq, 1, idx, now)) {
+		if (scx_bpf_dsq_move_to_local(fl_seat_dsq, 0)) {
+			seat_service_at[1][idx] = now;
+			if (seat_used[1][idx] &&
+			    !scx_bpf_dsq_nr_queued(fl_seat_dsq))
+				seat_used[1][idx] = 0;
 			if (has_bulk)
 				STAT_INC(nr_depth1_pulls_seat);
 			return;
 		}
-		if (pull_node(fl_node_dsq, 1, nidx, now)) {
+		if (scx_bpf_dsq_move_to_local(fl_node_dsq, 0)) {
+			if (node_preempt_claim[nidx])
+				node_preempt_claim[nidx] = 0;
+			if (now - node_service_at[1][nidx] >
+			    NSEC_PER_MSEC)
+				node_service_at[1][nidx] = now;
 			if (has_bulk)
 				STAT_INC(nr_depth1_pulls);
 			return;
@@ -1142,17 +1134,34 @@ void BPF_STRUCT_OPS(baby_dispatch, s32 cpu, struct task_struct *prev)
 		 */
 		s32 from = q ? scx_bpf_task_cpu(q) : -1;
 
-		if (node_bulk && pull_node(node, 0, nidx, now)) {
+		if (node_bulk && scx_bpf_dsq_move_to_local(node, 0)) {
+			if (now - node_service_at[0][nidx] >
+			    NSEC_PER_MSEC)
+				node_service_at[0][nidx] = now;
 			STAT_INC(nr_pull_land[cpu_dist(cpu, from)]);
 			return;
 		}
-		if (seat_bulk && pull_seat(bulk_seat_dsq, 0, idx, now))
+		if (seat_bulk && scx_bpf_dsq_move_to_local(bulk_seat_dsq, 0)) {
+			seat_service_at[0][idx] = now;
+			if (seat_used[0][idx] &&
+			    !scx_bpf_dsq_nr_queued(bulk_seat_dsq))
+				seat_used[0][idx] = 0;
 			return;
+		}
 	} else {
-		if (seat_bulk && pull_seat(bulk_seat_dsq, 0, idx, now))
+		if (seat_bulk && scx_bpf_dsq_move_to_local(bulk_seat_dsq, 0)) {
+			seat_service_at[0][idx] = now;
+			if (seat_used[0][idx] &&
+			    !scx_bpf_dsq_nr_queued(bulk_seat_dsq))
+				seat_used[0][idx] = 0;
 			return;
-		if (node_bulk && pull_node(node, 0, nidx, now))
+		}
+		if (node_bulk && scx_bpf_dsq_move_to_local(node, 0)) {
+			if (now - node_service_at[0][nidx] >
+			    NSEC_PER_MSEC)
+				node_service_at[0][nidx] = now;
 			return;
+		}
 	}
 
 	/*
@@ -1164,10 +1173,21 @@ void BPF_STRUCT_OPS(baby_dispatch, s32 cpu, struct task_struct *prev)
 	 * last accounting left it and bulk waits its turn afterwards.
 	 */
 	if (has_fl && !serve_fl) {
-		if (pull_seat(fl_seat_dsq, 1, idx, now))
+		if (scx_bpf_dsq_move_to_local(fl_seat_dsq, 0)) {
+			seat_service_at[1][idx] = now;
+			if (seat_used[1][idx] &&
+			    !scx_bpf_dsq_nr_queued(fl_seat_dsq))
+				seat_used[1][idx] = 0;
 			return;
-		if (pull_node(fl_node_dsq, 1, nidx, now))
+		}
+		if (scx_bpf_dsq_move_to_local(fl_node_dsq, 0)) {
+			if (node_preempt_claim[nidx])
+				node_preempt_claim[nidx] = 0;
+			if (now - node_service_at[1][nidx] >
+			    NSEC_PER_MSEC)
+				node_service_at[1][nidx] = now;
 			return;
+		}
 	}
 
 	if (need_running) {
@@ -1214,10 +1234,18 @@ void BPF_STRUCT_OPS(baby_dispatch, s32 cpu, struct task_struct *prev)
 		 * behind it costs a queue lookup, which is what the counts
 		 * save on every other dispatch.
 		 */
-		if (pull_node(fl_node_dsq, 1, nidx, now))
+		if (scx_bpf_dsq_move_to_local(fl_node_dsq, 0)) {
+			if (node_preempt_claim[nidx])
+				node_preempt_claim[nidx] = 0;
+			if (now - node_service_at[1][nidx] > NSEC_PER_MSEC)
+				node_service_at[1][nidx] = now;
 			return;
-		if (pull_node(node, 0, nidx, now))
+		}
+		if (scx_bpf_dsq_move_to_local(node, 0)) {
+			if (now - node_service_at[0][nidx] > NSEC_PER_MSEC)
+				node_service_at[0][nidx] = now;
 			return;
+		}
 		/*
 		 * The CPU is going idle: drop its performance level. The
 		 * write happens once, when the level changes; see the
@@ -1693,19 +1721,6 @@ static int rescue_timerfn(void *map, int *key, struct bpf_timer *timer)
 	return 0;
 }
 
-/*
- * Create one DSQ and report the first failure. @node is the NUMA node
- * the queue is bound to, or -1 for a per-CPU seat.
- */
-static __always_inline int create_dsq(u64 dsq, s32 node)
-{
-	int err = scx_bpf_create_dsq(dsq, node);
-
-	if (err)
-		scx_bpf_error("failed to create DSQ %llu: %d", dsq, err);
-	return err;
-}
-
 s32 BPF_STRUCT_OPS_SLEEPABLE(baby_init)
 {
 	struct bpf_timer *timer;
@@ -1738,23 +1753,34 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(baby_init)
 	 * both lanes.
 	 */
 	bpf_for(cpu, 0, nr_cpu_ids) {
-		err = create_dsq(cpu2dsq(cpu), -1);
-		if (err)
+		err = scx_bpf_create_dsq(cpu2dsq(cpu), -1);
+		if (err) {
+			scx_bpf_error("failed to create DSQ %llu: %d",
+				      cpu2dsq(cpu), err);
 			return err;
+		}
 
-		err = create_dsq(fl_cpu2dsq(cpu), -1);
-		if (err)
+		err = scx_bpf_create_dsq(fl_cpu2dsq(cpu), -1);
+		if (err) {
+			scx_bpf_error("failed to create DSQ %llu: %d",
+				      fl_cpu2dsq(cpu), err);
 			return err;
+		}
 	}
 
 	bpf_for(node, 0, nr_node_ids) {
-		err = create_dsq(node, node);
-		if (err)
+		err = scx_bpf_create_dsq(node, node);
+		if (err) {
+			scx_bpf_error("failed to create DSQ %d: %d", node, err);
 			return err;
+		}
 
-		err = create_dsq(fl_node2dsq(node), node);
-		if (err)
+		err = scx_bpf_create_dsq(fl_node2dsq(node), node);
+		if (err) {
+			scx_bpf_error("failed to create DSQ %llu: %d",
+				      fl_node2dsq(node), err);
 			return err;
+		}
 	}
 
 	timer = bpf_map_lookup_elem(&rescue_timer, &key);
