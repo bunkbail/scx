@@ -90,27 +90,21 @@ pub fn classify(
         && below_bar(*lo, *hi)
     {
         let max_cap = *hi;
-        let big: Vec<usize> = ids
+        let (big, rest): (Vec<_>, Vec<_>) = ids
             .iter()
-            .zip(&capacities)
-            .filter(|(_, cap)| matches!(**cap, Some(c) if in_top_band(c, max_cap)))
-            .map(|(id, _)| *id)
-            .collect();
-        let rest: Vec<usize> = ids.iter().filter(|id| !big.contains(id)).copied().collect();
+            .copied()
+            .zip(capacities.iter().copied())
+            .partition(|(_, cap)| matches!(*cap, Some(c) if in_top_band(c, max_cap)));
+        let big: Vec<usize> = big.into_iter().map(|(id, _)| id).collect();
+        let rest: Vec<usize> = rest.into_iter().map(|(id, _)| id).collect();
         let (little, lp) = split_lps(&rest, capacity, max_cap);
         return (CoreClasses { big, little, lp }, TierSource::Capacity);
     }
 
-    let big: Vec<usize> = ids
+    let (big, rest): (Vec<usize>, Vec<usize>) = ids
         .iter()
-        .filter(|id| is_big_core_type(**id) == Some(true))
         .copied()
-        .collect();
-    let rest: Vec<usize> = ids
-        .iter()
-        .filter(|id| is_big_core_type(**id) != Some(true))
-        .copied()
-        .collect();
+        .partition(|id| is_big_core_type(*id) == Some(true));
 
     let freqs: Vec<u32> = ids.iter().filter_map(|id| max_freq(*id)).collect();
     let max_freq_cap = freqs.iter().copied().max().unwrap_or(0);
