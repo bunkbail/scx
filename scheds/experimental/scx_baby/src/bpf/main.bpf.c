@@ -1693,6 +1693,19 @@ static int rescue_timerfn(void *map, int *key, struct bpf_timer *timer)
 	return 0;
 }
 
+/*
+ * Create one DSQ and report the first failure. @node is the NUMA node
+ * the queue is bound to, or -1 for a per-CPU seat.
+ */
+static __always_inline int create_dsq(u64 dsq, s32 node)
+{
+	int err = scx_bpf_create_dsq(dsq, node);
+
+	if (err)
+		scx_bpf_error("failed to create DSQ %llu: %d", dsq, err);
+	return err;
+}
+
 s32 BPF_STRUCT_OPS_SLEEPABLE(baby_init)
 {
 	struct bpf_timer *timer;
@@ -1725,34 +1738,23 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(baby_init)
 	 * both lanes.
 	 */
 	bpf_for(cpu, 0, nr_cpu_ids) {
-		err = scx_bpf_create_dsq(cpu2dsq(cpu), -1);
-		if (err) {
-			scx_bpf_error("failed to create DSQ %llu: %d",
-				      cpu2dsq(cpu), err);
+		err = create_dsq(cpu2dsq(cpu), -1);
+		if (err)
 			return err;
-		}
 
-		err = scx_bpf_create_dsq(fl_cpu2dsq(cpu), -1);
-		if (err) {
-			scx_bpf_error("failed to create DSQ %llu: %d",
-				      fl_cpu2dsq(cpu), err);
+		err = create_dsq(fl_cpu2dsq(cpu), -1);
+		if (err)
 			return err;
-		}
 	}
 
 	bpf_for(node, 0, nr_node_ids) {
-		err = scx_bpf_create_dsq(node, node);
-		if (err) {
-			scx_bpf_error("failed to create DSQ %d: %d", node, err);
+		err = create_dsq(node, node);
+		if (err)
 			return err;
-		}
 
-		err = scx_bpf_create_dsq(fl_node2dsq(node), node);
-		if (err) {
-			scx_bpf_error("failed to create DSQ %llu: %d",
-				      fl_node2dsq(node), err);
+		err = create_dsq(fl_node2dsq(node), node);
+		if (err)
 			return err;
-		}
 	}
 
 	timer = bpf_map_lookup_elem(&rescue_timer, &key);
