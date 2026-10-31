@@ -95,6 +95,27 @@ fn fmt_wait_row<W: Write>(
     Ok(())
 }
 
+/// Build a `sub()` from four field lists: saturating scalars, `vec_sub`
+/// vectors, copied scalars and cloned vectors. The struct literal makes
+/// the compiler enforce that every field appears exactly once.
+macro_rules! sub_fields {
+    (
+        scalar: $($scalar:ident),* ;
+        vec: $($vec:ident),* ;
+        copy: $($copy:ident),* ;
+        clone: $($clone:ident),* ;
+    ) => {
+        fn sub(&self, rhs: &Self) -> Self {
+            Self {
+                $( $scalar: self.$scalar.saturating_sub(rhs.$scalar), )*
+                $( $vec: vec_sub(&self.$vec, &rhs.$vec), )*
+                $( $copy: self.$copy, )*
+                $( $clone: self.$clone.clone(), )*
+            }
+        }
+    };
+}
+
 /// One placement-distance histogram: landings bucketed by the distance
 /// rank between the task's previous CPU and where it actually went
 /// (self, SMT sibling, same L2, same LLC, same node, beyond).
@@ -129,15 +150,11 @@ impl Ranks {
         }
     }
 
-    fn sub(&self, rhs: &Self) -> Self {
-        Ranks {
-            r_self: self.r_self.saturating_sub(rhs.r_self),
-            r_sib: self.r_sib.saturating_sub(rhs.r_sib),
-            r_l2: self.r_l2.saturating_sub(rhs.r_l2),
-            r_llc: self.r_llc.saturating_sub(rhs.r_llc),
-            r_node: self.r_node.saturating_sub(rhs.r_node),
-            r_far: self.r_far.saturating_sub(rhs.r_far),
-        }
+    sub_fields! {
+        scalar: r_self, r_sib, r_l2, r_llc, r_node, r_far;
+        vec: ;
+        copy: ;
+        clone: ;
     }
 
     fn total(&self) -> u64 {
@@ -191,13 +208,11 @@ impl WaitB {
         }
     }
 
-    fn sub(&self, rhs: &Self) -> Self {
-        WaitB {
-            b0: self.b0.saturating_sub(rhs.b0),
-            b1: self.b1.saturating_sub(rhs.b1),
-            b2: self.b2.saturating_sub(rhs.b2),
-            b3: self.b3.saturating_sub(rhs.b3),
-        }
+    sub_fields! {
+        scalar: b0, b1, b2, b3;
+        vec: ;
+        copy: ;
+        clone: ;
     }
 }
 
@@ -306,37 +321,15 @@ impl WaitCls {
         }
     }
 
-    fn sub(&self, rhs: &Self) -> Self {
-        WaitCls {
-            fg_b0: self.fg_b0.saturating_sub(rhs.fg_b0),
-            fg_b1: self.fg_b1.saturating_sub(rhs.fg_b1),
-            fg_b2: self.fg_b2.saturating_sub(rhs.fg_b2),
-            fg_b3: self.fg_b3.saturating_sub(rhs.fg_b3),
-            fg_ns_b0: self.fg_ns_b0.saturating_sub(rhs.fg_ns_b0),
-            fg_ns_b1: self.fg_ns_b1.saturating_sub(rhs.fg_ns_b1),
-            fg_ns_b2: self.fg_ns_b2.saturating_sub(rhs.fg_ns_b2),
-            fg_ns_b3: self.fg_ns_b3.saturating_sub(rhs.fg_ns_b3),
-            // The BPF maxima are reset after every snapshot, so the
-            // current snapshot's value is this interval's maximum.
-            fg_max_b0: self.fg_max_b0,
-            fg_max_b1: self.fg_max_b1,
-            fg_max_b2: self.fg_max_b2,
-            fg_max_b3: self.fg_max_b3,
-            fg_slow: vec_sub(&self.fg_slow, &rhs.fg_slow),
-            other_b0: self.other_b0.saturating_sub(rhs.other_b0),
-            other_b1: self.other_b1.saturating_sub(rhs.other_b1),
-            other_b2: self.other_b2.saturating_sub(rhs.other_b2),
-            other_b3: self.other_b3.saturating_sub(rhs.other_b3),
-            other_ns_b0: self.other_ns_b0.saturating_sub(rhs.other_ns_b0),
-            other_ns_b1: self.other_ns_b1.saturating_sub(rhs.other_ns_b1),
-            other_ns_b2: self.other_ns_b2.saturating_sub(rhs.other_ns_b2),
-            other_ns_b3: self.other_ns_b3.saturating_sub(rhs.other_ns_b3),
-            other_max_b0: self.other_max_b0,
-            other_max_b1: self.other_max_b1,
-            other_max_b2: self.other_max_b2,
-            other_max_b3: self.other_max_b3,
-            other_slow: vec_sub(&self.other_slow, &rhs.other_slow),
-        }
+    sub_fields! {
+        scalar: fg_b0, fg_b1, fg_b2, fg_b3,
+                fg_ns_b0, fg_ns_b1, fg_ns_b2, fg_ns_b3,
+                other_b0, other_b1, other_b2, other_b3,
+                other_ns_b0, other_ns_b1, other_ns_b2, other_ns_b3;
+        vec: fg_slow, other_slow;
+        copy: fg_max_b0, fg_max_b1, fg_max_b2, fg_max_b3,
+              other_max_b0, other_max_b1, other_max_b2, other_max_b3;
+        clone: ;
     }
 }
 
@@ -447,35 +440,15 @@ impl WaitType {
         }
     }
 
-    fn sub(&self, rhs: &Self) -> Self {
-        WaitType {
-            wk_b0: self.wk_b0.saturating_sub(rhs.wk_b0),
-            wk_b1: self.wk_b1.saturating_sub(rhs.wk_b1),
-            wk_b2: self.wk_b2.saturating_sub(rhs.wk_b2),
-            wk_b3: self.wk_b3.saturating_sub(rhs.wk_b3),
-            wk_ns_b0: self.wk_ns_b0.saturating_sub(rhs.wk_ns_b0),
-            wk_ns_b1: self.wk_ns_b1.saturating_sub(rhs.wk_ns_b1),
-            wk_ns_b2: self.wk_ns_b2.saturating_sub(rhs.wk_ns_b2),
-            wk_ns_b3: self.wk_ns_b3.saturating_sub(rhs.wk_ns_b3),
-            wk_max_b0: self.wk_max_b0,
-            wk_max_b1: self.wk_max_b1,
-            wk_max_b2: self.wk_max_b2,
-            wk_max_b3: self.wk_max_b3,
-            wk_slow: vec_sub(&self.wk_slow, &rhs.wk_slow),
-            rot_b0: self.rot_b0.saturating_sub(rhs.rot_b0),
-            rot_b1: self.rot_b1.saturating_sub(rhs.rot_b1),
-            rot_b2: self.rot_b2.saturating_sub(rhs.rot_b2),
-            rot_b3: self.rot_b3.saturating_sub(rhs.rot_b3),
-            rot_ns_b0: self.rot_ns_b0.saturating_sub(rhs.rot_ns_b0),
-            rot_ns_b1: self.rot_ns_b1.saturating_sub(rhs.rot_ns_b1),
-            rot_ns_b2: self.rot_ns_b2.saturating_sub(rhs.rot_ns_b2),
-            rot_ns_b3: self.rot_ns_b3.saturating_sub(rhs.rot_ns_b3),
-            rot_max_b0: self.rot_max_b0,
-            rot_max_b1: self.rot_max_b1,
-            rot_max_b2: self.rot_max_b2,
-            rot_max_b3: self.rot_max_b3,
-            rot_slow: vec_sub(&self.rot_slow, &rhs.rot_slow),
-        }
+    sub_fields! {
+        scalar: wk_b0, wk_b1, wk_b2, wk_b3,
+                wk_ns_b0, wk_ns_b1, wk_ns_b2, wk_ns_b3,
+                rot_b0, rot_b1, rot_b2, rot_b3,
+                rot_ns_b0, rot_ns_b1, rot_ns_b2, rot_ns_b3;
+        vec: wk_slow, rot_slow;
+        copy: wk_max_b0, wk_max_b1, wk_max_b2, wk_max_b3,
+              rot_max_b0, rot_max_b1, rot_max_b2, rot_max_b3;
+        clone: ;
     }
 }
 
@@ -529,17 +502,11 @@ impl WaitLCRI {
         }
     }
 
-    fn sub(&self, rhs: &Self) -> Self {
-        WaitLCRI {
-            lat_n: vec_sub(&self.lat_n, &rhs.lat_n),
-            lat_ns: vec_sub(&self.lat_ns, &rhs.lat_ns),
-            lat_max: self.lat_max.clone(),
-            lat_slow: vec_sub(&self.lat_slow, &rhs.lat_slow),
-            other_n: vec_sub(&self.other_n, &rhs.other_n),
-            other_ns: vec_sub(&self.other_ns, &rhs.other_ns),
-            other_max: self.other_max.clone(),
-            other_slow: vec_sub(&self.other_slow, &rhs.other_slow),
-        }
+    sub_fields! {
+        scalar: ;
+        vec: lat_n, lat_ns, lat_slow, other_n, other_ns, other_slow;
+        copy: ;
+        clone: lat_max, other_max;
     }
 }
 
@@ -580,13 +547,11 @@ impl WaitGateMiss {
         }
     }
 
-    fn sub(&self, rhs: &Self) -> Self {
-        WaitGateMiss {
-            n: vec_sub(&self.n, &rhs.n),
-            ns: vec_sub(&self.ns, &rhs.ns),
-            max: self.max.clone(),
-            slow: vec_sub(&self.slow, &rhs.slow),
-        }
+    sub_fields! {
+        scalar: ;
+        vec: n, ns, slow;
+        copy: ;
+        clone: max;
     }
 
     /// Per-depth row views into the flat depth-major arrays.
@@ -624,11 +589,11 @@ impl Census {
         }
     }
 
-    fn sub(&self, rhs: &Self) -> Self {
-        Census {
-            seat: vec_sub(&self.seat, &rhs.seat),
-            shared: vec_sub(&self.shared, &rhs.shared),
-        }
+    sub_fields! {
+        scalar: ;
+        vec: seat, shared;
+        copy: ;
+        clone: ;
     }
 
     fn format<W: Write>(&self, w: &mut W) -> Result<()> {
@@ -1262,6 +1227,8 @@ mod tests {
         prev.wait_max.b0 = u64::MAX;
         prev.nr_running = cur.nr_running + 3;
         prev.stats_enabled = cur.stats_enabled + 1;
+        prev.census.seat[0] = cur.census.seat[0] + 5;
+        prev.census.shared[7] = 0;
 
         let delta = cur.delta(&prev);
 
@@ -1277,5 +1244,7 @@ mod tests {
         assert_eq!(delta.wait_max.b0, cur.wait_max.b0);
         assert_eq!(delta.nr_running, cur.nr_running);
         assert_eq!(delta.stats_enabled, cur.stats_enabled);
+        assert_eq!(delta.census.seat[0], 0);
+        assert_eq!(delta.census.shared[7], cur.census.shared[7]);
     }
 }
