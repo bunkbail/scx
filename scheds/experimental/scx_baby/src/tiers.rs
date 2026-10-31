@@ -25,6 +25,27 @@ pub enum TierSource {
     NoSplit,
 }
 
+/// The split bar: the tiers separate when the weakest value falls more
+/// than 15 percent below the top. A value at exactly 85 percent of the
+/// top stays in the top band.
+const SPLIT_BAR: u64 = 85;
+
+/// True when @low falls below the split bar of @top.
+fn below_bar(low: u32, top: u32) -> bool {
+    u64::from(low) * 100 < u64::from(top) * SPLIT_BAR
+}
+
+/// True when @cap sits in the top band of @top.
+fn in_top_band(cap: u32, top: u32) -> bool {
+    !below_bar(cap, top)
+}
+
+/// True when @cap is a low-power island: below half of the little tier's
+/// top and below a third of the machine's top.
+fn is_lp(cap: u32, little_top: u32, max_cap: u32) -> bool {
+    u64::from(cap) * 2 < u64::from(little_top) && u64::from(cap) * 3 < u64::from(max_cap)
+}
+
 /// Classify the CPUs of a machine.
 ///
 /// The capacity branch needs the kernel's own per-CPU capacity
@@ -66,15 +87,13 @@ pub fn classify(
     let capacities: Vec<Option<u32>> = ids.iter().map(|id| capacity(*id)).collect();
     let caps: Vec<u32> = capacities.iter().flatten().copied().collect();
     if let (Some(lo), Some(hi)) = (caps.iter().min(), caps.iter().max())
-        && lo * 100 < hi * 85
+        && below_bar(*lo, *hi)
     {
         let max_cap = *hi;
         let big: Vec<usize> = ids
             .iter()
             .zip(&capacities)
-            .filter(|(_, cap)| {
-                matches!(**cap, Some(c) if u64::from(c) * 100 >= u64::from(max_cap) * 85)
-            })
+            .filter(|(_, cap)| matches!(**cap, Some(c) if in_top_band(c, max_cap)))
             .map(|(id, _)| *id)
             .collect();
         let rest: Vec<usize> = ids.iter().filter(|id| !big.contains(id)).copied().collect();
@@ -107,7 +126,7 @@ pub fn classify(
 
     let corroborated = matches!(
         (freqs.iter().min(), freqs.iter().max()),
-        (Some(lo), Some(hi)) if u64::from(*lo) * 100 < u64::from(*hi) * 85
+        (Some(lo), Some(hi)) if below_bar(*lo, *hi)
     );
     if !corroborated {
         // A core-type split the clocks do not show is a ranking
@@ -149,7 +168,7 @@ fn split_lps(
     let mut lp = Vec::new();
     for id in rest {
         match (cap(*id), little_cap) {
-            (Some(c), Some(top)) if c * 2 < top && c * 3 < max_cap => lp.push(*id),
+            (Some(c), Some(top)) if is_lp(c, top, max_cap) => lp.push(*id),
             _ => little.push(*id),
         }
     }
@@ -422,7 +441,7 @@ mod tests {
                 .expect("capacity split with no capacity");
             for cap in caps_of(&classes.big) {
                 assert!(
-                    cap.is_some_and(|c| u64::from(c) * 100 >= u64::from(max_cap) * 85),
+                    cap.is_some_and(|c| in_top_band(c, max_cap)),
                     "big cores sit in the top band"
                 );
             }
@@ -432,7 +451,7 @@ mod tests {
                 .max()
                 .expect("capacity split with an empty little set");
             for cap in caps_of(&classes.lp) {
-                assert!(cap.is_some_and(|c| c * 2 < little_cap && c * 3 < max_cap));
+                assert!(cap.is_some_and(|c| is_lp(c, little_cap, max_cap)));
             }
         }
     }
