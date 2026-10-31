@@ -1253,6 +1253,82 @@ void BPF_STRUCT_OPS(baby_cpu_release, s32 cpu,
 }
 
 /*
+ * The saturation preemption gate (see the top of the file). The
+ * victim's residency comes from its ops.running() stamp; the waiter is
+ * any non-empty fast lane: this CPU's seat, or the fast-lane node queue
+ * under the one-CPU-at-a-time stamp. The time budget takes no part: the
+ * tick fires between dispatches, and counting it would black the lane
+ * out with no dispatch to reset it. baby_dispatch() owns the budget.
+ */
+static __always_inline void tick_try_preempt(struct task_struct *p,
+					     struct task_ctx *tctx, u64 now)
+{
+	s32 cpu = scx_bpf_task_cpu(p);
+	u32 cidx = cpu_idx(cpu);
+	u64 ran_at = cpu_running_at[cidx];
+
+	if (now - ran_at < BABY_TICK_PREEMPT_PROTECT_NS)
+		return;
+
+	{
+		s32 node = __COMPAT_scx_bpf_cpu_node(cpu);
+		bool cri = false;
+		bool warm = false;
+
+		if (scx_bpf_dsq_nr_queued(fl_cpu2dsq(cpu))) {
+			cri = true;
+			warm = true;
+		} else {
+			/*
+			 * Only a head this CPU can pull justifies
+			 * cutting its resident: a pinned waiter would
+			 * otherwise have every CPU on the node preempt
+			 * for work none of them can serve.
+			 */
+			struct task_struct *head =
+				dsq_peek_allowed(fl_node2dsq(node), cpu);
+
+			if (head) {
+				u32 nidx = node_idx(node);
+				u32 pid = (u32)head->pid;
+				u64 now32 = (u32)now | 1;
+				u64 claim = ((u64)pid << 32) | now32;
+				u64 old = node_preempt_claim[nidx];
+
+				/*
+				 * Same waiter and inside the quiet
+				 * window: another CPU is already in
+				 * flight for it. A new head, or a stale
+				 * claim, may claim at once.
+				 */
+				if (old == 0 ||
+				    (u32)(old >> 32) != pid ||
+				    (u32)(now32 - (u32)old) >=
+					    BABY_TICK_PREEMPT_FALLBACK_NS) {
+					if (__sync_bool_compare_and_swap(
+						    &node_preempt_claim[nidx],
+						    old, claim))
+						cri = true;
+				}
+			}
+		}
+
+		if (cri) {
+			p->scx.slice = 0;
+			tctx->tick_preempted = true;
+			if (stats_enabled) {
+				if (warm)
+					__sync_fetch_and_add(
+						&nr_tick_preempts_warm, 1);
+				else
+					__sync_fetch_and_add(
+						&nr_tick_preempts, 1);
+			}
+		}
+	}
+}
+
+/*
  * Periodic tick: account bursts, advance the CPU performance ledger and
  * renew the deadline once reached. The only tick-driven preemption is
  * the saturation gate below; the rotation order stays the deadline
@@ -1290,80 +1366,8 @@ void BPF_STRUCT_OPS(baby_tick, struct task_struct *p)
 	if (reached_deadline(tctx, now))
 		tctx->deadline = calc_deadline(p, tctx, now);
 
-	/*
-	 * The saturation preemption gate (see the top of the file). The
-	 * victim's residency comes from its ops.running() stamp; the
-	 * waiter is any non-empty fast lane: this CPU's seat, or the
-	 * fast-lane node queue under the one-CPU-at-a-time stamp. The
-	 * time budget takes no part: the tick fires between dispatches,
-	 * and counting it would black the lane out with no dispatch to
-	 * reset it. baby_dispatch() owns the budget.
-	 */
-	if (!is_lat_cri(tctx)) {
-		s32 cpu = scx_bpf_task_cpu(p);
-		u32 idx = cpu_idx(cpu);
-		u64 ran_at = cpu_running_at[idx];
-
-		if (now - ran_at >= BABY_TICK_PREEMPT_PROTECT_NS) {
-			s32 node = __COMPAT_scx_bpf_cpu_node(cpu);
-			bool cri = false;
-			bool warm = false;
-
-			if (scx_bpf_dsq_nr_queued(fl_cpu2dsq(cpu))) {
-				cri = true;
-				warm = true;
-			} else {
-				/*
-				 * Only a head this CPU can pull justifies
-				 * cutting its resident: a pinned waiter
-				 * would otherwise have every CPU on the
-				 * node preempt for work none of them can
-				 * serve.
-				 */
-				struct task_struct *head =
-					dsq_peek_allowed(fl_node2dsq(node), cpu);
-
-				if (head) {
-					u32 idx = node_idx(node);
-					u32 pid = (u32)head->pid;
-					u64 now32 = (u32)now | 1;
-					u64 claim = ((u64)pid << 32) | now32;
-					u64 old = node_preempt_claim[idx];
-
-					/*
-					 * Same waiter and inside the
-					 * quiet window: another CPU is
-					 * already in flight for it.
-					 * A new head, or a stale claim,
-					 * may claim at once.
-					 */
-					if (old == 0 ||
-					    (u32)(old >> 32) != pid ||
-					    (u32)(now32 - (u32)old) >=
-						    BABY_TICK_PREEMPT_FALLBACK_NS) {
-						if (__sync_bool_compare_and_swap(
-							    &node_preempt_claim[idx],
-							    old, claim))
-							cri = true;
-					}
-				}
-			}
-
-			if (cri) {
-				p->scx.slice = 0;
-				tctx->tick_preempted = true;
-				if (stats_enabled) {
-					if (warm)
-						__sync_fetch_and_add(
-							&nr_tick_preempts_warm,
-							1);
-					else
-						__sync_fetch_and_add(
-							&nr_tick_preempts, 1);
-				}
-			}
-		}
-	}
+	if (!is_lat_cri(tctx))
+		tick_try_preempt(p, tctx, now);
 }
 
 /*
