@@ -134,6 +134,46 @@ fn max2(a: &[u64], r0: usize, r1: usize) -> [u64; WDEPTH] {
     std::array::from_fn(|b| a[r0 * WDEPTH + b].max(a[r1 * WDEPTH + b]))
 }
 
+/// One vector-width wait row: the wlcri rows and the wake-gate depth
+/// rows. The mean uses integer division, unlike the fixed-width rows.
+fn fmt_vec_wait<W: Write>(
+    w: &mut W,
+    tag: &str,
+    n: &[u64],
+    ns: &[u64],
+    max: &[u64],
+    slow: &[u64],
+) -> Result<()> {
+    let mean: Vec<String> = ns
+        .iter()
+        .zip(n)
+        .map(|(ns, n)| {
+            if *n > 0 {
+                (ns / n / 1000).to_string()
+            } else {
+                "-".to_string()
+            }
+        })
+        .collect();
+    let maxs: Vec<String> = max
+        .iter()
+        .zip(n)
+        .map(|(m, n)| {
+            if *n > 0 {
+                m.to_string()
+            } else {
+                "-".to_string()
+            }
+        })
+        .collect();
+    writeln!(
+        w,
+        "  {} n[{:?}] mean_us[{:?}] max_ns[{:?}] slow5ms[{:?}]",
+        tag, n, mean, maxs, slow
+    )?;
+    Ok(())
+}
+
 /// One placement-distance histogram: landings bucketed by the distance
 /// rank between the task's previous CPU and where it actually went
 /// (self, SMT sibling, same L2, same LLC, same node, beyond).
@@ -856,63 +896,31 @@ impl Metrics {
             Some((self.nr_arr_rot_seat, self.nr_arr_rot_shared)),
         )?;
         let wl = &self.wait_lcri;
-        let vmean = |ns: &[u64], n: &[u64]| -> Vec<String> {
-            ns.iter()
-                .zip(n.iter())
-                .map(|(ns, n)| {
-                    if *n > 0 {
-                        (ns / n / 1000).to_string()
-                    } else {
-                        "-".to_string()
-                    }
-                })
-                .collect()
-        };
-        let vmaxs = |m: &[u64], n: &[u64]| -> Vec<String> {
-            m.iter()
-                .zip(n.iter())
-                .map(|(m, n)| {
-                    if *n > 0 {
-                        m.to_string()
-                    } else {
-                        "-".to_string()
-                    }
-                })
-                .collect()
-        };
-        writeln!(
+        fmt_vec_wait(
             w,
-            "  wlcri lat n[{:?}] mean_us[{:?}] max_ns[{:?}] slow5ms[{:?}]",
-            wl.lat_n,
-            vmean(&wl.lat_ns, &wl.lat_n),
-            vmaxs(&wl.lat_max, &wl.lat_n),
-            wl.lat_slow,
+            "wlcri lat",
+            &wl.lat_n,
+            &wl.lat_ns,
+            &wl.lat_max,
+            &wl.lat_slow,
         )?;
-        writeln!(
+        fmt_vec_wait(
             w,
-            "  wlcri other n[{:?}] mean_us[{:?}] max_ns[{:?}] slow5ms[{:?}]",
-            wl.other_n,
-            vmean(&wl.other_ns, &wl.other_n),
-            vmaxs(&wl.other_max, &wl.other_n),
-            wl.other_slow,
+            "wlcri other",
+            &wl.other_n,
+            &wl.other_ns,
+            &wl.other_max,
+            &wl.other_slow,
         )?;
         let wg = &self.wait_wg;
         for (depth, tag) in [
-            (0usize, "d0"),
-            (1usize, "d1"),
-            (2usize, "d2"),
-            (3usize, "d3"),
+            (0usize, "wg d0"),
+            (1usize, "wg d1"),
+            (2usize, "wg d2"),
+            (3usize, "wg d3"),
         ] {
             let (n, ns, max, slow) = wg.row(depth);
-            writeln!(
-                w,
-                "  wg {} n[{:?}] mean_us[{:?}] max_ns[{:?}] slow5ms[{:?}]",
-                tag,
-                n,
-                vmean(ns, n),
-                vmaxs(max, n),
-                slow,
-            )?;
+            fmt_vec_wait(w, tag, n, ns, max, slow)?;
         }
         write!(w, "  census: ")?;
         self.census.format(w)?;
