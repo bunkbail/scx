@@ -152,11 +152,7 @@ __hidden bool balance_try_warm_seat(struct task_struct *p, struct task_ctx *tctx
 			if (best != target && best_nr + 2 <= eff_nr) {
 				target = best;
 				target_nr = best_nr;
-				if (stats_enabled)
-					__sync_fetch_and_add(
-						&nr_seat_move[cpu_dist(
-							prev_cpu, target)],
-						1);
+				STAT_INC(nr_seat_move[cpu_dist(prev_cpu, target)]);
 			} else if (stats_enabled) {
 				__sync_fetch_and_add(&nr_seat_self, 1);
 			}
@@ -254,8 +250,7 @@ __hidden bool balance_try_warm_seat(struct task_struct *p, struct task_ctx *tctx
 		 * before joining the shared queue, which keeps the load
 		 * distribution flowing at saturation.
 		 */
-		if (stats_enabled)
-			__sync_fetch_and_add(&nr_coldspreads, 1);
+		STAT_INC(nr_coldspreads);
 	}
 
 	return false;

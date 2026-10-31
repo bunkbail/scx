@@ -125,6 +125,15 @@ extern const volatile bool stats_enabled;
 } while(0)
 
 /*
+ * Bump one diagnostic counter when the instrument is on. The counter
+ * expression is evaluated once, inside the guard.
+ */
+#define STAT_INC(counter) do {				\
+	if (stats_enabled)				\
+		__sync_fetch_and_add(&(counter), 1);	\
+} while (0)
+
+/*
  * Cache-topology distance rank, as published by userspace from the sysfs
  * cache hierarchy. The rank of a pair is the deepest cache level the two
  * CPUs share: same lane < SMT sibling < same L2 < same LLC < same node <

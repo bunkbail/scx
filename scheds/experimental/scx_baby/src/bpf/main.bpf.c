@@ -458,15 +458,10 @@ s32 BPF_STRUCT_OPS(baby_select_cpu, struct task_struct *p,
 		if (cpu < 0 && !big_pin && is_heavy_proven(tctx))
 			cpu = pick_idle_pref(p, prev_cpu, big_cpumask);
 		if (cpu >= 0) {
-			if (stats_enabled)
-				__sync_fetch_and_add(
-					&nr_wake_land[cpu_dist(prev_cpu,
-								       cpu)],
-					1);
+			STAT_INC(nr_wake_land[cpu_dist(prev_cpu, cpu)]);
 			scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL,
 					   task_slice(tctx), 0);
-			if (stats_enabled)
-				__sync_fetch_and_add(&nr_direct_dispatches, 1);
+			STAT_INC(nr_direct_dispatches);
 			return cpu;
 		}
 	}
@@ -510,9 +505,7 @@ s32 BPF_STRUCT_OPS(baby_select_cpu, struct task_struct *p,
 			if (scx_bpf_test_and_clear_cpu_idle(prev_cpu)) {
 				scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL,
 						   task_slice(tctx), 0);
-				if (stats_enabled)
-					__sync_fetch_and_add(
-						&nr_direct_dispatches, 1);
+				STAT_INC(nr_direct_dispatches);
 				return prev_cpu;
 			}
 
@@ -552,10 +545,7 @@ s32 BPF_STRUCT_OPS(baby_select_cpu, struct task_struct *p,
 								   prev_cpu,
 								   task_slice(tctx),
 								   SCX_ENQ_PREEMPT);
-						if (stats_enabled)
-							__sync_fetch_and_add(
-								&nr_wake_preempts,
-								1);
+						STAT_INC(nr_wake_preempts);
 						return prev_cpu;
 					}
 				}
@@ -565,13 +555,10 @@ s32 BPF_STRUCT_OPS(baby_select_cpu, struct task_struct *p,
 
 	cpu = pick_idle_cpu(p, prev_cpu, wake_flags, &is_idle);
 	if (is_idle) {
-		if (stats_enabled)
-			__sync_fetch_and_add(
-				&nr_wake_land[cpu_dist(prev_cpu, cpu)], 1);
+		STAT_INC(nr_wake_land[cpu_dist(prev_cpu, cpu)]);
 		scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL,
 				   tctx ? task_slice(tctx) : deadline_ns, 0);
-		if (stats_enabled)
-			__sync_fetch_and_add(&nr_direct_dispatches, 1);
+		STAT_INC(nr_direct_dispatches);
 	} else if (wake_flags & (SCX_WAKE_TTWU | SCX_WAKE_FORK)) {
 		/*
 		 * No idle CPU: the depth-0 wake-path preempt, the
@@ -801,8 +788,7 @@ void BPF_STRUCT_OPS(baby_enqueue, struct task_struct *p, u64 enq_flags)
 						   SCX_DSQ_LOCAL_ON | prev_cpu,
 						   task_slice(tctx),
 						   enq_flags | SCX_ENQ_PREEMPT);
-				if (stats_enabled)
-					__sync_fetch_and_add(&nr_preemptions, 1);
+				STAT_INC(nr_preemptions);
 				return;
 			}
 		}
@@ -1028,9 +1014,7 @@ void BPF_STRUCT_OPS(baby_dispatch, s32 cpu, struct task_struct *prev)
 		if (hctx && hctx->last_cpu == cpu && !is_pcpu_task(head)) {
 			fl_allowed = true;
 			serve_fl = true;
-			if (stats_enabled)
-				__sync_fetch_and_add(&nr_home_takebacks, 1);
-		}
+			STAT_INC(nr_home_takebacks);		}
 	}
 
 	/*
@@ -1039,8 +1023,7 @@ void BPF_STRUCT_OPS(baby_dispatch, s32 cpu, struct task_struct *prev)
 	 * gate claims a head without consulting this CPU's budget.
 	 */
 	if (tctx && tctx->tick_preempted && has_fl && !serve_fl) {
-		if (stats_enabled)
-			__sync_fetch_and_add(&nr_tick_cut_refused, 1);
+		STAT_INC(nr_tick_cut_refused);
 	}
 
 	if (need_running && tctx && !tctx->yield_pending) {
@@ -1105,8 +1088,7 @@ void BPF_STRUCT_OPS(baby_dispatch, s32 cpu, struct task_struct *prev)
 								  has_bulk);
 					scx_bpf_task_set_slice(prev, grant);
 				}
-				if (stats_enabled)
-					__sync_fetch_and_add(&nr_sticky, 1);
+				STAT_INC(nr_sticky);
 				return;
 			}
 		}
@@ -1124,9 +1106,7 @@ void BPF_STRUCT_OPS(baby_dispatch, s32 cpu, struct task_struct *prev)
 
 			if (pull_node(fl_node_dsq, 1, nidx, now)) {
 				if (has_bulk) {
-					if (stats_enabled)
-						__sync_fetch_and_add(
-							&nr_depth1_pulls, 1);
+					STAT_INC(nr_depth1_pulls);
 				} else if (stats_enabled) {
 					__sync_fetch_and_add(
 						&nr_pull_land[cpu_dist(cpu,
@@ -1137,19 +1117,13 @@ void BPF_STRUCT_OPS(baby_dispatch, s32 cpu, struct task_struct *prev)
 			}
 		}
 		if (pull_seat(fl_seat_dsq, 1, idx, now)) {
-			if (has_bulk) {
-				if (stats_enabled)
-					__sync_fetch_and_add(
-						&nr_depth1_pulls_seat, 1);
-			}
+			if (has_bulk)
+				STAT_INC(nr_depth1_pulls_seat);
 			return;
 		}
 		if (pull_node(fl_node_dsq, 1, nidx, now)) {
-			if (has_bulk) {
-				if (stats_enabled)
-					__sync_fetch_and_add(
-						&nr_depth1_pulls, 1);
-			}
+			if (has_bulk)
+				STAT_INC(nr_depth1_pulls);
 			return;
 		}
 	}
@@ -1169,9 +1143,7 @@ void BPF_STRUCT_OPS(baby_dispatch, s32 cpu, struct task_struct *prev)
 		s32 from = q ? scx_bpf_task_cpu(q) : -1;
 
 		if (node_bulk && pull_node(node, 0, nidx, now)) {
-			if (stats_enabled)
-				__sync_fetch_and_add(
-					&nr_pull_land[cpu_dist(cpu, from)], 1);
+			STAT_INC(nr_pull_land[cpu_dist(cpu, from)]);
 			return;
 		}
 		if (seat_bulk && pull_seat(bulk_seat_dsq, 0, idx, now))
