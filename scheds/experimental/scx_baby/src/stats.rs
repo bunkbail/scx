@@ -1015,6 +1015,7 @@ mod tests {
             stats_enabled: 1,
             nr_direct_dispatches: 11,
             nr_preemptions: 17,
+            nr_preempt_refused_lat: 0,
             nr_boosts: 59,
             nr_sticky: 61,
             nr_coldspreads: 71,
@@ -1174,7 +1175,7 @@ mod tests {
     /// The recorded output of `sample_metrics()`. The trailing spaces on
     /// the summary line are part of the format and are spelled out.
     const GOLDEN: &str = concat!(
-        "[scx_baby] tasks -> r:  7 | dispatch -> d: 11    s: 79    | preempt: 17    tick: 19  +23   tkref: 29   | d1pull: 31  +37   | bkstop: 41   | wkpre: 43    | lease: 47  /53   | boost: 59   | sticky: 61    | warm: 73    | cold: 71\x20\x20\x20\n",
+        "[scx_baby] tasks -> r:  7 | dispatch -> d: 11    s: 79    | preempt: 17    latref: 0     tick: 19  +23   tkref: 29   | d1pull: 31  +37   | bkstop: 41   | wkpre: 43    | lease: 47  /53   | boost: 59   | sticky: 61    | warm: 73    | cold: 71\x20\x20\x20\n",
         "  class[[1, 2, 3, 4]] lane[bulk 5 fast 6]\n",
         "  land: self 4.8% sib 9.5% l2 14.3% llc 19.0% node 23.8% far 28.6% | wake: self 7.4% sib 11.1% l2 14.8% llc 18.5% node 22.2% far 25.9%\n",
         "  seatmove: self 9.1% sib 12.1% l2 15.2% llc 18.2% node 21.2% far 24.2% | pull: self 10.3% sib 12.8% l2 15.4% llc 17.9% node 20.5% far 23.1%\n",
