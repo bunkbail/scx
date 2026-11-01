@@ -645,6 +645,8 @@ pub struct Metrics {
     pub nr_direct_dispatches: u64,
     #[stat(desc = "Wake-path preemptions admitted by ops.enqueue()")]
     pub nr_preemptions: u64,
+    #[stat(desc = "Wake-path preemptions refused because the victim is latency critical")]
+    pub nr_preempt_refused_lat: u64,
     #[stat(desc = "Number of interactive priority boosts granted")]
     pub nr_boosts: u64,
     #[stat(desc = "Number of slice-end continuations of the deadline winner")]
@@ -725,12 +727,13 @@ impl Metrics {
         }
         writeln!(
             w,
-            "[{}] tasks -> r: {:>2} | dispatch -> d: {:<5} s: {:<5} | preempt: {:<5} tick: {:<4}+{:<4} tkref: {:<4} | d1pull: {:<4}+{:<4} | bkstop: {:<4} | wkpre: {:<5} | lease: {:<4}/{:<4} | boost: {:<4} | sticky: {:<5} | warm: {:<5} | cold: {:<5}",
+            "[{}] tasks -> r: {:>2} | dispatch -> d: {:<5} s: {:<5} | preempt: {:<5} latref: {:<5} tick: {:<4}+{:<4} tkref: {:<4} | d1pull: {:<4}+{:<4} | bkstop: {:<4} | wkpre: {:<5} | lease: {:<4}/{:<4} | boost: {:<4} | sticky: {:<5} | warm: {:<5} | cold: {:<5}",
             crate::SCHEDULER_NAME,
             self.nr_running,
             self.nr_direct_dispatches,
             self.nr_arr_shared,
             self.nr_preemptions,
+            self.nr_preempt_refused_lat,
             self.nr_tick_preempts,
             self.nr_tick_preempts_warm,
             self.nr_tick_cut_refused,
@@ -961,6 +964,9 @@ impl Metrics {
                 .nr_direct_dispatches
                 .saturating_sub(rhs.nr_direct_dispatches),
             nr_preemptions: self.nr_preemptions.saturating_sub(rhs.nr_preemptions),
+            nr_preempt_refused_lat: self
+                .nr_preempt_refused_lat
+                .saturating_sub(rhs.nr_preempt_refused_lat),
             nr_boosts: self.nr_boosts.saturating_sub(rhs.nr_boosts),
             nr_sticky: self.nr_sticky.saturating_sub(rhs.nr_sticky),
             nr_coldspreads: self.nr_coldspreads.saturating_sub(rhs.nr_coldspreads),

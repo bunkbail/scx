@@ -773,21 +773,34 @@ void BPF_STRUCT_OPS(baby_enqueue, struct task_struct *p, u64 enq_flags)
 	}
 
 	/*
+	 * Grab a confirmed idle CPU before considering a preemption. A
+	 * wakee that can run now on a CPU that went idle since
+	 * ops.select_cpu() has no reason to evict a running task, and an
+	 * idle CPU is what the fan-out would have to beat anyway. A
+	 * reenqueued task rescans here for the same reason. The scan runs
+	 * before the warm seat so a requeue or rescue never parks on a
+	 * busy seat while a lane sits idle.
+	 */
+	if (try_direct_dispatch(p, tctx, prev_cpu, enq_flags, is_running))
+		return;
+
+	/*
 	 * check_preempt_wakeup(): preempt the previous CPU's task when the
 	 * waker has an earlier deadline and no lower priority, provided
-	 * the CPU has no warm backlog and the running task passes
-	 * can_resched(). A preemption into a deep queue would only trade
-	 * places with work that runs anyway, and a burst hog must not be
-	 * preempted. Only interactive and foreground wakers are eligible:
-	 * a task that never wakes has no latency to protect. The victim
-	 * warm-seats behind its successor, so this is a same-CPU
-	 * alternation.
+	 * the CPU has no warm backlog and the running task can be cut. A
+	 * preemption into a deep queue would only trade places with work
+	 * that runs anyway, and a burst hog must not be preempted. Only
+	 * interactive and foreground wakers are eligible: a task that
+	 * never wakes has no latency to protect.
 	 *
-	 * The guards mirror ops.select_cpu()'s wake gate: the wakee must
-	 * be allowed on the target, no in-flight wakee may hold the local
-	 * DSQ (the insert would queue behind it), and the deadline order
-	 * arbitrates between two latency-critical tasks as it does between
-	 * bulk ones.
+	 * The victim rules mirror ops.select_cpu()'s wake gate: a
+	 * latency-critical resident keeps its CPU (two pipeline stages
+	 * must not take turns on one), a victim pinned to a single CPU
+	 * has nowhere else to go, and a resident still inside the
+	 * residency floor has not had a turn worth taking. The wakee must
+	 * be allowed on the target, and no in-flight wakee may hold the
+	 * local DSQ (the insert would queue behind it). The deadline
+	 * order arbitrates between two bulk tasks as before.
 	 */
 	if ((enq_flags & SCX_ENQ_WAKEUP) &&
 	    bpf_cpumask_test_cpu(prev_cpu, p->cpus_ptr) &&
@@ -795,15 +808,23 @@ void BPF_STRUCT_OPS(baby_enqueue, struct task_struct *p, u64 enq_flags)
 	    !scx_bpf_dsq_nr_queued(cpu2dsq(prev_cpu)) &&
 	    !scx_bpf_dsq_nr_queued(SCX_DSQ_LOCAL_ON | prev_cpu) &&
 	    (is_interactive(tctx) || is_foreground(tctx))) {
+		u32 pidx = (u32)prev_cpu & (BABY_MAX_CPUS - 1);
+		u64 ran_at = cpu_running_at[pidx];
 		struct task_struct *curr = __COMPAT_scx_bpf_cpu_curr(prev_cpu);
 
 		if (curr && curr != p && !(curr->flags & PF_IDLE)) {
 			struct task_ctx *cctx = try_lookup_task_ctx(curr);
 
-			if (cctx &&
-			    (s64)(tctx->deadline - cctx->deadline) < 0 &&
-			    p->static_prio <= curr->static_prio &&
-			    can_resched(cctx)) {
+			if (cctx && is_lat_cri(cctx)) {
+				if (stats_enabled)
+					__sync_fetch_and_add(
+						&nr_preempt_refused_lat, 1);
+			} else if (cctx && !is_pcpu_task(curr) && ran_at &&
+				   (s64)(now - ran_at) >=
+					   (s64)BABY_TICK_PREEMPT_PROTECT_NS &&
+				   (s64)(tctx->deadline - cctx->deadline) < 0 &&
+				   p->static_prio <= curr->static_prio &&
+				   can_resched(cctx)) {
 				scx_bpf_dsq_insert(p,
 						   SCX_DSQ_LOCAL_ON | prev_cpu,
 						   task_slice(tctx),
@@ -814,16 +835,6 @@ void BPF_STRUCT_OPS(baby_enqueue, struct task_struct *p, u64 enq_flags)
 			}
 		}
 	}
-
-	/*
-	 * Grab a confirmed idle CPU if the machine still has one: a task
-	 * that stopped on a loaded core spreads to a core that went idle
-	 * since, and a reenqueued task rescans after an RT lease. This
-	 * runs before the warm seat so a requeue or rescue never parks on
-	 * a busy seat while a lane sits idle.
-	 */
-	if (try_direct_dispatch(p, tctx, prev_cpu, enq_flags, is_running))
-		return;
 
 	/*
 	 * Warm seat, gated on oversubscription (see balance.bpf.c).

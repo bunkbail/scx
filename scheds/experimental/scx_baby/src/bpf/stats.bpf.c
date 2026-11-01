@@ -30,6 +30,13 @@ __attribute__((aligned(64))) volatile u64 nr_direct_dispatches;
 volatile u64 nr_preemptions, nr_boosts, nr_sticky, nr_coldspreads;
 
 /*
+ * Enqueue wake preemptions refused because the victim is latency
+ * critical. A live count proves the victim guard is doing work; a fired
+ * preemption must never be counted against a latency-critical task.
+ */
+volatile u64 nr_preempt_refused_lat;
+
+/*
  * Class census at run start: the class composition and the lane of
  * every dispatched task. "Measured, not declared" classification needs
  * to be countable, or a latched class is invisible.

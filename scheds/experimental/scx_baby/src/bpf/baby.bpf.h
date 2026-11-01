@@ -205,6 +205,7 @@ extern u64 node_pending[2][BABY_NODE_CLOCK_NR];
 extern volatile u64 nr_running __attribute__((aligned(64)));
 extern volatile u64 nr_direct_dispatches;
 extern volatile u64 nr_preemptions, nr_boosts, nr_sticky;
+extern volatile u64 nr_preempt_refused_lat;
 extern volatile u64 nr_coldspreads;
 
 /*

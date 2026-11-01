@@ -493,6 +493,7 @@ impl<'a> Scheduler<'a> {
             stats_enabled: self.skel.maps.rodata_data.as_ref().unwrap().stats_enabled as u64,
             nr_direct_dispatches: bss_data.nr_direct_dispatches,
             nr_preemptions: bss_data.nr_preemptions,
+            nr_preempt_refused_lat: bss_data.nr_preempt_refused_lat,
             nr_boosts: bss_data.nr_boosts,
             nr_sticky: bss_data.nr_sticky,
             nr_coldspreads: bss_data.nr_coldspreads,
