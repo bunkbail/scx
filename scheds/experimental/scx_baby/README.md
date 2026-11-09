@@ -41,7 +41,7 @@ a latency-critical wake out of a foreground resident's warm seat: the
 arrival joins the shared fast-lane queue, where the earliest deadline
 wins, instead of waiting out the resident's fourfold slice. It trades
 throughput under saturation for lower frame latency. Both profiles share
-one binary and one BPF program; the profile is a rodata flag.
+one binary and one BPF program. The profile is a rodata flag.
 
 ## Design
 
@@ -337,7 +337,8 @@ policy.
   latency-critical wake out of a foreground resident's warm seat and sends
   it to the shared fast-lane queue, trading throughput under saturation for
   lower frame latency.
-- `--game`: shorthand for `--profile gaming`.
+- `--game`: shorthand for `--profile gaming`, mutually exclusive with an
+  explicit `--profile`.
 - `--stats <SECS>`: enable the stats report and run normally.
 - `--monitor <SECS>`: run in stats monitoring mode without launching the
   scheduler.

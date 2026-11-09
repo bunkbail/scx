@@ -218,8 +218,8 @@ struct Opts {
     )]
     profile: String,
 
-    /// Shorthand for --profile gaming.
-    #[clap(long, action = clap::ArgAction::SetTrue)]
+    /// Shorthand for `--profile gaming`.
+    #[clap(long, action = clap::ArgAction::SetTrue, conflicts_with = "profile")]
     game: bool,
 
     /// Enable stats monitoring with the specified interval.
