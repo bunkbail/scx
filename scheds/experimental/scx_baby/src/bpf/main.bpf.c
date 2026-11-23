@@ -1475,12 +1475,28 @@ s32 BPF_STRUCT_OPS(baby_select_cpu, struct task_struct *p,
 		if (prev_cpu < 0 ||
 		    (u32)prev_cpu >= nr_cpu_ids ||
 		    !bpf_cpumask_test_cpu(prev_cpu, p->cpus_ptr) ||
-		    is_cpu_shielded(prev_cpu, now))
-			return pin_next_unshielded(p, prev_cpu, now);
+		    is_cpu_shielded(prev_cpu, now)) {
+			cpu = pin_next_unshielded(p, prev_cpu, now);
+			/*
+			 * ops.select_cpu() has to name a valid CPU: the
+			 * kernel rejects anything else and aborts the
+			 * scheduler. prev_cpu always is one, and a task
+			 * wholly inside the shield reaches ops.enqueue(),
+			 * where the stranded park serves it.
+			 */
+			return cpu >= 0 ? cpu : prev_cpu;
+		}
 
 		cpu = prev_cpu;
 	} else {
 		cpu = pick_idle_cpu(p, prev_cpu, wake_flags, &is_idle);
+		/*
+		 * A shield published by another CPU after the gate above
+		 * can make the selector decline. Stay on prev_cpu for the
+		 * same reason: a negative return aborts the scheduler.
+		 */
+		if (cpu < 0)
+			return prev_cpu;
 	}
 	if (is_idle) {
 		if (stats_enabled)
@@ -2926,14 +2942,44 @@ static __noinline bool pin_release_stale(u64 now)
 	return released;
 }
 
+/*
+ * Whether either slot has an owner. The rescue timer uses it to decide
+ * whether a rebuild is worth its cost: the count alone cannot answer
+ * this, because a lost rebuild is exactly the case where the record says
+ * zero while a slot is live.
+ */
+static __noinline bool pin_slot_live(void)
+{
+	struct pin_slot *slot;
+	u32 key = 0;
+
+	slot = bpf_map_lookup_elem(&pin_slots, &key);
+	if (slot && READ_ONCE(slot->pid))
+		return true;
+
+	key = 1;
+	slot = bpf_map_lookup_elem(&pin_slots, &key);
+	return slot && READ_ONCE(slot->pid);
+}
+
 static int rescue_timerfn(void *map, int *key, struct bpf_timer *timer)
 {
 	u64 now = bpf_ktime_get_ns();
 	s32 node, cpu;
 	int err;
 
-	if (game_pin)
+	if (game_pin) {
 		pin_release_stale(now);
+		/*
+		 * Self-heal a lost rebuild: two racing claims can publish
+		 * their snapshots out of order, which leaves the shield
+		 * record behind the slots until the next slot change. One
+		 * rebuild per rescue tick bounds that window, and it is
+		 * also what puts the record back after a stale release.
+		 */
+		if (pin_slot_live() || READ_ONCE(pin_shield_n))
+			pin_mask_rebuild();
+	}
 
 	if ((!plain || game_pin) && __COMPAT_has_generic_reenq()) {
 		bpf_for(cpu, 0, nr_cpu_ids) {
