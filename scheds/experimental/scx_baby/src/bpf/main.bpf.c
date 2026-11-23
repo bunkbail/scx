@@ -545,36 +545,37 @@ __hidden s32 select_cpu_no_lp(struct task_struct *p, s32 prev_cpu,
  * that re-admits a released home. Without tiers non_lp_cpumask is
  * empty and every CPU stays eligible, which is what the plain
  * selector would use.
+ *
+ * The new record is built in a local array and published at the end,
+ * so the shield never reads as absent for the length of the rebuild.
  */
 static __noinline void pin_mask_rebuild(void)
 {
 	struct bpf_cpumask *mask;
 	const struct cpumask *non_lp;
 	struct pin_slot *slot;
+	u8 next_shield[BABY_MAX_CPUS];
 	bool use_non_lp;
-	u32 key = 0, i;
-	s32 cpu;
+	u32 key = 0, i, next_n = 0;
 
 	bpf_rcu_read_lock();
 	mask = pin_worker_cpumask;
 	non_lp = cast_mask(non_lp_cpumask);
 	use_non_lp = non_lp && !bpf_cpumask_empty(non_lp);
 
-	for (i = 0; i < BABY_MAX_CPUS; i++)
-		pin_shield_cpu[i] = 0;
-	pin_shield_n = 0;
+	__builtin_memset(next_shield, 0, sizeof(next_shield));
 
 	slot = bpf_map_lookup_elem(&pin_slots, &key);
 	if (slot && slot->pid) {
 		if (slot->home_cpu >= 0 && (u32)slot->home_cpu < nr_cpu_ids) {
-			pin_shield_cpu[(u32)slot->home_cpu &
-				       (BABY_MAX_CPUS - 1)] = 1;
-			pin_shield_n++;
+			next_shield[(u32)slot->home_cpu &
+				    (BABY_MAX_CPUS - 1)] = 1;
+			next_n++;
 		}
 		if (slot->sib_cpu >= 0 && (u32)slot->sib_cpu < nr_cpu_ids) {
-			pin_shield_cpu[(u32)slot->sib_cpu &
-				       (BABY_MAX_CPUS - 1)] = 1;
-			pin_shield_n++;
+			next_shield[(u32)slot->sib_cpu &
+				    (BABY_MAX_CPUS - 1)] = 1;
+			next_n++;
 		}
 	}
 
@@ -582,26 +583,38 @@ static __noinline void pin_mask_rebuild(void)
 	slot = bpf_map_lookup_elem(&pin_slots, &key);
 	if (slot && slot->pid) {
 		if (slot->home_cpu >= 0 && (u32)slot->home_cpu < nr_cpu_ids) {
-			pin_shield_cpu[(u32)slot->home_cpu &
-				       (BABY_MAX_CPUS - 1)] = 1;
-			pin_shield_n++;
+			next_shield[(u32)slot->home_cpu &
+				    (BABY_MAX_CPUS - 1)] = 1;
+			next_n++;
 		}
 		if (slot->sib_cpu >= 0 && (u32)slot->sib_cpu < nr_cpu_ids) {
-			pin_shield_cpu[(u32)slot->sib_cpu &
-				       (BABY_MAX_CPUS - 1)] = 1;
-			pin_shield_n++;
+			next_shield[(u32)slot->sib_cpu &
+				    (BABY_MAX_CPUS - 1)] = 1;
+			next_n++;
 		}
 	}
 
 	if (mask) {
-		bpf_for(cpu, 0, nr_cpu_ids) {
-			if ((!use_non_lp || bpf_cpumask_test_cpu(cpu, non_lp)) &&
-			    !pin_shield_cpu[(u32)cpu & (BABY_MAX_CPUS - 1)])
-				bpf_cpumask_set_cpu(cpu, mask);
+		bpf_for(i, 0, BABY_MAX_CPUS) {
+			if ((!use_non_lp ||
+			     (i < nr_cpu_ids &&
+			      bpf_cpumask_test_cpu(i, non_lp))) &&
+			    !next_shield[i])
+				bpf_cpumask_set_cpu(i, mask);
 			else
-				bpf_cpumask_clear_cpu(cpu, mask);
+				bpf_cpumask_clear_cpu(i, mask);
 		}
 	}
+
+	/*
+	 * Publish the record only once it is complete, bytes first and
+	 * the count last: clearing the count for the length of the
+	 * rebuild takes the shield down between two wakeups, which is
+	 * exactly the window a worker needs to land on a held core.
+	 */
+	bpf_for(i, 0, BABY_MAX_CPUS)
+		pin_shield_cpu[i] = next_shield[i];
+	WRITE_ONCE(pin_shield_n, next_n);
 	bpf_rcu_read_unlock();
 }
 
@@ -1934,8 +1947,10 @@ void BPF_STRUCT_OPS(baby_dispatch, s32 cpu, struct task_struct *prev)
 		 * with the flag but no claim touches no map here.
 		 */
 		if (game_pin) {
-			if (scx_bpf_dsq_move_to_local(cpu2dsq(cpu), 0))
+			if (scx_bpf_dsq_move_to_local(cpu2dsq(cpu), 0)) {
+				seat_service_at[0][idx] = now;
 				return;
+			}
 			if (scx_bpf_dsq_move_to_local(fl_cpu2dsq(cpu), 0)) {
 				seat_service_at[1][idx] = now;
 				return;
@@ -1953,27 +1968,32 @@ void BPF_STRUCT_OPS(baby_dispatch, s32 cpu, struct task_struct *prev)
 					 pin_owns_cpu(cpu, prev);
 				if (!pinned) {
 					if (is_cpu_shielded(cpu, now)) {
-						struct task_struct *head;
+						struct task_struct *head, *q;
 
 						need_running = false;
 						/*
-						 * A shielded CPU still serves
-						 * a task that can run nowhere
-						 * else: dsq_peek_allowed()
-						 * gives the first task this
-						 * CPU can run, so a pull
-						 * after it delivers exactly
-						 * that task. A thread whose
-						 * only CPU is this one would
-						 * otherwise wait for the
-						 * watchdog.
+						 * A shielded CPU still serves a
+						 * task that can run nowhere
+						 * else, and it must take THAT
+						 * task: a plain pull pops queue
+						 * position 0, which may be a
+						 * task this CPU cannot run.
 						 */
 						head = dsq_peek_allowed(node,
 									cpu);
-						if (head && is_pcpu_task(head) &&
-						    scx_bpf_dsq_move_to_local(
-							    node, 0))
-							return;
+						if (head && (is_pcpu_task(head) ||
+							     pin_wholly_shielded(head))) {
+							bpf_for_each(scx_dsq, q, node, 0) {
+								if (q != head)
+									continue;
+								if (scx_bpf_dsq_move(
+								    BPF_FOR_EACH_ITER,
+								    q,
+								    SCX_DSQ_LOCAL, 0))
+									return;
+								break;
+							}
+						}
 					} else if (scx_bpf_dsq_move_to_local(
 							   node, 0)) {
 						return;
