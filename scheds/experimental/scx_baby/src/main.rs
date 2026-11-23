@@ -176,19 +176,19 @@ struct Opts {
     exit_dump_len: u32,
 
     /// Deadline offset in microseconds: every task is assigned
-    /// deadline = now + deadline offset (default 1180us, the original
-    /// DEADLINE_NS). This is also the base time slice of each task. The
-    /// scheduler is a deadline machine, so a value near zero collapses
-    /// every slice to nothing; accepted range is 100 to 100000. Above
-    /// 10000 the tick is the only preemption source for a full slice,
-    /// and the scheduler warns.
+    /// deadline = now + deadline offset. This is also the base time
+    /// slice of each task. The default is 1180us (the original
+    /// DEADLINE_NS), except under `gaming`, which uses 800us; an
+    /// explicit -d always wins. The scheduler is a deadline machine, so
+    /// a value near zero collapses every slice to nothing; accepted
+    /// range is 100 to 100000. Above 10000 the tick is the only
+    /// preemption source for a full slice, and the scheduler warns.
     #[clap(
         short = 'd',
         long,
-        default_value = "1180",
         value_parser = clap::value_parser!(u64).range(100..=100_000)
     )]
-    deadline_us: u64,
+    deadline_us: Option<u64>,
 
     /// CPU frequency performance level (0 = min, 1024 = max). Accepted
     /// range is -2 to 1024.
@@ -206,8 +206,8 @@ struct Opts {
     perf_lvl: i64,
 
     /// Scheduling profile. `default` keeps the throughput-first
-    /// placement. `gaming` keeps a latency-critical wake out of a
-    /// foreground resident's warm seat, trading throughput under
+    /// placement on the 1180us slice. `gaming` runs the plain
+    /// virtual-time queue on an 800us slice, trading throughput under
     /// saturation for lower frame latency.
     #[clap(
         long,
@@ -221,6 +221,33 @@ struct Opts {
     /// Shorthand for `--profile gaming`.
     #[clap(long, action = clap::ArgAction::SetTrue, conflicts_with = "profile")]
     game: bool,
+
+    /// Minimal EDF baseline: bypass the warm seats and the two-lane
+    /// bulk/fast-lane split. One shared deadline queue per node plus
+    /// direct dispatch to an idle CPU. For scheduler comparisons, not
+    /// for production.
+    #[clap(long, action = clap::ArgAction::SetTrue)]
+    plain: bool,
+
+    /// Plain EDF on the base slice. Implies --plain.
+    #[clap(long, action = clap::ArgAction::SetTrue)]
+    plain_1x: bool,
+
+    /// Bounded wake preemption on plain mode. Implies --plain-1x.
+    #[clap(long, action = clap::ArgAction::SetTrue)]
+    plain_wake: bool,
+
+    /// Virtual-time ordering on plain mode: one per-node queue keyed by
+    /// weighted runtime instead of an absolute deadline, with a
+    /// wake-frequency bounded credit. Implies --plain-1x.
+    #[clap(long, action = clap::ArgAction::SetTrue)]
+    plain_vtime: bool,
+
+    /// Credit window for --plain-vtime, in microseconds: a waking task
+    /// may sort ahead by at most this much virtual time per unit of
+    /// wake frequency. 20 ms is cosmos's slice_lag.
+    #[clap(long, default_value = "20000")]
+    vtime_lag_us: u64,
 
     /// Enable stats monitoring with the specified interval.
     #[clap(long)]
@@ -249,6 +276,51 @@ struct Opts {
 
     #[clap(flatten, next_help_heading = "Libbpf Options")]
     pub libbpf: LibbpfOpts,
+}
+
+/// The base slice and the plain-family rodata the options resolve to.
+///
+/// `gaming` is the only place the two interact: it selects
+/// `--plain-vtime` on an 800us slice. Every other profile keeps the
+/// throughput dispatch and the 1180us slice untouched.
+struct Mode {
+    gaming: bool,
+    deadline_us: u64,
+    plain: bool,
+    plain_1x: bool,
+    plain_wake: bool,
+    plain_vtime: bool,
+}
+
+/// The `-d` defaults: the original DEADLINE_NS, and the gaming slice.
+const DEADLINE_US_DEFAULT: u64 = 1180;
+const DEADLINE_US_GAMING: u64 = 800;
+
+impl Mode {
+    fn from_opts(opts: &Opts) -> Self {
+        let gaming = opts.game || opts.profile == "gaming";
+        let deadline_us = opts.deadline_us.unwrap_or(if gaming {
+            DEADLINE_US_GAMING
+        } else {
+            DEADLINE_US_DEFAULT
+        });
+
+        /*
+         * Each plain variant implies --plain, and --plain-wake and
+         * --plain-vtime both imply --plain-1x.
+         */
+        let plain_vtime = opts.plain_vtime || gaming;
+        let plain_1x = opts.plain_1x || opts.plain_wake || plain_vtime;
+
+        Self {
+            gaming,
+            deadline_us,
+            plain: opts.plain || plain_1x,
+            plain_1x,
+            plain_wake: opts.plain_wake,
+            plain_vtime,
+        }
+    }
 }
 
 struct Scheduler<'a> {
@@ -317,8 +389,9 @@ impl<'a> Scheduler<'a> {
 
         // Override default BPF scheduling parameters.
         let rodata = skel.maps.rodata_data.as_mut().unwrap();
+        let mode = Mode::from_opts(opts);
         rodata.debug = opts.debug;
-        rodata.deadline_ns = opts.deadline_us * 1000;
+        rodata.deadline_ns = mode.deadline_us * 1000;
         rodata.prio_offset_ns = scaled_prio_offsets(rodata.deadline_ns);
 
         // The wait/census instrument and the distance histograms run
@@ -386,12 +459,31 @@ impl<'a> Scheduler<'a> {
         );
         rodata.cpuperf_lvl = opts.perf_lvl;
 
-        // Scheduling profile: the default keeps the warm seat; the
-        // gaming profile sends a latency-critical wake behind a
-        // foreground resident to the shared fast-lane queue.
-        let gaming = opts.game || opts.profile == "gaming";
-        info!("profile: {}", if gaming { "gaming" } else { "default" });
-        rodata.gaming = gaming;
+        // Scheduling profile: the default keeps the throughput
+        // placement; the gaming profile runs the plain virtual-time
+        // queue on the 800us slice.
+        info!(
+            "profile: {}",
+            if mode.gaming { "gaming" } else { "default" }
+        );
+        rodata.gaming = mode.gaming;
+        rodata.plain = mode.plain;
+        rodata.plain_1x = mode.plain_1x;
+        rodata.plain_wake = mode.plain_wake;
+        rodata.plain_vtime = mode.plain_vtime;
+        /* 1 s bounds the BPF-side product (lag * freq cap * weight). */
+        let vtime_lag_ns = opts.vtime_lag_us.min(1_000_000) * 1000;
+        rodata.vtime_lag_ns = vtime_lag_ns;
+        if mode.plain {
+            info!("plain EDF baseline: warm seats and the lane split are off");
+        }
+        if mode.plain_vtime {
+            info!(
+                "plain virtual time: node queues keyed by weighted runtime, \
+                 credit window {}us",
+                vtime_lag_ns / 1000
+            );
+        }
 
         // Set scheduler flags.
         //
@@ -613,10 +705,11 @@ fn main() -> Result<()> {
         simplelog::ColorChoice::Auto,
     )?;
 
-    if opts.deadline_us > 10_000 {
+    let mode = Mode::from_opts(&opts);
+    if mode.deadline_us > 10_000 {
         warn!(
             "-d {}us is above 10ms: the tick is the only preemption source for a full slice",
-            opts.deadline_us
+            mode.deadline_us
         );
     }
 
@@ -686,7 +779,42 @@ mod tests {
         assert!(Opts::try_parse_from(["scx_baby", "-d", "100001"]).is_err());
 
         let ok = Opts::try_parse_from(["scx_baby", "-d", "500"]).unwrap();
-        assert_eq!(ok.deadline_us, 500);
+        assert_eq!(ok.deadline_us, Some(500));
+    }
+
+    /// `gaming` is the flag that changes the dispatch: it selects
+    /// --plain-vtime on an 800us slice, an explicit -d still wins, and
+    /// the default profile resolves to exactly what it did before.
+    #[test]
+    fn game_selects_plain_vtime_on_the_800us_slice() {
+        let game = Mode::from_opts(&Opts::try_parse_from(["scx_baby", "--game"]).unwrap());
+        assert!(game.gaming);
+        assert!(game.plain && game.plain_1x && game.plain_vtime);
+        assert!(!game.plain_wake);
+        assert_eq!(game.deadline_us, 800);
+
+        let alias =
+            Mode::from_opts(&Opts::try_parse_from(["scx_baby", "--profile", "gaming"]).unwrap());
+        assert!(alias.gaming && alias.plain_vtime);
+        assert_eq!(alias.deadline_us, 800);
+
+        let explicit =
+            Mode::from_opts(&Opts::try_parse_from(["scx_baby", "--game", "-d", "1000"]).unwrap());
+        assert!(explicit.plain_vtime);
+        assert_eq!(explicit.deadline_us, 1000);
+
+        let default = Mode::from_opts(&Opts::try_parse_from(["scx_baby"]).unwrap());
+        assert!(!default.gaming);
+        assert!(!default.plain && !default.plain_1x);
+        assert!(!default.plain_wake && !default.plain_vtime);
+        assert_eq!(default.deadline_us, 1180);
+
+        let bench = Mode::from_opts(
+            &Opts::try_parse_from(["scx_baby", "--plain-vtime", "-d", "800"]).unwrap(),
+        );
+        assert!(!bench.gaming);
+        assert!(bench.plain_vtime);
+        assert_eq!(bench.deadline_us, 800);
     }
 
     /// Test-only mirror of the wake-rate blend and peak gate in
@@ -841,7 +969,47 @@ mod tests {
     // scheduler. The topology counts are rodata, so the BPF loops and
     // bounds checks are verified against the synthetic width too, and
     // both hybrid-gate arms are exercised by publishing a tier split
-    // for every shape.
+    // for every shape. The plain flags are rodata as well, so each
+    // shape is loaded once per reachable flag combination, with the
+    // rodata production sets for it: a branch the verifier prunes when
+    // the flag is off is still checked when it is on.
+    fn load_synthetic(
+        nr_cpus: usize,
+        plain: bool,
+        plain_wake: bool,
+        plain_vtime: bool,
+    ) -> anyhow::Result<()> {
+        let mut object = MaybeUninit::uninit();
+        let builder = BpfSkelBuilder::default();
+        let mut skel = scx_ops_open!(builder, &mut object, baby_ops, None)?;
+        let ro = skel.maps.rodata_data.as_mut().unwrap();
+        /* --plain-vtime is the gaming queue, and gaming uses 800us. */
+        ro.deadline_ns = if plain_vtime { 800 } else { 1180 } * 1000;
+        ro.prio_offset_ns = scaled_prio_offsets(ro.deadline_ns);
+        ro.gaming = plain_vtime && !plain_wake;
+        ro.nr_cpu_ids = nr_cpus as u64;
+        ro.nr_node_ids = 2;
+        ro.nr_big_cpus = (nr_cpus / 2) as u64;
+        ro.nr_little_cpus = (nr_cpus - nr_cpus / 2) as u64;
+        ro.plain = plain || plain_wake || plain_vtime;
+        ro.plain_1x = plain_wake || plain_vtime;
+        ro.plain_wake = plain_wake;
+        ro.plain_vtime = plain_vtime;
+        ro.vtime_lag_ns = 20_000_000;
+        for cpu in 0..nr_cpus.min(ro.topo_node.len()) {
+            // Two node-ish halves, eight LLCs, per-pair L2 groups
+            // and SMT pairs - a denser distance ladder than any
+            // real host of this size.
+            ro.topo_node[cpu] = if cpu < nr_cpus / 2 { 1 } else { 2 };
+            ro.topo_llc[cpu] = (cpu % 8) as u32 + 1;
+            ro.topo_l2[cpu] = (cpu / 2) as u32 + 1;
+            ro.topo_core[cpu] = (cpu / 2) as u32 + 1;
+        }
+        let loaded = scx_ops_load!(skel, baby_ops, uei)?;
+        drop(loaded);
+        Ok(())
+    }
+
     #[test]
     #[ignore = "requires BPF load capabilities and a sched_ext kernel"]
     fn verifier_load_synthetic_topologies() -> anyhow::Result<()> {
@@ -850,29 +1018,20 @@ mod tests {
         })));
 
         let mut failures = Vec::new();
-        for nr_cpus in [1usize, 14, 128] {
-            let mut object = MaybeUninit::uninit();
-            let builder = BpfSkelBuilder::default();
-            let mut skel = scx_ops_open!(builder, &mut object, baby_ops, None)?;
-            let ro = skel.maps.rodata_data.as_mut().unwrap();
-            ro.deadline_ns = 1180 * 1000;
-            ro.prio_offset_ns = scaled_prio_offsets(ro.deadline_ns);
-            ro.nr_cpu_ids = nr_cpus as u64;
-            ro.nr_node_ids = 2;
-            ro.nr_big_cpus = (nr_cpus / 2) as u64;
-            ro.nr_little_cpus = (nr_cpus - nr_cpus / 2) as u64;
-            for cpu in 0..nr_cpus.min(ro.topo_node.len()) {
-                // Two node-ish halves, eight LLCs, per-pair L2 groups
-                // and SMT pairs - a denser distance ladder than any
-                // real host of this size.
-                ro.topo_node[cpu] = if cpu < nr_cpus / 2 { 1 } else { 2 };
-                ro.topo_llc[cpu] = (cpu % 8) as u32 + 1;
-                ro.topo_l2[cpu] = (cpu / 2) as u32 + 1;
-                ro.topo_core[cpu] = (cpu / 2) as u32 + 1;
-            }
-            match scx_ops_load!(skel, baby_ops, uei) {
-                Ok(loaded) => drop(loaded),
-                Err(error) => failures.push(format!("{nr_cpus} CPUs: {error:#}")),
+        for (plain, plain_wake, plain_vtime) in [
+            (false, false, false),
+            (true, false, false),
+            (true, true, false),
+            (true, false, true),
+            (true, true, true),
+        ] {
+            for nr_cpus in [1usize, 14, 128] {
+                if let Err(error) = load_synthetic(nr_cpus, plain, plain_wake, plain_vtime) {
+                    failures.push(format!(
+                        "{nr_cpus} CPUs plain={plain} wake={plain_wake} \
+                         vtime={plain_vtime}: {error:#}"
+                    ));
+                }
             }
         }
         anyhow::ensure!(failures.is_empty(), "{}", failures.join("\n"));

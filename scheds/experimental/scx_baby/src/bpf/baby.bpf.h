@@ -108,10 +108,32 @@ extern const volatile u64 deadline_ns;
 extern const volatile bool debug;
 
 /*
- * Gaming profile: a latency-critical wake behind a foreground resident
- * joins the shared fast-lane queue instead of the resident's warm seat.
+ * Gaming profile: the plain virtual-time queue on an 800us slice. There
+ * are no warm seats and no fast lane under it; a latency-critical wake
+ * waits in the node's virtual-time queue like any other task.
  */
 extern const volatile bool gaming;
+
+/*
+ * Plain EDF baseline (--plain): no warm seats, no two-lane split and no
+ * lane arbitration. It exists for scheduler comparisons, not for
+ * production.
+ */
+extern const volatile bool plain;
+
+/* Plain mode on the base slice (--plain-1x). */
+extern const volatile bool plain_1x;
+
+/* Bounded wake preemption on top of --plain-1x (--plain-wake). */
+extern const volatile bool plain_wake;
+
+/*
+ * Virtual-time ordering on top of --plain-1x (--plain-vtime): the node
+ * queue is keyed by the task's weighted runtime instead of an absolute
+ * deadline, with wake-frequency bounded credit.
+ */
+extern const volatile bool plain_vtime;
+extern const volatile u64 vtime_lag_ns;
 
 /*
  * The wait/census instrument and the distance histograms run; set
@@ -361,6 +383,14 @@ struct task_ctx {
 	u64 deadline;
 
 	/*
+	 * Virtual time (--plain-vtime): runtime consumed, inversely
+	 * scaled by weight, so a heavy task's second of CPU buys the
+	 * same place that a light task's fraction does. Lifted to the
+	 * node's credit floor on each wake (vtime_encode).
+	 */
+	u64 vtime;
+
+	/*
 	 * Runtime accumulated within the current and the previous
 	 * TIME_PERIOD window (bursts), and when the current window began.
 	 */
@@ -462,6 +492,10 @@ struct task_ctx {
 	 */
 	s32 last_cpu;
 
+	/* The previous run's length, and the stamp it started at. */
+	u64 last_run_ns;
+	u64 run_start_ns;
+
 	/*
 	 * The queued arrival this task still owes its pending count to: a
 	 * tag naming the queue's kind, lane and index, or zero when the
@@ -471,6 +505,10 @@ struct task_ctx {
 	 */
 	u32 queued_tag;
 };
+
+/* Virtual-time key encoding for --plain-vtime (main.bpf.c). */
+__hidden u64 vtime_encode(const struct task_struct *p, struct task_ctx *tctx,
+			  s32 node);
 
 /*
  * A granted slice and the tag it needs share no storage: the tick, the
@@ -643,7 +681,8 @@ static __always_inline bool is_foreground(const struct task_ctx *tctx)
  */
 static __always_inline u64 task_slice(const struct task_ctx *tctx)
 {
-	return is_foreground(tctx) ? 4 * deadline_ns : deadline_ns;
+	return !plain_1x && is_foreground(tctx) ? 4 * deadline_ns :
+						  deadline_ns;
 }
 
 /*

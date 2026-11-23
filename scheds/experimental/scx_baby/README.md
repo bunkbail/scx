@@ -36,12 +36,13 @@ its lane.
 ### Profiles
 
 The scheduler runs one of two profiles. The default is the placement
-described here. The gaming profile (`--profile gaming`, or `--game`) keeps
-a latency-critical wake out of a foreground resident's warm seat: the
-arrival joins the shared fast-lane queue, where the earliest deadline
-wins, instead of waiting out the resident's fourfold slice. It trades
-throughput under saturation for lower frame latency. Both profiles share
-one binary and one BPF program. The profile is a rodata flag.
+described here, on the 1180us slice. The gaming profile (`--profile
+gaming`, or `--game`) runs the plain virtual-time queue on an 800us slice
+(`--plain-vtime -d 800`): no warm seats and no fast lane, one shared
+queue per node ordered by weighted runtime, with a wake-frequency bounded
+credit. It trades throughput under saturation for lower frame latency.
+Both profiles share one binary and one BPF program. The profiles are
+rodata flags.
 
 ## Design
 
@@ -333,12 +334,16 @@ policy.
   CPU's level from its utilization; -2 leaves the platform's cpufreq setup
   alone.
 - `--profile <default|gaming>`: scheduling profile. `default` is the
-  throughput-first placement described above. `gaming` keeps a
-  latency-critical wake out of a foreground resident's warm seat and sends
-  it to the shared fast-lane queue, trading throughput under saturation for
-  lower frame latency.
+  throughput-first placement described above. `gaming` runs the plain
+  virtual-time queue on an 800us slice, trading throughput under
+  saturation for lower frame latency. An explicit `-d` still sets the
+  slice.
 - `--game`: shorthand for `--profile gaming`, mutually exclusive with an
   explicit `--profile`.
+- `--plain`, `--plain-1x`, `--plain-wake`, `--plain-vtime`,
+  `--vtime-lag-us`: the plain EDF baseline and its variants. These exist
+  for scheduler comparisons; `--plain-vtime` is what `gaming` selects, and
+  `--game` is the supported way to run it.
 - `--stats <SECS>`: enable the stats report and run normally.
 - `--monitor <SECS>`: run in stats monitoring mode without launching the
   scheduler.

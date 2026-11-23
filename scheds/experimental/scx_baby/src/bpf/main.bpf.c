@@ -21,10 +21,42 @@ const volatile u64 deadline_ns = 1180000ULL;
 const volatile bool debug;
 
 /*
- * Gaming profile: a latency-critical wake behind a foreground resident
- * joins the shared fast-lane queue instead of the resident's warm seat.
+ * Gaming profile: the plain virtual-time queue on an 800us slice. There
+ * are no warm seats and no fast lane under it; a latency-critical wake
+ * waits in the node's virtual-time queue like any other task.
  */
 const volatile bool gaming;
+
+/*
+ * Plain EDF baseline (--plain): no warm seats, no two-lane split and no
+ * lane arbitration. Every task waits in its node's deadline queue.
+ */
+const volatile bool plain;
+
+/* Plain base slice (--plain-1x) and bounded wake preemption (--plain-wake). */
+const volatile bool plain_1x;
+const volatile bool plain_wake;
+
+/*
+ * Plain virtual time (--plain-vtime, implies --plain-1x): the node
+ * queue is keyed by the runtime each task has consumed, inversely
+ * scaled by its weight, instead of by an absolute deadline. A waking
+ * task is lifted to `vtime_now - vtime_lag_ns * wakeup_freq` scaled by
+ * its weight, which is cosmos's slice_lag model: frequent wakers sort
+ * ahead by a bounded amount of virtual time, CPU hogs do not.
+ */
+const volatile bool plain_vtime;
+const volatile u64 vtime_lag_ns = 20000000ULL;
+
+/* cosmos's MAX_WAKEUP_FREQ cap on the credit multiplier. */
+#define BABY_VTIME_WAKE_FREQ_MAX	1024
+
+/*
+ * The largest run one stop may charge: a task renewed in place
+ * accumulates across the renewals, and the weight division multiplies
+ * by a hundred before it divides.
+ */
+#define BABY_VTIME_CHARGE_MAX_NS	NSEC_PER_SEC
 
 /*
  * Big and little CPU sets, published by userspace at startup. They drive
@@ -88,6 +120,10 @@ private(BABY) struct bpf_cpumask __kptr *non_lp_cpumask;
  */
 #define BABY_TICK_PREEMPT_PROTECT_NS	(50ULL * NSEC_PER_USEC)
 
+/* Plain wake gate: the residency floor and the short-burst bound. */
+#define PLAIN_WAKE_PROTECT_NS		(200ULL * NSEC_PER_USEC)
+#define PLAIN_WAKE_SHORT_NS		(500ULL * NSEC_PER_USEC)
+
 /*
  * Fallback quiet window for the shared-queue claim. It covers the
  * tick -> resched -> dispatch flight, which may be diverted to a
@@ -111,6 +147,14 @@ bool cpu_is_lat[BABY_MAX_CPUS];
  * queue, not by a bulk pull or a seat pull, which serve other work.
  */
 static u64 node_preempt_claim[BABY_NODE_CLOCK_NR];
+
+/*
+ * The per-node virtual clock (--plain-vtime). It advances to the
+ * virtual time of every task the node dispatches and never goes back,
+ * so a task that slept while the node made progress wakes to a credit
+ * floor set by how far that node has come, not by its own idle time.
+ */
+static u64 node_vtime_now[BABY_NODE_CLOCK_NR];
 
 /*
  * Per-queue service clocks for the starve rescue, indexed by lane
@@ -378,6 +422,18 @@ static __always_inline s32 pick_idle_pref(struct task_struct *p,
 	return cpu;
 }
 
+/* Whether a plain-mode wake may cut @victim for @wakee. */
+static __always_inline bool plain_wake_cut(const struct task_ctx *wakee,
+					   const struct task_ctx *victim)
+{
+	if ((s64)(victim->deadline - wakee->deadline) >
+	    (s64)(deadline_ns / 2))
+		return true;
+
+	return !is_foreground(wakee) &&
+	       wakee->last_run_ns < PLAIN_WAKE_SHORT_NS;
+}
+
 /*
  * The kernel idle-CPU selection, restricted to the non-LP mask while
  * the tiers exist. scx_bpf_select_cpu_and() clears the chosen CPU's
@@ -456,7 +512,7 @@ s32 BPF_STRUCT_OPS(baby_select_cpu, struct task_struct *p,
 	 * statically false on a single-tier machine and disengage before
 	 * saturation.
 	 */
-	if (tctx && nr_little_cpus && nr_big_cpus &&
+	if (!plain && tctx && nr_little_cpus && nr_big_cpus &&
 	    nr_running <= nr_little_cpus + 2) {
 		bool big_pin = is_heavy_proven(tctx) && !is_foreground(tctx);
 
@@ -502,7 +558,7 @@ s32 BPF_STRUCT_OPS(baby_select_cpu, struct task_struct *p,
 	 * The miss reasons are left to the gate below; this block only
 	 * returns where it has already placed the task.
 	 */
-	if (tctx && is_lat_cri(tctx) &&
+	if (!plain && tctx && is_lat_cri(tctx) &&
 	    bpf_cpumask_test_cpu(prev_cpu, p->cpus_ptr) &&
 	    !cpu_smt_shared(prev_cpu)) {
 		u32 pidx = (u32)prev_cpu & (BABY_MAX_CPUS - 1);
@@ -647,7 +703,8 @@ s32 BPF_STRUCT_OPS(baby_select_cpu, struct task_struct *p,
 			tctx->wake_gate_miss = BABY_WG_M4_DEGEN;
 			return cpu;
 		}
-		if (is_lat_cri(cctx)) {
+		if (is_lat_cri(cctx) &&
+		    !(plain_wake && plain_wake_cut(tctx, cctx))) {
 			tctx->wake_gate_miss = BABY_WG_M4_VICTIM_LAT;
 			/*
 			 * The previous CPU runs another latency-critical
@@ -664,7 +721,8 @@ s32 BPF_STRUCT_OPS(baby_select_cpu, struct task_struct *p,
 
 		ran_at = cpu_running_at[pcpu_idx];
 		if (!ran_at ||
-		    now - ran_at < BABY_TICK_PREEMPT_PROTECT_NS) {
+		    now - ran_at < (plain_wake ? PLAIN_WAKE_PROTECT_NS :
+					BABY_TICK_PREEMPT_PROTECT_NS)) {
 			tctx->wake_gate_miss = BABY_WG_M5_RESIDENCY;
 			return cpu;
 		}
@@ -682,6 +740,40 @@ s32 BPF_STRUCT_OPS(baby_select_cpu, struct task_struct *p,
 	}
 
 	return cpu;
+}
+
+/*
+ * Encode the virtual-time key of a task for its node's queue
+ * (--plain-vtime): cosmos's task_dl(), with the clock kept per node.
+ * The lift only ever raises the key, so a wake cannot buy back runtime
+ * the task has already been charged for.
+ */
+__hidden u64 vtime_encode(const struct task_struct *p, struct task_ctx *tctx,
+			  s32 node)
+{
+	u64 lag_scale = MAX(tctx->wakeup_freq, 1);
+	u64 vsleep_max, vtime_now, vmin;
+
+	if (lag_scale > BABY_VTIME_WAKE_FREQ_MAX)
+		lag_scale = BABY_VTIME_WAKE_FREQ_MAX;
+
+	vtime_now = node_vtime_now[(u32)node & (BABY_NODE_CLOCK_NR - 1)];
+
+	/*
+	 * First sight of this task: start it at the node clock, as cosmos
+	 * does in ops.enable(). Starting at zero would hand a new task the
+	 * full wake credit and let a burst of fresh tasks jump the queue.
+	 */
+	if (!tctx->vtime)
+		tctx->vtime = vtime_now;
+
+	vsleep_max = scale_by_task_weight(p, vtime_lag_ns * lag_scale);
+	vmin = vtime_now > vsleep_max ? vtime_now - vsleep_max : 0;
+
+	if (tctx->vtime < vmin)
+		tctx->vtime = vmin;
+
+	return tctx->vtime;
 }
 
 /*
@@ -773,102 +865,139 @@ void BPF_STRUCT_OPS(baby_enqueue, struct task_struct *p, u64 enq_flags)
 	}
 
 	/*
-	 * Grab a confirmed idle CPU before considering a preemption. A
-	 * wakee that can run now on a CPU that went idle since
+	 * Place the arrival before considering a preemption.
+	 *
+	 * A wakee that can run now on a CPU that went idle since
 	 * ops.select_cpu() has no reason to evict a running task, and an
 	 * idle CPU is what the fan-out would have to beat anyway. A
 	 * reenqueued task rescans here for the same reason. The scan runs
 	 * before the warm seat so a requeue or rescue never parks on a
 	 * busy seat while a lane sits idle.
 	 */
-	if (try_direct_dispatch(p, tctx, prev_cpu, enq_flags, is_running))
-		return;
+	{
+		if (try_direct_dispatch(p, tctx, prev_cpu, enq_flags,
+					is_running))
+			return;
 
-	/*
-	 * check_preempt_wakeup(): preempt the previous CPU's task when the
-	 * waker has an earlier deadline and no lower priority, provided
-	 * the CPU has no warm backlog and the running task can be cut. A
-	 * preemption into a deep queue would only trade places with work
-	 * that runs anyway, and a burst hog must not be preempted. Only
-	 * interactive and foreground wakers are eligible: a task that
-	 * never wakes has no latency to protect.
-	 *
-	 * The victim rules mirror ops.select_cpu()'s wake gate: a
-	 * latency-critical resident keeps its CPU (two pipeline stages
-	 * must not take turns on one), a victim pinned to a single CPU
-	 * has nowhere else to go, and a resident still inside the
-	 * residency floor has not had a turn worth taking. The wakee must
-	 * be allowed on the target, and no in-flight wakee may hold the
-	 * local DSQ (the insert would queue behind it). The deadline
-	 * order arbitrates between two bulk tasks as before.
-	 */
-	if ((enq_flags & SCX_ENQ_WAKEUP) &&
-	    bpf_cpumask_test_cpu(prev_cpu, p->cpus_ptr) &&
-	    !scx_bpf_dsq_nr_queued(fl_cpu2dsq(prev_cpu)) &&
-	    !scx_bpf_dsq_nr_queued(cpu2dsq(prev_cpu)) &&
-	    !scx_bpf_dsq_nr_queued(SCX_DSQ_LOCAL_ON | prev_cpu) &&
-	    (is_interactive(tctx) || is_foreground(tctx))) {
-		u32 pidx = (u32)prev_cpu & (BABY_MAX_CPUS - 1);
-		u64 ran_at = cpu_running_at[pidx];
-		struct task_struct *curr = __COMPAT_scx_bpf_cpu_curr(prev_cpu);
+		/*
+		 * check_preempt_wakeup(): preempt the previous CPU's task
+		 * when the waker has an earlier deadline and no lower
+		 * priority, provided the CPU has no warm backlog and the
+		 * running task can be cut. A preemption into a deep queue
+		 * would only trade places with work that runs anyway, and a
+		 * burst hog must not be preempted. Only interactive and
+		 * foreground wakers are eligible: a task that never wakes
+		 * has no latency to protect.
+		 *
+		 * The victim rules mirror ops.select_cpu()'s wake gate: a
+		 * latency-critical resident keeps its CPU (two pipeline
+		 * stages must not take turns on one), a victim pinned to a
+		 * single CPU has nowhere else to go, and a resident still
+		 * inside the residency floor has not had a turn worth
+		 * taking. The wakee must be allowed on the target, and no
+		 * in-flight wakee may hold the local DSQ (the insert would
+		 * queue behind it). The deadline order arbitrates between
+		 * two bulk tasks as before.
+		 */
+		if ((plain_wake || !plain) && (enq_flags & SCX_ENQ_WAKEUP) &&
+		    bpf_cpumask_test_cpu(prev_cpu, p->cpus_ptr) &&
+		    (plain_wake ? !scx_bpf_dsq_nr_queued(node) :
+		     (!scx_bpf_dsq_nr_queued(fl_cpu2dsq(prev_cpu)) &&
+		      !scx_bpf_dsq_nr_queued(cpu2dsq(prev_cpu)))) &&
+		    !scx_bpf_dsq_nr_queued(SCX_DSQ_LOCAL_ON | prev_cpu) &&
+		    (plain_wake || is_interactive(tctx) || is_foreground(tctx))) {
+			u32 pidx = (u32)prev_cpu & (BABY_MAX_CPUS - 1);
+			u64 ran_at = cpu_running_at[pidx];
+			struct task_struct *curr =
+				__COMPAT_scx_bpf_cpu_curr(prev_cpu);
 
-		if (curr && curr != p && !(curr->flags & PF_IDLE)) {
-			struct task_ctx *cctx = try_lookup_task_ctx(curr);
+			if (curr && curr != p && !(curr->flags & PF_IDLE)) {
+				struct task_ctx *cctx =
+					try_lookup_task_ctx(curr);
 
-			if (cctx && is_lat_cri(cctx)) {
-				if (stats_enabled)
-					__sync_fetch_and_add(
-						&nr_preempt_refused_lat, 1);
-			} else if (cctx && !is_pcpu_task(curr) && ran_at &&
-				   (s64)(now - ran_at) >=
-					   (s64)BABY_TICK_PREEMPT_PROTECT_NS &&
-				   (s64)(tctx->deadline - cctx->deadline) < 0 &&
-				   p->static_prio <= curr->static_prio &&
-				   can_resched(cctx)) {
-				scx_bpf_dsq_insert(p,
-						   SCX_DSQ_LOCAL_ON | prev_cpu,
-						   task_slice(tctx),
-						   enq_flags | SCX_ENQ_PREEMPT);
-				if (stats_enabled)
-					__sync_fetch_and_add(&nr_preemptions, 1);
-				return;
+				if (!plain_wake && cctx && is_lat_cri(cctx)) {
+					if (stats_enabled)
+						__sync_fetch_and_add(
+							&nr_preempt_refused_lat,
+							1);
+				} else if (cctx && !is_pcpu_task(curr) &&
+					   ran_at &&
+					   (s64)(now - ran_at) >=
+						   (s64)(plain_wake ?
+							 PLAIN_WAKE_PROTECT_NS :
+							 BABY_TICK_PREEMPT_PROTECT_NS) &&
+					   (plain_wake ?
+					    plain_wake_cut(tctx, cctx) :
+					    (s64)(tctx->deadline -
+						  cctx->deadline) < 0) &&
+					   p->static_prio <= curr->static_prio &&
+					   can_resched(cctx)) {
+					scx_bpf_dsq_insert(
+						p, SCX_DSQ_LOCAL_ON | prev_cpu,
+						task_slice(tctx),
+						enq_flags | SCX_ENQ_PREEMPT);
+					if (stats_enabled)
+						__sync_fetch_and_add(
+							&nr_preemptions, 1);
+					return;
+				}
 			}
 		}
+
+		/*
+		 * Warm seat, gated on oversubscription (see balance.bpf.c).
+		 * Plain mode has no seats.
+		 */
+		if (!plain &&
+		    balance_try_warm_seat(p, tctx, enq_flags, bulk_backlog,
+					  fl_backlog, now))
+			return;
 	}
 
 	/*
-	 * Warm seat, gated on oversubscription (see balance.bpf.c).
-	 */
-	if (balance_try_warm_seat(p, tctx, enq_flags, bulk_backlog,
-				  fl_backlog, now))
-		return;
-
-	/*
-	 * No idle CPU: join the deadline order. A deep backlog grants the
-	 * fourfold slice; a tick-preempted victim keeps the base slice.
-	 * Latency-critical tasks use their own node queue, which dispatch
-	 * serves ahead of bulk while the time budget allows.
+	 * No idle CPU: join the deadline order. In the full scheduler a
+	 * deep backlog grants the fourfold slice, a tick-preempted victim
+	 * keeps the base slice, and latency-critical tasks use their own
+	 * node queue, which dispatch serves ahead of bulk while the time
+	 * budget allows. Plain mode has one queue and one base slice.
 	 */
 	{
-		bool lat = is_lat_cri(tctx);
+		bool lat = !plain && is_lat_cri(tctx);
 		u64 lane_backlog = lat ? fl_backlog : bulk_backlog;
 		u64 dsq = lat ? fl_node2dsq(node) : (u64)node;
 
 		/*
-		 * Seed the rescue clock when the lane's shared queue was
-		 * empty; a queue that is already served does not need it.
+		 * Plain mode is the minimal EDF baseline: one shared
+		 * deadline queue per node, the base slice, no rescue clock
+		 * and no arrival tag. The tag and the rescue clock serve
+		 * the lanes and the seats, which plain mode does not have.
 		 */
-		if (!lane_backlog)
-			node_service_at[lat & 1][node &
-						 (BABY_NODE_CLOCK_NR - 1)] = now;
+		if (plain) {
+			u64 key = plain_vtime ?
+				vtime_encode(p, tctx, node) : tctx->deadline;
 
-		slice = backlog_deep(lane_backlog) && !tctx->tick_preempted
-			? 4 * deadline_ns : task_slice(tctx);
+			scx_bpf_dsq_insert_vtime(p, dsq, task_slice(tctx),
+						 key, enq_flags);
+			stamp_wait(tctx, now, lane_backlog, true);
+		} else {
+			/*
+			 * Seed the rescue clock when the lane's shared
+			 * queue was empty; a queue that is already served
+			 * does not need it.
+			 */
+			if (!lane_backlog)
+				node_service_at[lat & 1][node &
+							 (BABY_NODE_CLOCK_NR - 1)] = now;
 
-		baby_insert_vtime(p, tctx, dsq, slice, tctx->deadline,
-				  enq_flags,
-				  baby_tag(1, lat, (u32)node));
-		stamp_wait(tctx, now, lane_backlog, true);
+			slice = backlog_deep(lane_backlog) &&
+					 !tctx->tick_preempted
+				? 4 * deadline_ns : task_slice(tctx);
+
+			baby_insert_vtime(p, tctx, dsq, slice,
+					  tctx->deadline, enq_flags,
+					  baby_tag(1, lat, (u32)node));
+			stamp_wait(tctx, now, lane_backlog, true);
+		}
 	}
 
 	/*
@@ -919,6 +1048,47 @@ void BPF_STRUCT_OPS(baby_dispatch, s32 cpu, struct task_struct *prev)
 	 */
 	tctx = (need_running || stats_enabled) && prev ?
 		try_lookup_task_ctx(prev) : NULL;
+
+	/*
+	 * Plain mode (--plain): the minimal EDF dispatcher. One shared
+	 * deadline queue per node feeds the CPU; the fast lane, the bulk
+	 * seats, the lane budget and the lane arbitration stay out of the
+	 * path entirely. A running task that finds the queue empty keeps
+	 * the CPU with a renewed deadline, which is the same rotation the
+	 * full dispatcher performs without any of its placement rules.
+	 */
+	if (plain) {
+		if (scx_bpf_dsq_move_to_local(node, 0))
+			return;
+
+		/*
+		 * --plain-vtime refuses in-place renewal on a contended
+		 * SMT core, as cosmos's keep_running does, unless the task
+		 * can only run here: a pinned task would come straight back
+		 * to the same half core.
+		 */
+		if (plain_vtime && need_running && !is_pcpu_task(prev) &&
+		    cpu_smt_shared(cpu))
+			need_running = false;
+
+		if (!need_running) {
+			cpuperf_on_idle(cpu);
+			return;
+		}
+		if (tctx) {
+			update_bursts(tctx, now);
+			if (reached_deadline(tctx, now))
+				tctx->deadline =
+					calc_deadline(prev, tctx, now);
+			tctx->tick_preempted = false;
+			tctx->yield_pending = false;
+			tctx->last_cpu = cpu;
+			cpu_running_at[idx] = now;
+		}
+		scx_bpf_task_set_slice(prev,
+				       tctx ? task_slice(tctx) : deadline_ns);
+		return;
+	}
 
 	if (stats_enabled)
 		census_sample(cpu);
@@ -1342,7 +1512,7 @@ void BPF_STRUCT_OPS(baby_tick, struct task_struct *p)
 	 * charge point, so the stop that follows charges only the
 	 * remainder.
 	 */
-	if (is_lat_cri(tctx)) {
+	if (!plain && is_lat_cri(tctx)) {
 		s32 cpu = scx_bpf_task_cpu(p);
 		u32 idx = (u32)cpu & (BABY_MAX_CPUS - 1);
 
@@ -1367,7 +1537,7 @@ void BPF_STRUCT_OPS(baby_tick, struct task_struct *p)
 	 * and counting it would black the lane out with no dispatch to
 	 * reset it. baby_dispatch() owns the budget.
 	 */
-	if (!is_lat_cri(tctx)) {
+	if (plain_1x || (!plain && !is_lat_cri(tctx))) {
 		s32 cpu = scx_bpf_task_cpu(p);
 		u32 idx = (u32)cpu & (BABY_MAX_CPUS - 1);
 		u64 ran_at = cpu_running_at[idx];
@@ -1377,7 +1547,11 @@ void BPF_STRUCT_OPS(baby_tick, struct task_struct *p)
 			bool cri = false;
 			bool warm = false;
 
-			if (scx_bpf_dsq_nr_queued(fl_cpu2dsq(cpu))) {
+			if (plain_1x &&
+			    scx_bpf_dsq_nr_queued(SCX_DSQ_LOCAL_ON | cpu)) {
+				cri = true;
+			} else if (!plain_1x &&
+				   scx_bpf_dsq_nr_queued(fl_cpu2dsq(cpu))) {
 				cri = true;
 				warm = true;
 			} else {
@@ -1389,7 +1563,8 @@ void BPF_STRUCT_OPS(baby_tick, struct task_struct *p)
 				 * serve.
 				 */
 				struct task_struct *head =
-					dsq_peek_allowed(fl_node2dsq(node), cpu);
+					dsq_peek_allowed(plain_1x ? (u64)node :
+							 fl_node2dsq(node), cpu);
 
 				if (head) {
 					u32 idx = (u32)node &
@@ -1492,6 +1667,10 @@ void BPF_STRUCT_OPS(baby_stopping, struct task_struct *p, bool runnable)
 	if (!tctx)
 		return;
 
+	/* The run that just ended, for the plain wake gate. */
+	if (now > tctx->run_start_ns)
+		tctx->last_run_ns = now - tctx->run_start_ns;
+
 	/*
 	 * Whatever enqueues this task next is a re-entry of a task that
 	 * has run - slice expiry, preemption, an RT-lease reenqueue -
@@ -1510,6 +1689,18 @@ void BPF_STRUCT_OPS(baby_stopping, struct task_struct *p, bool runnable)
 		tctx->yield_pending = false;
 
 	update_bursts(tctx, now);
+
+	/*
+	 * --plain-vtime: charge this run's runtime to the task's virtual
+	 * time, inversely scaled by its weight (cosmos ops.stopping()).
+	 */
+	if (plain_vtime) {
+		u64 used = now > tctx->run_start_ns ?
+			   now - tctx->run_start_ns : 0;
+
+		used = MIN(used, BABY_VTIME_CHARGE_MAX_NS);
+		tctx->vtime += scale_by_task_weight_inverse(p, used);
+	}
 
 	class_boost_on_sleep(p, tctx, runnable, now);
 
@@ -1564,7 +1755,7 @@ void BPF_STRUCT_OPS(baby_running, struct task_struct *p)
 
 		cpu_running_at[cpu_idx] = now;
 		cpu_running[cpu_idx] = true;
-		cpu_is_lat[cpu_idx] = tctx && is_lat_cri(tctx);
+		cpu_is_lat[cpu_idx] = !plain && tctx && is_lat_cri(tctx);
 		if (!cpu_is_lat[cpu_idx])
 			cpu_bulk_at[cpu_idx] = now;
 		/*
@@ -1581,8 +1772,10 @@ void BPF_STRUCT_OPS(baby_running, struct task_struct *p)
 					  cpu_bulk_wait[cpu_idx]);
 		}
 		cpu_fl_running_at[cpu_idx] = cpu_is_lat[cpu_idx] ? now : 0;
-		if (tctx)
+		if (tctx) {
 			tctx->last_cpu = cpu;
+			tctx->run_start_ns = now;
+		}
 	}
 
 	if (!tctx)
@@ -1609,7 +1802,8 @@ void BPF_STRUCT_OPS(baby_running, struct task_struct *p)
 		u32 cls = task_nr_class(tctx);
 
 		__sync_fetch_and_add(&nr_class[cls & (BABY_WCLS_NR - 1)], 1);
-		__sync_fetch_and_add(&nr_lane[is_lat_cri(tctx) ? 1 : 0], 1);
+		__sync_fetch_and_add(
+			&nr_lane[!plain && is_lat_cri(tctx) ? 1 : 0], 1);
 	}
 
 	/*
@@ -1622,6 +1816,19 @@ void BPF_STRUCT_OPS(baby_running, struct task_struct *p)
 			   is_heavy_proven(tctx) || is_foreground(tctx));
 
 	class_on_running(p, tctx, now);
+
+	/*
+	 * --plain-vtime: this node's clock follows the virtual time of
+	 * the task it just dispatched, monotonically (cosmos does the
+	 * same at the head of its dispatch).
+	 */
+	if (plain_vtime) {
+		s32 node = __COMPAT_scx_bpf_cpu_node(scx_bpf_task_cpu(p));
+		u32 nidx = (u32)node & (BABY_NODE_CLOCK_NR - 1);
+
+		if (tctx->vtime > node_vtime_now[nidx])
+			node_vtime_now[nidx] = tctx->vtime;
+	}
 }
 
 /*
@@ -1732,7 +1939,7 @@ static int rescue_timerfn(void *map, int *key, struct bpf_timer *timer)
 	s32 node, cpu;
 	int err;
 
-	if (__COMPAT_has_generic_reenq()) {
+	if (!plain && __COMPAT_has_generic_reenq()) {
 		bpf_for(cpu, 0, nr_cpu_ids) {
 			u32 idx = (u32)cpu & (BABY_MAX_CPUS - 1);
 
