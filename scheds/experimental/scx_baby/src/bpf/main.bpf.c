@@ -753,6 +753,19 @@ static __noinline bool pin_slot_take(struct pin_slot *slot,
 	slot->nr_enq = 0;
 
 	pin_mask_rebuild();
+
+	/*
+	 * A claim can shield the only CPU some waiting task can run on.
+	 * Dispatch withholds the node queue on a shielded CPU, and the
+	 * arrival path only parks a task whose affinity is already inside
+	 * the shield when it is enqueued, so a task that was queued
+	 * before this claim would wait there until the watchdog. The
+	 * re-enqueue runs every arrival through ops.enqueue() again,
+	 * where the park catches it.
+	 */
+	if (__COMPAT_has_generic_reenq())
+		scx_bpf_dsq_reenq___compat(
+			(u64)__COMPAT_scx_bpf_cpu_node(home), 0);
 	return true;
 }
 
@@ -1843,7 +1856,27 @@ void BPF_STRUCT_OPS(baby_dispatch, s32 cpu, struct task_struct *prev)
 					 pin_owns_cpu(cpu, prev);
 				if (!pinned) {
 					if (is_cpu_shielded(cpu, now)) {
+						struct task_struct *head;
+
 						need_running = false;
+						/*
+						 * A shielded CPU still serves
+						 * a task that can run nowhere
+						 * else: dsq_peek_allowed()
+						 * gives the first task this
+						 * CPU can run, so a pull
+						 * after it delivers exactly
+						 * that task. A thread whose
+						 * only CPU is this one would
+						 * otherwise wait for the
+						 * watchdog.
+						 */
+						head = dsq_peek_allowed(node,
+									cpu);
+						if (head && is_pcpu_task(head) &&
+						    scx_bpf_dsq_move_to_local(
+							    node, 0))
+							return;
 					} else if (scx_bpf_dsq_move_to_local(
 							   node, 0)) {
 						return;
