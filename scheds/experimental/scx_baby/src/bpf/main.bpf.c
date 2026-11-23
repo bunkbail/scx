@@ -766,6 +766,16 @@ static __noinline bool pin_slot_take(struct pin_slot *slot,
 	if (__COMPAT_has_generic_reenq())
 		scx_bpf_dsq_reenq___compat(
 			(u64)__COMPAT_scx_bpf_cpu_node(home), 0);
+
+	/*
+	 * An idle CPU does not call dispatch() until something wakes it,
+	 * so the CPU this claim just shielded has to be woken once: a
+	 * task parked in its seat by an earlier claim would otherwise sit
+	 * there unwatched.
+	 */
+	scx_bpf_kick_cpu(home, SCX_KICK_IDLE);
+	if (sib >= 0)
+		scx_bpf_kick_cpu(sib, SCX_KICK_IDLE);
 	return true;
 }
 
@@ -1064,38 +1074,55 @@ __hidden __noinline bool pin_enqueue_pinned(struct task_struct *p,
 }
 
 /*
+ * Whether every CPU @p may run on is inside the shield. The byte array
+ * is the shield's authoritative record, so this predicate and the
+ * per-CPU test in is_cpu_shielded() can never disagree. The affinity
+ * width is a fast reject: a task allowed on more CPUs than the shield
+ * covers always has one outside it.
+ */
+__hidden __noinline bool pin_wholly_shielded(const struct task_struct *p)
+{
+	u32 shielded = READ_ONCE(pin_shield_n);
+	bool outside = false;
+	s32 cpu;
+
+	if (!shielded)
+		return false;
+	if ((u32)p->nr_cpus_allowed > shielded)
+		return false;
+
+	bpf_for(cpu, 0, nr_cpu_ids) {
+		if (bpf_cpumask_test_cpu(cpu, p->cpus_ptr) &&
+		    !pin_shield_cpu[(u32)cpu & (BABY_MAX_CPUS - 1)]) {
+			outside = true;
+			break;
+		}
+	}
+	return !outside;
+}
+
+/*
  * The stranded-arrival safety valve. Dispatch withholds the node queue
  * on a shielded CPU, so a task whose whole affinity lies inside the
  * shield can never be served from there: every CPU it is allowed on
  * refuses the queue, and no other CPU may run it. A single-CPU task is
- * the common case (a pinned kthread or a kcompactd), but a two-CPU
- * affinity covering one pin's home and sibling is just as stuck, and it
- * would wait until the watchdog unloaded the scheduler.
+ * the common case (a pinned kthread, or an engine thread the launcher
+ * bound to one CPU), but a two-CPU affinity covering one pin's home and
+ * sibling is just as stuck, and it would wait until the watchdog
+ * unloaded the scheduler.
  *
  * Park such a task in the seat of one of its own allowed CPUs instead:
  * every shielded CPU drains its two seats before it looks at the node
- * queue, so that is the one queue which always reaches it. Its affinity
- * width is not part of the test, only whether any allowed CPU is
- * outside the shield.
+ * queue, so that is the one queue which always reaches it.
  */
 __hidden __noinline bool pin_stranded_enqueue(struct task_struct *p,
 					      u64 enq_flags, u64 now)
 {
-	struct bpf_cpumask *mask = pin_worker_cpumask;
 	struct task_ctx *tctx;
 	u64 slice;
 	s32 only;
 
-	if (!READ_ONCE(pin_shield_n) || !mask)
-		return false;
-	/*
-	 * Width first: a task allowed on more CPUs than the shield covers
-	 * cannot be wholly inside it, and the common case answers without
-	 * a mask intersection.
-	 */
-	if ((u32)p->nr_cpus_allowed > READ_ONCE(pin_shield_n))
-		return false;
-	if (bpf_cpumask_intersects(p->cpus_ptr, cast_mask(mask)))
+	if (!pin_wholly_shielded(p))
 		return false;
 
 	only = scx_bpf_task_cpu(p);
@@ -1765,12 +1792,15 @@ void BPF_STRUCT_OPS(baby_enqueue, struct task_struct *p, u64 enq_flags)
 	/*
 	 * The task is placed without the wake side effect of
 	 * ops.select_cpu(), so wake the CPU that will pull it if idle. A
-	 * CPU the pin is shielding is not woken for work it will not be
-	 * served: the shield's dispatch withholds the node queue there.
+	 * CPU the pin is shielding is not woken for ordinary work it will
+	 * not be served, but a task that can run nowhere outside the
+	 * shield must still wake it: an idle CPU that is never kicked
+	 * never calls dispatch(), so it never looks at the seat the
+	 * arrival was parked in, and the task waits for the watchdog.
 	 */
 	if (!is_running && !__COMPAT_is_enq_cpu_selected(enq_flags) &&
 	    !(plain && game_pin && READ_ONCE(pin_shield_n) &&
-	      is_cpu_shielded(prev_cpu, now)))
+	      !pin_wholly_shielded(p) && is_cpu_shielded(prev_cpu, now)))
 		scx_bpf_kick_cpu(prev_cpu, SCX_KICK_IDLE);
 }
 
