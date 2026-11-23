@@ -48,6 +48,22 @@ const volatile bool plain_wake;
 const volatile bool plain_vtime;
 const volatile u64 vtime_lag_ns = 20000000ULL;
 
+/*
+ * The game pin (--game-pin). Userspace rewrites only game_pin,
+ * pin_grace_ns and pin_max; the rest are tuned here, where the
+ * comments in baby.bpf.h explain what each bar means.
+ */
+const volatile bool game_pin;
+const volatile u64 pin_grace_ns = 2000000ULL;
+const volatile u32 pin_max = 2;
+const volatile u32 pin_promote0 = 665;		/* ~65% of a core in 0..1024 */
+const volatile u32 pin_release0 = 500;		/* ~49% */
+const volatile u64 pin_stale_ns = 600ULL * NSEC_PER_MSEC;
+const volatile u32 pin_promote1 = 615;		/* ~60% */
+const volatile u32 pin_streak_need = 2;
+const volatile u32 pin_busy_max = 563;		/* 55% in q10 */
+const volatile u32 pin_challenger = 100;	/* ~10% */
+
 /* cosmos's MAX_WAKEUP_FREQ cap on the credit multiplier. */
 #define BABY_VTIME_WAKE_FREQ_MAX	1024
 
@@ -75,6 +91,44 @@ private(BABY) struct bpf_cpumask __kptr *little_cpumask;
  * affinity allows only LP cores.
  */
 private(BABY) struct bpf_cpumask __kptr *non_lp_cpumask;
+
+/*
+ * The game pin (--game-pin; the mechanism is described in baby.bpf.h).
+ *
+ * pin_slots holds the two claims. Its pid word is the claim word: 0 is
+ * free, a nonzero pid is the owner, and a takeover is an atomic CAS
+ * from the pid the reader saw. Nothing else is ever compare-exchanged,
+ * and every other field has its owner as its only writer, so no
+ * bpf_spin_lock is needed: a reader that matched the pid tolerates one
+ * field still carrying the previous owner's value.
+ *
+ * pin_shield_cpu[] is the hot-path copy of the slots' homes and
+ * siblings, because the dispatch, wake and enqueue paths ask about one
+ * CPU and a byte test beats a map lookup. It and the mask are rebuilt
+ * only when a slot changes (claim, takeover, release), never on the
+ * hot path. machine_busy_q10 is the sampled busy share of the machine
+ * that gates the second slot.
+ */
+struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__uint(max_entries, 2);
+	__type(key, u32);
+	__type(value, struct pin_slot);
+} pin_slots SEC(".maps");
+
+u8 pin_shield_cpu[BABY_MAX_CPUS];
+u32 pin_shield_n;
+volatile u32 machine_busy_q10;
+
+/*
+ * The CPUs a non-pinned task may be placed on while a pin is active:
+ * the non-LP set minus the shielded homes and siblings. Held as a
+ * cpumask because scx_bpf_select_cpu_and() takes the mask directly.
+ * Every CPU starts eligible; the tier syscall clears the LP ones, so
+ * without a pin claimed the mask is the non-LP set the plain selector
+ * already uses.
+ */
+private(BABY) struct bpf_cpumask __kptr *pin_worker_cpumask;
 
 /*
  * Saturation preemption: at full saturation a latency-critical waiter
@@ -466,6 +520,593 @@ __hidden s32 select_cpu_no_lp(struct task_struct *p, s32 prev_cpu,
 }
 
 /*
+ * Rebuild the shield state after a slot change: the mask the wake
+ * selector is restricted to, the per-CPU byte array the dispatch and
+ * enqueue paths test, and the count that gates them. Only a claim, a
+ * takeover or a release calls this; the hot paths read what it left.
+ *
+ * The mask is re-derived from non_lp_cpumask rather than set from
+ * zero, so the LP exclusion the tier masks encode survives a rebuild
+ * that re-admits a released home. Without tiers non_lp_cpumask is
+ * empty and every CPU stays eligible, which is what the plain
+ * selector would use.
+ */
+static __noinline void pin_mask_rebuild(void)
+{
+	struct bpf_cpumask *mask;
+	const struct cpumask *non_lp;
+	struct pin_slot *slot;
+	bool use_non_lp;
+	u32 key = 0, i;
+	s32 cpu;
+
+	bpf_rcu_read_lock();
+	mask = pin_worker_cpumask;
+	non_lp = cast_mask(non_lp_cpumask);
+	use_non_lp = non_lp && !bpf_cpumask_empty(non_lp);
+	if (mask) {
+		bpf_for(cpu, 0, nr_cpu_ids) {
+			if (!use_non_lp || bpf_cpumask_test_cpu(cpu, non_lp))
+				bpf_cpumask_set_cpu(cpu, mask);
+		}
+	}
+
+	for (i = 0; i < BABY_MAX_CPUS; i++)
+		pin_shield_cpu[i] = 0;
+	pin_shield_n = 0;
+
+	slot = bpf_map_lookup_elem(&pin_slots, &key);
+	if (slot && slot->pid) {
+		if (slot->home_cpu >= 0 && (u32)slot->home_cpu < nr_cpu_ids) {
+			pin_shield_cpu[(u32)slot->home_cpu &
+				       (BABY_MAX_CPUS - 1)] = 1;
+			pin_shield_n++;
+			if (mask)
+				bpf_cpumask_clear_cpu(slot->home_cpu, mask);
+		}
+		if (slot->sib_cpu >= 0 && (u32)slot->sib_cpu < nr_cpu_ids) {
+			pin_shield_cpu[(u32)slot->sib_cpu &
+				       (BABY_MAX_CPUS - 1)] = 1;
+			pin_shield_n++;
+			if (mask)
+				bpf_cpumask_clear_cpu(slot->sib_cpu, mask);
+		}
+	}
+
+	key = 1;
+	slot = bpf_map_lookup_elem(&pin_slots, &key);
+	if (slot && slot->pid) {
+		if (slot->home_cpu >= 0 && (u32)slot->home_cpu < nr_cpu_ids) {
+			pin_shield_cpu[(u32)slot->home_cpu &
+				       (BABY_MAX_CPUS - 1)] = 1;
+			pin_shield_n++;
+			if (mask)
+				bpf_cpumask_clear_cpu(slot->home_cpu, mask);
+		}
+		if (slot->sib_cpu >= 0 && (u32)slot->sib_cpu < nr_cpu_ids) {
+			pin_shield_cpu[(u32)slot->sib_cpu &
+				       (BABY_MAX_CPUS - 1)] = 1;
+			pin_shield_n++;
+			if (mask)
+				bpf_cpumask_clear_cpu(slot->sib_cpu, mask);
+		}
+	}
+	bpf_rcu_read_unlock();
+}
+
+/*
+ * Whether @cpu is a legal home for @p: allowed by its affinity, on the
+ * big set while a tier split uses one, and on a different physical
+ * core than @other_home (the first slot's home) when there is one.
+ * The topology cores are stored offset by one, so an unfilled entry
+ * compares unequal to nothing: two unfilled entries are both zero and
+ * fail the distinctness test, which is the conservative answer.
+ */
+static __noinline bool pin_cpu_usable(const struct task_struct *p, s32 cpu,
+				      s32 other_home)
+{
+	struct bpf_cpumask *big = big_cpumask;
+	u32 core, other;
+
+	if (cpu < 0 || (u32)cpu >= nr_cpu_ids)
+		return false;
+	if (!bpf_cpumask_test_cpu(cpu, p->cpus_ptr))
+		return false;
+	if (nr_big_cpus && big && !bpf_cpumask_empty(cast_mask(big)) &&
+	    !bpf_cpumask_test_cpu(cpu, cast_mask(big)))
+		return false;
+	if (other_home >= 0) {
+		core = topo_core[(u32)cpu & (BABY_MAX_CPUS - 1)];
+		other = topo_core[(u32)other_home & (BABY_MAX_CPUS - 1)];
+		if (core == other)
+			return false;
+	}
+	return true;
+}
+
+/*
+ * The home CPU of a fresh claim: the one the task is running on when
+ * it qualifies, otherwise the first that does. -1 when none does, and
+ * the claim is then not made.
+ */
+static __noinline s32 pin_home_pick(const struct task_struct *p,
+				    s32 other_home)
+{
+	s32 cpu = scx_bpf_task_cpu(p);
+
+	if (pin_cpu_usable(p, cpu, other_home))
+		return cpu;
+
+	bpf_for(cpu, 0, nr_cpu_ids) {
+		if (pin_cpu_usable(p, cpu, other_home))
+			return cpu;
+	}
+	return -1;
+}
+
+/*
+ * The share of the machine that is not idle, in q10. The stamp gate
+ * lets one CPU take the sample per 200ms window and makes every other
+ * caller read the value that one stored: the scan walks every CPU and
+ * every task that rolls a window at once would otherwise repeat it.
+ */
+static u64 pin_busy_at;
+
+static __noinline u32 pin_busy_sample(u64 now)
+{
+	const struct cpumask *idle, *non_lp;
+	u64 old = READ_ONCE(pin_busy_at);
+	u32 total = 0, nr_idle = 0, q10, prev;
+	bool use_non_lp;
+	s32 cpu;
+
+	if (now - old < TIME_PERIOD ||
+	    !__sync_bool_compare_and_swap(&pin_busy_at, old, now))
+		return READ_ONCE(machine_busy_q10);
+
+	bpf_rcu_read_lock();
+	non_lp = cast_mask(non_lp_cpumask);
+	use_non_lp = non_lp && !bpf_cpumask_empty(non_lp);
+	total = use_non_lp ? bpf_cpumask_weight(non_lp) : (u32)nr_cpu_ids;
+	idle = scx_bpf_get_idle_cpumask();
+	/*
+	 * Plain bounded loops, not bpf_for: the bound is the rodata CPU
+	 * count, so the verifier proves the induction variable directly.
+	 * An open-coded iterator also carries the scalars the body
+	 * writes, and this scan's idle count changes every iteration, so
+	 * its loop state never converges and the verifier walks it to
+	 * its state limit. Each arm is branch-free: a member test per
+	 * CPU would make every iteration a distinct state too.
+	 */
+	if (idle && use_non_lp) {
+		for (cpu = 0; cpu < (s32)nr_cpu_ids; cpu++)
+			nr_idle += (u32)bpf_cpumask_test_cpu(cpu, idle) &
+				   (u32)bpf_cpumask_test_cpu(cpu, non_lp);
+	} else if (idle) {
+		for (cpu = 0; cpu < (s32)nr_cpu_ids; cpu++)
+			nr_idle += bpf_cpumask_test_cpu(cpu, idle);
+	}
+	if (idle)
+		scx_bpf_put_cpumask(idle);
+	bpf_rcu_read_unlock();
+
+	if (!total)
+		return READ_ONCE(machine_busy_q10);
+
+	q10 = ((total - nr_idle) * 1024) / total;
+	prev = READ_ONCE(machine_busy_q10);
+	machine_busy_q10 = prev ? (3 * prev + q10 + 2) >> 2 : q10;
+	return machine_busy_q10;
+}
+
+/*
+ * Claim @slot for @p. A free slot is taken at once; a live one only by
+ * a task whose duty beats the owner's by the challenger margin, and a
+ * stale one by anyone. The CAS is what arbitrates between competing
+ * claimants: it must still hold the pid this reader saw, or the claim
+ * is lost and the caller stops.
+ */
+static __noinline bool pin_slot_take(struct pin_slot *slot,
+				     struct task_struct *p,
+				     struct task_ctx *tctx, u64 now,
+				     u32 busy, s32 other_home)
+{
+	u32 pid = (u32)p->pid;
+	u32 old = READ_ONCE(slot->pid);
+	s32 home, sib;
+
+	if (old == pid)
+		return false;
+	if (old != 0 &&
+	    now - READ_ONCE(slot->last_seen_ns) <= pin_stale_ns &&
+	    tctx->duty_q10 <= READ_ONCE(slot->duty_q10) + pin_challenger)
+		return false;
+
+	home = pin_home_pick(p, other_home);
+	if (home < 0)
+		return false;
+	sib = cpu_smt_sibling(home);
+
+	if (__sync_val_compare_and_swap(&slot->pid, old, pid) != old)
+		return false;
+
+	/*
+	 * The claim is ours; fill the rest. A reader that matched the pid
+	 * between the CAS and the stores may take one placement from the
+	 * old fields, which is why home_cpu is always a CPU id this
+	 * scheduler wrote and every reader bounds-checks it.
+	 */
+	slot->tgid = (u32)p->tgid;
+	slot->home_cpu = home;
+	slot->sib_cpu = sib;
+	slot->duty_q10 = tctx->duty_q10;
+	slot->busy_q10 = busy;
+	slot->core_id = topo_core[(u32)home & (BABY_MAX_CPUS - 1)];
+	slot->last_seen_ns = now;
+	slot->active_until = now + pin_grace_ns;
+	slot->nr_enq = 0;
+	slot->nr_dispatch = 0;
+
+	pin_mask_rebuild();
+	return true;
+}
+
+/*
+ * Try to give @p a slot. Slot 0 is open to any task over the promotion
+ * bar. Slot 1 is reserved for a second thread of the process that owns
+ * slot 0: a game's render thread and its submission thread are the
+ * pair, and letting two unrelated processes hold the slots would pin a
+ * helper over the game. The second claim also waits for the first
+ * thread's duty to hold across windows and for the machine to have
+ * headroom, so a saturated box does not spend two cores on one game.
+ */
+static __noinline void pin_try_promote(struct task_struct *p,
+				       struct task_ctx *tctx, u64 now)
+{
+	struct pin_slot *slot0, *slot1;
+	u32 busy, key = 0;
+	s32 other;
+
+	busy = pin_busy_sample(now);
+
+	slot0 = bpf_map_lookup_elem(&pin_slots, &key);
+	if (slot0 && pin_slot_take(slot0, p, tctx, now, busy, -1))
+		return;
+
+	if (pin_max < 2 || !slot0)
+		return;
+
+	key = 1;
+	slot1 = bpf_map_lookup_elem(&pin_slots, &key);
+	if (!slot1)
+		return;
+	if (!READ_ONCE(slot0->pid) ||
+	    READ_ONCE(slot0->tgid) != (u32)p->tgid ||
+	    tctx->pin_streak < pin_streak_need || busy > pin_busy_max)
+		return;
+
+	other = slot0->home_cpu;
+	pin_slot_take(slot1, p, tctx, now, busy, other);
+}
+
+/*
+ * Sample a closed 200ms window into the task's duty. Called from the
+ * tick right after the burst tracker rolls the window, so the sample
+ * is the runtime the task accumulated in the window that just closed;
+ * every tick inside a window returns on the stamp. The duty is the
+ * same 3:1 EWMA the wake rate uses, rounded up so a steady 65% reads
+ * the promotion bar exactly.
+ */
+__hidden __noinline void pin_account(struct task_struct *p,
+				     struct task_ctx *tctx, u64 now)
+{
+	struct pin_slot *slot;
+	u64 raw;
+	u32 duty, key = 0;
+
+	if (tctx->pin_window == tctx->start_time)
+		return;
+	tctx->pin_window = tctx->start_time;
+
+	raw = (tctx->prev_bursts * 1024) / TIME_PERIOD;
+	if (raw > 1024)
+		raw = 1024;
+	duty = tctx->duty_q10 ?
+	       (u32)((3 * tctx->duty_q10 + raw + 2) >> 2) : (u32)raw;
+	tctx->duty_q10 = duty;
+	tctx->pin_streak = duty >= pin_promote1 ?
+			   (u8)MIN((u32)tctx->pin_streak + 1, 255) : 0;
+
+	/*
+	 * The owner refreshes its slot, or gives it back once its duty
+	 * falls under the release bar. A duty of zero releases at once:
+	 * a task that has stopped using its window must not keep the
+	 * core, and the first sample of a task with no history is the
+	 * raw window rather than a blend, so the test binds from the
+	 * first window on.
+	 */
+	slot = bpf_map_lookup_elem(&pin_slots, &key);
+	if (!slot || slot->pid != (u32)p->pid) {
+		key = 1;
+		slot = bpf_map_lookup_elem(&pin_slots, &key);
+		if (!slot || slot->pid != (u32)p->pid)
+			slot = NULL;
+	}
+	if (slot) {
+		if (duty < pin_release0) {
+			__sync_val_compare_and_swap(&slot->pid, (u32)p->pid,
+						    0);
+			pin_mask_rebuild();
+		} else {
+			slot->duty_q10 = duty;
+			slot->last_seen_ns = now;
+			slot->active_until = now + pin_grace_ns;
+		}
+		return;
+	}
+
+	/*
+	 * The first sample of a task carries no history: the raw window
+	 * is its duty, so a thread that spent the window on the CPU
+	 * qualifies at once and one that did not cannot.
+	 */
+	if (duty >= pin_promote0)
+		pin_try_promote(p, tctx, now);
+}
+
+/*
+ * Whether @cpu is the home of @p's active slot.
+ */
+__hidden bool pin_owns_cpu(s32 cpu, const struct task_struct *p)
+{
+	struct pin_slot *slot;
+	u32 key = 0;
+
+	if (cpu < 0)
+		return false;
+
+	slot = bpf_map_lookup_elem(&pin_slots, &key);
+	if (slot && slot->pid == (u32)p->pid && slot->home_cpu == cpu)
+		return true;
+
+	key = 1;
+	slot = bpf_map_lookup_elem(&pin_slots, &key);
+	if (slot && slot->pid == (u32)p->pid && slot->home_cpu == cpu)
+		return true;
+	return false;
+}
+
+/*
+ * Whether @cpu must be kept for a pinned thread: it is a slot's home or
+ * SMT sibling and the slot's owner either stamped it inside the grace
+ * window or is running on the home CPU right now.
+ */
+__hidden __noinline bool is_cpu_shielded(s32 cpu, u64 now)
+{
+	struct task_struct *curr;
+	struct pin_slot *slot;
+	u32 key = 0;
+
+	if (cpu < 0 || (u32)cpu >= nr_cpu_ids)
+		return false;
+
+	slot = bpf_map_lookup_elem(&pin_slots, &key);
+	if (slot && slot->pid &&
+	    (slot->home_cpu == cpu || slot->sib_cpu == cpu)) {
+		if ((s64)(now - slot->active_until) <= 0)
+			return true;
+		curr = __COMPAT_scx_bpf_cpu_curr(slot->home_cpu);
+		if (curr && (u32)curr->pid == slot->pid)
+			return true;
+	}
+
+	key = 1;
+	slot = bpf_map_lookup_elem(&pin_slots, &key);
+	if (slot && slot->pid &&
+	    (slot->home_cpu == cpu || slot->sib_cpu == cpu)) {
+		if ((s64)(now - slot->active_until) <= 0)
+			return true;
+		curr = __COMPAT_scx_bpf_cpu_curr(slot->home_cpu);
+		if (curr && (u32)curr->pid == slot->pid)
+			return true;
+	}
+	return false;
+}
+
+/*
+ * Whether @pid owns either slot. The preempt path uses it to leave
+ * another pinned thread alone: two pinned threads must not evict each
+ * other, or the pair ping-pongs its two cores.
+ */
+static __noinline bool pin_pid_active(u32 pid)
+{
+	struct pin_slot *slot;
+	u32 key = 0;
+
+	if (!pid)
+		return false;
+
+	slot = bpf_map_lookup_elem(&pin_slots, &key);
+	if (slot && slot->pid == pid)
+		return true;
+	key = 1;
+	slot = bpf_map_lookup_elem(&pin_slots, &key);
+	return slot && slot->pid == pid;
+}
+
+/*
+ * Place a pinned arrival on its home CPU, ahead of every shared queue:
+ * an idle home takes it directly, a home that runs a cuttable task is
+ * preempted, and anything else parks in the home's own seat, whose
+ * dispatch drains it first. The slot is stamped here so a burst of
+ * arrivals keeps the grace window open without the tick.
+ */
+__hidden __noinline bool pin_enqueue_pinned(struct task_struct *p,
+					    struct task_ctx *tctx,
+					    u64 enq_flags, u64 now)
+{
+	struct task_struct *curr;
+	struct pin_slot *slot;
+	bool is_running = scx_bpf_task_running(p);
+	u64 slice = tctx ? task_slice(tctx) : deadline_ns;
+	u32 key = 0, pid = (u32)p->pid;
+	s32 home;
+
+	slot = bpf_map_lookup_elem(&pin_slots, &key);
+	if (!slot || slot->pid != pid) {
+		key = 1;
+		slot = bpf_map_lookup_elem(&pin_slots, &key);
+		if (!slot || slot->pid != pid)
+			return false;
+	}
+
+	/*
+	 * A home the task's affinity no longer allows is not a
+	 * placement: fall back to the shared queue and let the next
+	 * window drop the slot.
+	 */
+	home = slot->home_cpu;
+	if (home < 0 || (u32)home >= nr_cpu_ids ||
+	    !bpf_cpumask_test_cpu(home, p->cpus_ptr))
+		return false;
+
+	slot->active_until = now + pin_grace_ns;
+	__sync_fetch_and_add(&slot->nr_enq, 1);
+
+	if (!is_running && !__COMPAT_is_enq_cpu_selected(enq_flags) &&
+	    scx_bpf_test_and_clear_cpu_idle(home)) {
+		scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL_ON | home, slice,
+				   enq_flags);
+		scx_bpf_kick_cpu(home, SCX_KICK_IDLE);
+		return true;
+	}
+
+	if (!scx_bpf_dsq_nr_queued(SCX_DSQ_LOCAL_ON | home)) {
+		curr = __COMPAT_scx_bpf_cpu_curr(home);
+		if (curr && curr != p && !(curr->flags & PF_IDLE) &&
+		    !is_pcpu_task(curr) && !pin_pid_active((u32)curr->pid)) {
+			scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL_ON | home, slice,
+					   enq_flags | SCX_ENQ_PREEMPT);
+			return true;
+		}
+	}
+
+	scx_bpf_dsq_insert(p, fl_cpu2dsq(home), slice, enq_flags);
+	scx_bpf_kick_cpu(home, SCX_KICK_IDLE | SCX_KICK_PREEMPT);
+	return true;
+}
+
+/*
+ * The single-CPU safety valve: a task whose only CPU is shielded can
+ * never be served from the node queue (dispatch withholds it there), so
+ * park it in that CPU's own seat, which the shield's dispatch drains
+ * first. Such a task is outside the pin's contract - it is not one of
+ * the two threads - but it must not be stranded by it.
+ */
+__hidden __noinline bool pin_pcpu_enqueue(struct task_struct *p, u64 now)
+{
+	struct task_ctx *tctx;
+	u64 slice;
+	s32 only;
+
+	if (!is_pcpu_task(p))
+		return false;
+
+	only = is_migration_disabled(p) ? scx_bpf_task_cpu(p) :
+					  (s32)bpf_cpumask_first(p->cpus_ptr);
+	if ((u32)only >= nr_cpu_ids ||
+	    !bpf_cpumask_test_cpu(only, p->cpus_ptr) ||
+	    !is_cpu_shielded(only, now))
+		return false;
+
+	tctx = try_lookup_task_ctx(p);
+	slice = tctx ? task_slice(tctx) : deadline_ns;
+	scx_bpf_dsq_insert(p, cpu2dsq(only), slice, 0);
+	scx_bpf_kick_cpu(only, SCX_KICK_IDLE);
+	return true;
+}
+
+/*
+ * The wake path of a pinned thread: home if it is idle, and the home
+ * as the placement either way. A busy home is left untouched here; the
+ * enqueue that follows decides between the direct preempt and the
+ * home's seat, and the selector never spreads a pinned thread off its
+ * core in the meantime.
+ */
+__hidden __noinline bool pin_select_pinned(struct task_struct *p,
+					   struct task_ctx *tctx,
+					   s32 prev_cpu, u64 now,
+					   s32 *out_cpu)
+{
+	struct pin_slot *slot;
+	u32 key = 0, pid = (u32)p->pid;
+	s32 home;
+
+	slot = bpf_map_lookup_elem(&pin_slots, &key);
+	if (!slot || slot->pid != pid) {
+		key = 1;
+		slot = bpf_map_lookup_elem(&pin_slots, &key);
+		if (!slot || slot->pid != pid)
+			return false;
+	}
+
+	home = slot->home_cpu;
+	if (home < 0 || (u32)home >= nr_cpu_ids ||
+	    !bpf_cpumask_test_cpu(home, p->cpus_ptr))
+		return false;
+
+	slot->active_until = now + pin_grace_ns;
+
+	if (scx_bpf_test_and_clear_cpu_idle(home)) {
+		scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, task_slice(tctx), 0);
+		if (stats_enabled)
+			__sync_fetch_and_add(&nr_direct_dispatches, 1);
+	}
+	*out_cpu = home;
+	return true;
+}
+
+/*
+ * The wake selector while a shield is up: the kernel selector runs on
+ * the pin worker mask, and when it finds no idle CPU the fallback is
+ * the plain one except that a shielded CPU is never handed a
+ * non-pinned wake. Only the last resort may still return one, because
+ * every allowed CPU being shielded means the task can run nowhere
+ * else and idling it would be worse.
+ */
+__hidden __noinline s32 pin_select_cpu_and(struct task_struct *p, s32 prev_cpu,
+					   u64 wake_flags)
+{
+	struct bpf_cpumask *mask = pin_worker_cpumask;
+	struct task_ctx *tctx;
+	u64 now;
+	s32 cpu = -1;
+
+	if (mask && !bpf_cpumask_empty(cast_mask(mask)))
+		cpu = scx_bpf_select_cpu_and(p, prev_cpu, wake_flags,
+					     cast_mask(mask), 0);
+	if (cpu >= 0) {
+		tctx = try_lookup_task_ctx(p);
+		if (stats_enabled)
+			__sync_fetch_and_add(
+				&nr_wake_land[cpu_dist(prev_cpu, cpu)], 1);
+		scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL,
+				   tctx ? task_slice(tctx) : deadline_ns, 0);
+		if (stats_enabled)
+			__sync_fetch_and_add(&nr_direct_dispatches, 1);
+		return cpu;
+	}
+
+	now = bpf_ktime_get_ns();
+	bpf_for(cpu, 0, nr_cpu_ids) {
+		if (bpf_cpumask_test_cpu(cpu, p->cpus_ptr) &&
+		    !is_cpu_shielded(cpu, now))
+			return cpu;
+	}
+	return any_allowed_cpu(p, prev_cpu);
+}
+
+/*
  * Pick a target CPU for a waking task and dispatch it straight to the
  * pick when that CPU is idle. Placement is delegated to the kernel's
  * idle-CPU selection: SMT-aware, previous-CPU biased and spread across
@@ -493,6 +1134,17 @@ s32 BPF_STRUCT_OPS(baby_select_cpu, struct task_struct *p,
 		tctx->wake_gate_miss = BABY_WG_NO_GATE;
 		roll_burst_window(tctx, now);
 	}
+
+	/*
+	 * A pinned thread wakes straight onto its own core: the slot
+	 * survives the short sleeps between frames, and while the home
+	 * is busy the wake is placed there instead of being spread. The
+	 * pin parks the task without touching a queue in that case, and
+	 * the enqueue that follows decides how the home is taken.
+	 */
+	if (game_pin && tctx &&
+	    pin_select_pinned(p, tctx, prev_cpu, now, &cpu))
+		return cpu;
 
 	/*
 	 * Don't trust the sync hint: a waker that keeps running after the
@@ -625,6 +1277,17 @@ s32 BPF_STRUCT_OPS(baby_select_cpu, struct task_struct *p,
 			}
 		}
 	}
+
+	/*
+	 * While a pin shield holds a core, the wake selector must not
+	 * hand a non-pinned task that core. The kernel selector runs on
+	 * the pin worker mask, which is the non-LP set minus the
+	 * shielded homes and siblings, and the fallback scan keeps off
+	 * them too. That path dispatches to its own idle pick, so the
+	 * is_idle handling below belongs to runs without a pin.
+	 */
+	if (plain && game_pin && READ_ONCE(pin_shield_n))
+		return pin_select_cpu_and(p, prev_cpu, wake_flags);
 
 	cpu = pick_idle_cpu(p, prev_cpu, wake_flags, &is_idle);
 	if (is_idle) {
@@ -865,6 +1528,18 @@ void BPF_STRUCT_OPS(baby_enqueue, struct task_struct *p, u64 enq_flags)
 	}
 
 	/*
+	 * A pinned arrival goes to its own core before the idle scan:
+	 * the core is the placement, and try_direct_dispatch() would
+	 * spread the task to the first idle CPU instead. A single-CPU
+	 * task whose only CPU is shielded parks in that CPU's seat, so
+	 * it can never wait in the node queue behind the shield.
+	 */
+	if (plain && game_pin &&
+	    (pin_enqueue_pinned(p, tctx, enq_flags, now) ||
+	     pin_pcpu_enqueue(p, now)))
+		return;
+
+	/*
 	 * Place the arrival before considering a preemption.
 	 *
 	 * A wakee that can run now on a CPU that went idle since
@@ -1002,9 +1677,12 @@ void BPF_STRUCT_OPS(baby_enqueue, struct task_struct *p, u64 enq_flags)
 
 	/*
 	 * The task is placed without the wake side effect of
-	 * ops.select_cpu(), so wake the CPU that will pull it if idle.
+	 * ops.select_cpu(), so wake the CPU that will pull it if idle. A
+	 * CPU the pin is shielding is not woken for work it will not be
+	 * served: the shield's dispatch withholds the node queue there.
 	 */
-	if (!is_running && !__COMPAT_is_enq_cpu_selected(enq_flags))
+	if (!is_running && !__COMPAT_is_enq_cpu_selected(enq_flags) &&
+	    !(plain && game_pin && is_cpu_shielded(prev_cpu, now)))
 		scx_bpf_kick_cpu(prev_cpu, SCX_KICK_IDLE);
 }
 
@@ -1058,17 +1736,44 @@ void BPF_STRUCT_OPS(baby_dispatch, s32 cpu, struct task_struct *prev)
 	 * full dispatcher performs without any of its placement rules.
 	 */
 	if (plain) {
-		if (scx_bpf_dsq_move_to_local(node, 0))
+		bool pinned = false;
+
+		/*
+		 * Game pin: the pinned thread's home is drained first -
+		 * its own seat holds the arrivals the pin parked there -
+		 * and the node queue is pulled only when this CPU is not
+		 * shielding a core. A pinned prev keeps running without
+		 * the node pull ahead of it.
+		 */
+		if (game_pin) {
+			if (scx_bpf_dsq_move_to_local(cpu2dsq(cpu), 0))
+				return;
+			if (scx_bpf_dsq_move_to_local(fl_cpu2dsq(cpu), 0)) {
+				seat_service_at[1][idx] = now;
+				return;
+			}
+			pinned = need_running && prev &&
+				 pin_owns_cpu(cpu, prev);
+			if (!pinned) {
+				if (is_cpu_shielded(cpu, now)) {
+					need_running = false;
+				} else if (scx_bpf_dsq_move_to_local(node, 0)) {
+					return;
+				}
+			}
+		} else if (scx_bpf_dsq_move_to_local(node, 0)) {
 			return;
+		}
 
 		/*
 		 * --plain-vtime refuses in-place renewal on a contended
 		 * SMT core, as cosmos's keep_running does, unless the task
 		 * can only run here: a pinned task would come straight back
-		 * to the same half core.
+		 * to the same half core. A game-pinned prev is exempt: the
+		 * core is held for it.
 		 */
-		if (plain_vtime && need_running && !is_pcpu_task(prev) &&
-		    cpu_smt_shared(cpu))
+		if (plain_vtime && need_running && !pinned &&
+		    !is_pcpu_task(prev) && cpu_smt_shared(cpu))
 			need_running = false;
 
 		if (!need_running) {
@@ -1522,6 +2227,14 @@ void BPF_STRUCT_OPS(baby_tick, struct task_struct *p)
 
 	update_bursts(tctx, now);
 
+	/*
+	 * The game pin samples the window the burst tracker just rolled:
+	 * inside a window this returns on the stamp, so the tick pays
+	 * nothing until the next 200ms boundary.
+	 */
+	if (game_pin)
+		pin_account(p, tctx, now);
+
 	cpuperf_on_tick(p, now,
 			is_heavy_proven(tctx) || is_foreground(tctx));
 
@@ -1939,7 +2652,7 @@ static int rescue_timerfn(void *map, int *key, struct bpf_timer *timer)
 	s32 node, cpu;
 	int err;
 
-	if (!plain && __COMPAT_has_generic_reenq()) {
+	if ((!plain || game_pin) && __COMPAT_has_generic_reenq()) {
 		bpf_for(cpu, 0, nr_cpu_ids) {
 			u32 idx = (u32)cpu & (BABY_MAX_CPUS - 1);
 
@@ -1950,12 +2663,19 @@ static int rescue_timerfn(void *map, int *key, struct bpf_timer *timer)
 					   seat_service_at[1][idx], now))
 				seat_used[1][idx] = 0;
 		}
-		bpf_for(node, 0, nr_node_ids) {
-			u32 idx = (u32)node & (BABY_NODE_CLOCK_NR - 1);
+		/*
+		 * The node queues exist only outside plain mode. A plain
+		 * run with a pin rescues just the two seat queues the pin
+		 * uses; its node queue is rescued by nothing, as before.
+		 */
+		if (!plain) {
+			bpf_for(node, 0, nr_node_ids) {
+				u32 idx = (u32)node & (BABY_NODE_CLOCK_NR - 1);
 
-			rescue_one_dsq(node, node_service_at[0][idx], now);
-			rescue_one_dsq(fl_node2dsq(node),
-				       node_service_at[1][idx], now);
+				rescue_one_dsq(node, node_service_at[0][idx], now);
+				rescue_one_dsq(fl_node2dsq(node),
+					       node_service_at[1][idx], now);
+			}
 		}
 	}
 
@@ -1968,6 +2688,7 @@ static int rescue_timerfn(void *map, int *key, struct bpf_timer *timer)
 
 s32 BPF_STRUCT_OPS_SLEEPABLE(baby_init)
 {
+	struct bpf_cpumask *mask;
 	struct bpf_timer *timer;
 	u32 key = 0;
 	s32 node, cpu, err;
@@ -2028,6 +2749,25 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(baby_init)
 		}
 	}
 
+	/*
+	 * The pin's placement mask starts with every CPU eligible. The
+	 * tier syscall clears the LP bits afterwards, so with no pin
+	 * claimed the mask ends up as the non-LP set the plain selector
+	 * already uses, and shields only ever subtract from it.
+	 */
+	if (game_pin) {
+		err = init_cpumask(&pin_worker_cpumask);
+		if (err)
+			return err;
+		bpf_rcu_read_lock();
+		mask = pin_worker_cpumask;
+		if (mask) {
+			bpf_for(cpu, 0, nr_cpu_ids)
+				bpf_cpumask_set_cpu(cpu, mask);
+		}
+		bpf_rcu_read_unlock();
+	}
+
 	timer = bpf_map_lookup_elem(&rescue_timer, &key);
 	if (!timer) {
 		scx_bpf_error("failed to lookup rescue timer");
@@ -2085,6 +2825,19 @@ int enable_core_class(struct core_arg *input)
 		mask = non_lp_cpumask;
 		if (mask)
 			bpf_cpumask_set_cpu(cpu, mask);
+	}
+	/*
+	 * The pin's mask mirrors the non-LP set; a pin only ever clears
+	 * its shielded homes and siblings from it.
+	 */
+	if (game_pin) {
+		mask = pin_worker_cpumask;
+		if (mask) {
+			if (tier == CORE_TIER_LP)
+				bpf_cpumask_clear_cpu(cpu, mask);
+			else
+				bpf_cpumask_set_cpu(cpu, mask);
+		}
 	}
 	if (tier == CORE_TIER_BIG)
 		mask = big_cpumask;

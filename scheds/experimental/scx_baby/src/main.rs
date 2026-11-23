@@ -249,6 +249,33 @@ struct Opts {
     #[clap(long, default_value = "20000")]
     vtime_lag_us: u64,
 
+    /// Native SMT-pair pin for the gaming queue. Requires
+    /// --game/--plain-vtime: the two busiest threads of one process
+    /// each keep a physical core to themselves, so a game's render and
+    /// submission threads do not wait behind helpers on their cores.
+    #[clap(long, action = clap::ArgAction::SetTrue)]
+    game_pin: bool,
+
+    /// Grace window of --game-pin, in microseconds: how long a pinned
+    /// thread's core stays reserved after its last wake or enqueue, so
+    /// the short sleeps between frames do not hand the core away.
+    #[clap(
+        long,
+        default_value = "2000",
+        value_parser = clap::value_parser!(u64).range(0..=1_000_000)
+    )]
+    pin_grace_us: u64,
+
+    /// Pin slots: 1 keeps one core for the busiest thread of the game,
+    /// 2 also holds a second core for another thread of the same
+    /// process once the first has proven its duty.
+    #[clap(
+        long,
+        default_value = "2",
+        value_parser = clap::value_parser!(u32).range(1..=2)
+    )]
+    pin_max: u32,
+
     /// Enable stats monitoring with the specified interval.
     #[clap(long)]
     stats: Option<f64>,
@@ -290,6 +317,7 @@ struct Mode {
     plain_1x: bool,
     plain_wake: bool,
     plain_vtime: bool,
+    game_pin: bool,
 }
 
 /// The `-d` defaults: the original DEADLINE_NS, and the gaming slice.
@@ -307,18 +335,22 @@ impl Mode {
 
         /*
          * Each plain variant implies --plain, and --plain-wake and
-         * --plain-vtime both imply --plain-1x.
+         * --plain-vtime both imply --plain-1x. The game pin is an
+         * overlay on the plain queue only: without it every pin
+         * branch stays dead in the BPF program.
          */
         let plain_vtime = opts.plain_vtime || gaming;
         let plain_1x = opts.plain_1x || opts.plain_wake || plain_vtime;
+        let plain = opts.plain || plain_1x;
 
         Self {
             gaming,
             deadline_us,
-            plain: opts.plain || plain_1x,
+            plain,
             plain_1x,
             plain_wake: opts.plain_wake,
             plain_vtime,
+            game_pin: opts.game_pin && plain,
         }
     }
 }
@@ -471,6 +503,14 @@ impl<'a> Scheduler<'a> {
         rodata.plain_1x = mode.plain_1x;
         rodata.plain_wake = mode.plain_wake;
         rodata.plain_vtime = mode.plain_vtime;
+        /*
+         * The pin is a plain-queue overlay: userspace resolves it to
+         * false unless the plain virtual-time queue is selected, and
+         * the BPF branches below it are verifier-pruned when it is.
+         */
+        rodata.game_pin = mode.game_pin;
+        rodata.pin_grace_ns = opts.pin_grace_us * 1000;
+        rodata.pin_max = opts.pin_max;
         /* 1 s bounds the BPF-side product (lag * freq cap * weight). */
         let vtime_lag_ns = opts.vtime_lag_us.min(1_000_000) * 1000;
         rodata.vtime_lag_ns = vtime_lag_ns;
@@ -482,6 +522,12 @@ impl<'a> Scheduler<'a> {
                 "plain virtual time: node queues keyed by weighted runtime, \
                  credit window {}us",
                 vtime_lag_ns / 1000
+            );
+        }
+        if mode.game_pin {
+            info!(
+                "game pin: {} slot(s), grace {}us",
+                opts.pin_max, opts.pin_grace_us
             );
         }
 
@@ -712,6 +758,12 @@ fn main() -> Result<()> {
             mode.deadline_us
         );
     }
+    if opts.game_pin && !mode.plain {
+        warn!(
+            "--game-pin needs the plain virtual-time queue (--game or \
+             --plain-vtime), ignoring it"
+        );
+    }
 
     let shutdown = Arc::new(AtomicBool::new(false));
     let shutdown_clone = shutdown.clone();
@@ -815,6 +867,45 @@ mod tests {
         assert!(!bench.gaming);
         assert!(bench.plain_vtime);
         assert_eq!(bench.deadline_us, 800);
+    }
+
+    /// The pin knobs bind their ranges at parse time: at most two slots
+    /// (the SMT pair) and a grace window the BPF side sees in
+    /// nanoseconds.
+    #[test]
+    fn pin_knobs_reject_out_of_range_values() {
+        assert!(Opts::try_parse_from(["scx_baby", "--pin-max", "0"]).is_err());
+        assert!(Opts::try_parse_from(["scx_baby", "--pin-max", "3"]).is_err());
+        assert!(Opts::try_parse_from(["scx_baby", "--pin-grace-us", "1000001"]).is_err());
+
+        let one = Opts::try_parse_from(["scx_baby", "--pin-max", "1"]).unwrap();
+        assert_eq!(one.pin_max, 1);
+        let two = Opts::try_parse_from(["scx_baby", "--pin-max", "2"]).unwrap();
+        assert_eq!(two.pin_max, 2);
+        assert_eq!(two.pin_grace_us, 2000);
+    }
+
+    /// --game-pin is an overlay on the plain virtual-time queue: alone
+    /// it resolves to false, with --game it arms, and the default
+    /// profile keeps its old resolution.
+    #[test]
+    fn game_pin_arms_only_on_the_plain_queue() {
+        let alone = Mode::from_opts(&Opts::try_parse_from(["scx_baby", "--game-pin"]).unwrap());
+        assert!(!alone.plain);
+        assert!(!alone.game_pin);
+
+        let game =
+            Mode::from_opts(&Opts::try_parse_from(["scx_baby", "--game", "--game-pin"]).unwrap());
+        assert!(game.plain && game.plain_vtime);
+        assert!(game.game_pin);
+
+        let bench = Mode::from_opts(
+            &Opts::try_parse_from(["scx_baby", "--plain-vtime", "--game-pin"]).unwrap(),
+        );
+        assert!(bench.plain_vtime && bench.game_pin);
+
+        let default = Mode::from_opts(&Opts::try_parse_from(["scx_baby"]).unwrap());
+        assert!(!default.plain && !default.game_pin);
     }
 
     /// Test-only mirror of the wake-rate blend and peak gate in
@@ -969,15 +1060,17 @@ mod tests {
     // scheduler. The topology counts are rodata, so the BPF loops and
     // bounds checks are verified against the synthetic width too, and
     // both hybrid-gate arms are exercised by publishing a tier split
-    // for every shape. The plain flags are rodata as well, so each
-    // shape is loaded once per reachable flag combination, with the
-    // rodata production sets for it: a branch the verifier prunes when
-    // the flag is off is still checked when it is on.
+    // for every shape. The plain flags and the game pin are rodata as
+    // well, so each shape is loaded once per reachable flag
+    // combination, with the rodata production sets for it: a branch the
+    // verifier prunes when the flag is off is still checked when it is
+    // on.
     fn load_synthetic(
         nr_cpus: usize,
         plain: bool,
         plain_wake: bool,
         plain_vtime: bool,
+        game_pin: bool,
     ) -> anyhow::Result<()> {
         let mut object = MaybeUninit::uninit();
         let builder = BpfSkelBuilder::default();
@@ -995,6 +1088,9 @@ mod tests {
         ro.plain_1x = plain_wake || plain_vtime;
         ro.plain_wake = plain_wake;
         ro.plain_vtime = plain_vtime;
+        ro.game_pin = game_pin;
+        ro.pin_grace_ns = 2_000_000;
+        ro.pin_max = 2;
         ro.vtime_lag_ns = 20_000_000;
         for cpu in 0..nr_cpus.min(ro.topo_node.len()) {
             // Two node-ish halves, eight LLCs, per-pair L2 groups
@@ -1018,18 +1114,21 @@ mod tests {
         })));
 
         let mut failures = Vec::new();
-        for (plain, plain_wake, plain_vtime) in [
-            (false, false, false),
-            (true, false, false),
-            (true, true, false),
-            (true, false, true),
-            (true, true, true),
+        for (plain, plain_wake, plain_vtime, game_pin) in [
+            (false, false, false, false),
+            (true, false, false, false),
+            (true, true, false, false),
+            (true, false, true, false),
+            (true, true, true, false),
+            (true, false, true, true),
         ] {
             for nr_cpus in [1usize, 14, 128] {
-                if let Err(error) = load_synthetic(nr_cpus, plain, plain_wake, plain_vtime) {
+                if let Err(error) =
+                    load_synthetic(nr_cpus, plain, plain_wake, plain_vtime, game_pin)
+                {
                     failures.push(format!(
                         "{nr_cpus} CPUs plain={plain} wake={plain_wake} \
-                         vtime={plain_vtime}: {error:#}"
+                         vtime={plain_vtime} pin={game_pin}: {error:#}"
                     ));
                 }
             }
