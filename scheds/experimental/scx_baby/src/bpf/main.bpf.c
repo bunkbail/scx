@@ -991,8 +991,15 @@ __hidden __noinline bool pin_enqueue_pinned(struct task_struct *p,
 		}
 	}
 
+	/*
+	 * The home runs a task the direct preempt could not displace,
+	 * so the arrival waits in the home's own seat until the home
+	 * reschedules. PREEMPT alone forces that; SCX_KICK_IDLE is
+	 * mutually exclusive with it and setting both aborts the
+	 * scheduler.
+	 */
 	scx_bpf_dsq_insert(p, fl_cpu2dsq(home), slice, enq_flags);
-	scx_bpf_kick_cpu(home, SCX_KICK_IDLE | SCX_KICK_PREEMPT);
+	scx_bpf_kick_cpu(home, SCX_KICK_PREEMPT);
 	return true;
 }
 
