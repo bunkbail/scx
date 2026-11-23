@@ -54,7 +54,7 @@ const volatile u64 vtime_lag_ns = 20000000ULL;
  * comments in baby.bpf.h explain what each bar means.
  */
 const volatile bool game_pin;
-const volatile u64 pin_grace_ns = 2000000ULL;
+const volatile u64 pin_grace_ns = 20000000ULL;
 const volatile u32 pin_max = 2;
 const volatile u32 pin_promote0 = 665;		/* ~65% of a core in 0..1024 */
 const volatile u32 pin_release0 = 500;		/* ~49% */
@@ -788,13 +788,16 @@ static __noinline bool pin_slot_take(struct pin_slot *slot,
 }
 
 /*
- * Try to give @p a slot. Slot 0 is open to any task over the promotion
- * bar. Slot 1 is reserved for a second thread of the process that owns
- * slot 0: a game's render thread and its submission thread are the
- * pair, and letting two unrelated processes hold the slots would pin a
- * helper over the game. The second claim also waits for the first
- * thread's duty to hold across windows and for the machine to have
- * headroom, so a saturated box does not spend two cores on one game.
+ * Try to give @p a slot. Slot 0 goes to a task over the promotion bar
+ * whose duty has held across pin_streak_need windows: two windows at
+ * pin_promote1 is 400 ms of sustained 60% duty, so a one-window
+ * plasmashell spike cannot claim a core. Slot 1 is reserved for a
+ * second thread of the process that owns slot 0: a game's render
+ * thread and its submission thread are the pair, and letting two
+ * unrelated processes hold the slots would pin a helper over the game.
+ * The second claim also waits for the first thread's duty to hold
+ * across windows and for the machine to have headroom, so a saturated
+ * box does not spend two cores on one game.
  */
 static __noinline void pin_try_promote(struct task_struct *p,
 				       struct task_ctx *tctx, u64 now)
@@ -817,7 +820,8 @@ static __noinline void pin_try_promote(struct task_struct *p,
 	 * other.
 	 */
 	other = (slot1 && READ_ONCE(slot1->pid)) ? slot1->home_cpu : -1;
-	if (slot0 && pin_slot_take(slot0, p, tctx, now, busy, other))
+	if (slot0 && tctx->pin_streak >= pin_streak_need &&
+	    pin_slot_take(slot0, p, tctx, now, busy, other))
 		return;
 
 	if (pin_max < 2 || !slot0 || !slot1)
@@ -913,6 +917,27 @@ __hidden __noinline void pin_account(struct task_struct *p,
 	 */
 	if (duty >= pin_promote0)
 		pin_try_promote(p, tctx, now);
+}
+
+/*
+ * Restart the grace window of a slot this task owns. ops.stopping() is
+ * the instant the task leaves the CPU, so this is where a 20 ms window
+ * that must cover an inter-frame gap has to start; the enqueue and wake
+ * stamps that follow keep it open while the thread is busy.
+ */
+__hidden __noinline void pin_stopping_stamp(struct task_struct *p, u64 now)
+{
+	struct pin_slot *slot;
+	u32 key = 0, pid = (u32)p->pid;
+
+	slot = bpf_map_lookup_elem(&pin_slots, &key);
+	if (slot && READ_ONCE(slot->pid) == pid)
+		slot->active_until = now + pin_grace_ns;
+
+	key = 1;
+	slot = bpf_map_lookup_elem(&pin_slots, &key);
+	if (slot && READ_ONCE(slot->pid) == pid)
+		slot->active_until = now + pin_grace_ns;
 }
 
 /*
@@ -2544,6 +2569,8 @@ void BPF_STRUCT_OPS(baby_stopping, struct task_struct *p, bool runnable)
 	last_cpu = (tctx && tctx->last_cpu >= 0) ? tctx->last_cpu :
 						  scx_bpf_task_cpu(p);
 	now = bpf_ktime_get_ns();
+	if (plain && game_pin && READ_ONCE(pin_shield_n))
+		pin_stopping_stamp(p, now);
 	{
 		u32 idx = (u32)last_cpu & (BABY_MAX_CPUS - 1);
 

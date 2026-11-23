@@ -257,11 +257,13 @@ struct Opts {
     game_pin: bool,
 
     /// Grace window of --game-pin, in microseconds: how long a pinned
-    /// thread's core stays reserved after its last wake or enqueue, so
-    /// the short sleeps between frames do not hand the core away.
+    /// thread's core stays reserved after it leaves the CPU or is
+    /// enqueued. It has to span the gap between two frames, not one
+    /// frame, or a thread that sleeps through a whole frame hands the
+    /// core away and pays a migration on every wake.
     #[clap(
         long,
-        default_value = "2000",
+        default_value = "20000",
         value_parser = clap::value_parser!(u64).range(0..=1_000_000)
     )]
     pin_grace_us: u64,
@@ -882,7 +884,7 @@ mod tests {
         assert_eq!(one.pin_max, 1);
         let two = Opts::try_parse_from(["scx_baby", "--pin-max", "2"]).unwrap();
         assert_eq!(two.pin_max, 2);
-        assert_eq!(two.pin_grace_us, 2000);
+        assert_eq!(two.pin_grace_us, 20000);
     }
 
     /// --game-pin is an overlay on the plain virtual-time queue: alone
@@ -1089,7 +1091,7 @@ mod tests {
         ro.plain_wake = plain_wake;
         ro.plain_vtime = plain_vtime;
         ro.game_pin = game_pin;
-        ro.pin_grace_ns = 2_000_000;
+        ro.pin_grace_ns = 20_000_000;
         ro.pin_max = 2;
         ro.vtime_lag_ns = 20_000_000;
         for cpu in 0..nr_cpus.min(ro.topo_node.len()) {

@@ -969,6 +969,7 @@ extern volatile u32 machine_busy_q10;
  */
 __hidden void pin_account(struct task_struct *p, struct task_ctx *tctx,
 			  u64 now);
+__hidden void pin_stopping_stamp(struct task_struct *p, u64 now);
 __hidden bool pin_enqueue_pinned(struct task_struct *p, struct task_ctx *tctx,
 				 u64 enq_flags, u64 now);
 __hidden bool pin_select_pinned(struct task_struct *p, struct task_ctx *tctx,
