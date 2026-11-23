@@ -29,8 +29,19 @@ __hidden s32 pick_idle_cpu(struct task_struct *p, s32 prev_cpu,
 	}
 
 	cpu = select_cpu_no_lp(p, prev_cpu, wake_flags);
-	if (cpu < 0)
+	if (cpu < 0) {
+		/*
+		 * Under a shield the selector ran on the pin worker mask
+		 * only, so there is no idle pick to confirm. Falling back
+		 * to the task's own affinity here would name a home or
+		 * sibling the shield owns, and the caller would dispatch
+		 * onto it. Leave *is_idle false and let ops.enqueue()
+		 * place the task.
+		 */
+		if (plain && game_pin && READ_ONCE(pin_shield_n))
+			return -1;
 		return any_allowed_cpu(p, prev_cpu);
+	}
 
 	*is_idle = true;
 

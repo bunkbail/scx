@@ -503,12 +503,20 @@ __hidden s32 select_cpu_no_lp(struct task_struct *p, s32 prev_cpu,
 	s32 cpu = -1;
 
 	/*
-	 * Load the mask once, as scx_beerland does: a re-load after the
-	 * helper could race an ops.init() replacement and give the
-	 * verifier a different trusted state. The scheduling callbacks
-	 * are non-sleepable, so the kptr read is already covered by the
-	 * verifier's RCU rules.
+	 * While a shield is up the selector may only see the pin worker
+	 * mask: non_lp_cpumask still names the slots' homes, and an idle
+	 * pick from it would hand a worker the core the pin holds. The
+	 * task-affinity fallback below stays out of this branch for the
+	 * same reason - it can return a shielded CPU just as well.
 	 */
+	if (plain && game_pin && READ_ONCE(pin_shield_n)) {
+		mask = pin_worker_cpumask;
+		if (mask && !bpf_cpumask_empty(cast_mask(mask)))
+			cpu = scx_bpf_select_cpu_and(p, prev_cpu, wake_flags,
+						     cast_mask(mask), 0);
+		return cpu;
+	}
+
 	if (mask && !bpf_cpumask_empty(cast_mask(mask)))
 		cpu = scx_bpf_select_cpu_and(p, prev_cpu, wake_flags,
 					     cast_mask(mask), 0);
