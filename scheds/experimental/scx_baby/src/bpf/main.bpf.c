@@ -1188,18 +1188,15 @@ __hidden __noinline bool pin_select_pinned(struct task_struct *p,
 
 /*
  * The wake selector while a shield is up: the kernel selector runs on
- * the pin worker mask, and when it finds no idle CPU the fallback is
- * the plain one except that a shielded CPU is never handed a
- * non-pinned wake. Only the last resort may still return one, because
- * every allowed CPU being shielded means the task can run nowhere
- * else and idling it would be worse.
+ * the pin worker mask and a pick is dispatched straight to its idle
+ * CPU. Anything else returns -1, so the caller keeps the warm seat or
+ * steps forward to the nearest unshielded CPU.
  */
 __hidden __noinline s32 pin_select_cpu_and(struct task_struct *p, s32 prev_cpu,
 					   u64 wake_flags)
 {
 	struct bpf_cpumask *mask = pin_worker_cpumask;
 	struct task_ctx *tctx;
-	u64 now;
 	s32 cpu = -1;
 
 	if (mask && !bpf_cpumask_empty(cast_mask(mask)))
@@ -1216,14 +1213,32 @@ __hidden __noinline s32 pin_select_cpu_and(struct task_struct *p, s32 prev_cpu,
 			__sync_fetch_and_add(&nr_direct_dispatches, 1);
 		return cpu;
 	}
+	return -1;
+}
 
-	now = bpf_ktime_get_ns();
-	bpf_for(cpu, 0, nr_cpu_ids) {
+/*
+ * The first CPU after @prev_cpu that @p may run on and that no shield
+ * holds. Only a wake whose previous CPU the shield owns needs this: the
+ * warm seat is gone, so stepping forward finds the nearest usable CPU
+ * without the CPU-0 restart that would throw the locality away.
+ */
+__hidden __noinline s32 pin_next_unshielded(struct task_struct *p,
+					    s32 prev_cpu, u64 now)
+{
+	u32 nr = (u32)nr_cpu_ids;
+	u32 i;
+
+	if (!nr)
+		return -1;
+
+	bpf_for(i, 0, nr_cpu_ids) {
+		s32 cpu = (s32)(((u32)prev_cpu + 1 + i) % nr);
+
 		if (bpf_cpumask_test_cpu(cpu, p->cpus_ptr) &&
 		    !is_cpu_shielded(cpu, now))
 			return cpu;
 	}
-	return any_allowed_cpu(p, prev_cpu);
+	return -1;
 }
 
 /*
@@ -1402,14 +1417,33 @@ s32 BPF_STRUCT_OPS(baby_select_cpu, struct task_struct *p,
 	 * While a pin shield holds a core, the wake selector must not
 	 * hand a non-pinned task that core. The kernel selector runs on
 	 * the pin worker mask, which is the non-LP set minus the
-	 * shielded homes and siblings, and the fallback scan keeps off
-	 * them too. That path dispatches to its own idle pick, so the
-	 * is_idle handling below belongs to runs without a pin.
+	 * shielded homes and siblings. A direct dispatch returns its own
+	 * pick; otherwise the depth-0 wake preempt below still applies,
+	 * on the unshielded warm seat or the nearest allowed CPU.
 	 */
-	if (plain && game_pin && READ_ONCE(pin_shield_n))
-		return pin_select_cpu_and(p, prev_cpu, wake_flags);
+	if (plain && game_pin && READ_ONCE(pin_shield_n)) {
+		cpu = pin_select_cpu_and(p, prev_cpu, wake_flags);
+		if (cpu >= 0)
+			return cpu;
 
-	cpu = pick_idle_cpu(p, prev_cpu, wake_flags, &is_idle);
+		/*
+		 * No idle CPU inside the pin worker mask. Keep the warm
+		 * seat when the shield does not own it, so the depth-0
+		 * wake preempt below can still cut a bulk resident; a
+		 * shielded CPU never takes that preempt, because the pin
+		 * holds it. When the shield owns prev_cpu, step forward
+		 * from it to the nearest unshielded allowed CPU.
+		 */
+		if (prev_cpu < 0 ||
+		    (u32)prev_cpu >= nr_cpu_ids ||
+		    !bpf_cpumask_test_cpu(prev_cpu, p->cpus_ptr) ||
+		    is_cpu_shielded(prev_cpu, now))
+			return pin_next_unshielded(p, prev_cpu, now);
+
+		cpu = prev_cpu;
+	} else {
+		cpu = pick_idle_cpu(p, prev_cpu, wake_flags, &is_idle);
+	}
 	if (is_idle) {
 		if (stats_enabled)
 			__sync_fetch_and_add(

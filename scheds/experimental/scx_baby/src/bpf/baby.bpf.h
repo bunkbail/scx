@@ -975,6 +975,7 @@ __hidden bool pin_select_pinned(struct task_struct *p, struct task_ctx *tctx,
 				s32 prev_cpu, u64 now, s32 *out_cpu);
 __hidden s32 pin_select_cpu_and(struct task_struct *p, s32 prev_cpu,
 				u64 wake_flags);
+__hidden s32 pin_next_unshielded(struct task_struct *p, s32 prev_cpu, u64 now);
 __hidden bool pin_owns_cpu(s32 cpu, const struct task_struct *p);
 __hidden bool is_cpu_shielded(s32 cpu, u64 now);
 __hidden bool pin_wholly_shielded(const struct task_struct *p);
