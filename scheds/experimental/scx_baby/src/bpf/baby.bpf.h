@@ -952,7 +952,7 @@ struct pin_slot {
 	u64 last_seen_ns;
 	u64 active_until;
 	u64 nr_enq;
-	u64 nr_dispatch;
+	u64 pad2_;
 };
 
 /*
@@ -977,6 +977,7 @@ __hidden s32 pin_select_cpu_and(struct task_struct *p, s32 prev_cpu,
 				u64 wake_flags);
 __hidden bool pin_owns_cpu(s32 cpu, const struct task_struct *p);
 __hidden bool is_cpu_shielded(s32 cpu, u64 now);
-__hidden bool pin_pcpu_enqueue(struct task_struct *p, u64 now);
+__hidden bool pin_stranded_enqueue(struct task_struct *p, u64 enq_flags,
+				   u64 now);
 
 #endif /* __BABY_H */
