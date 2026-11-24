@@ -207,8 +207,9 @@ struct Opts {
 
     /// Scheduling profile. `default` keeps the throughput-first
     /// placement on the 1180us slice. `gaming` runs the plain
-    /// virtual-time queue on an 800us slice, trading throughput under
-    /// saturation for lower frame latency.
+    /// virtual-time queue on an 800us slice with the SMT-pair game pin
+    /// armed, trading throughput under saturation for lower frame
+    /// latency.
     #[clap(
         long,
         default_value = "default",
@@ -218,7 +219,9 @@ struct Opts {
     )]
     profile: String,
 
-    /// Shorthand for `--profile gaming`.
+    /// Shorthand for `--profile gaming`: the plain virtual-time queue
+    /// on the 800us slice, with the SMT-pair game pin armed.
+    /// `--no-game-pin` turns the pin off under either spelling.
     #[clap(long, action = clap::ArgAction::SetTrue, conflicts_with = "profile")]
     game: bool,
 
@@ -249,18 +252,27 @@ struct Opts {
     #[clap(long, default_value = "20000")]
     vtime_lag_us: u64,
 
-    /// Native SMT-pair pin for the gaming queue. Requires
-    /// --game/--plain-vtime: the two busiest threads of one process
-    /// each keep a physical core to themselves, so a game's render and
+    /// Explicit opt-in for the native SMT-pair pin on the
+    /// --plain-vtime queue: the two busiest threads of one process each
+    /// keep a physical core to themselves, so a game's render and
     /// submission threads do not wait behind helpers on their cores.
+    /// --game and --profile gaming already arm it; --no-game-pin
+    /// clears it again.
     #[clap(long, action = clap::ArgAction::SetTrue)]
     game_pin: bool,
 
-    /// Grace window of --game-pin, in microseconds: how long a pinned
+    /// Disable the SMT-pair game pin even under --game or --profile
+    /// gaming. The pin is an overlay on the plain virtual-time queue,
+    /// so this has no effect on a run that never reaches that queue.
+    #[clap(long, action = clap::ArgAction::SetTrue, conflicts_with = "game_pin")]
+    no_game_pin: bool,
+
+    /// Grace window of the game pin, in microseconds: how long a pinned
     /// thread's core stays reserved after it leaves the CPU or is
     /// enqueued. It has to span the gap between two frames, not one
     /// frame, or a thread that sleeps through a whole frame hands the
-    /// core away and pays a migration on every wake.
+    /// core away and pays a migration on every wake. Default 20000us;
+    /// inert unless the pin resolves on.
     #[clap(
         long,
         default_value = "20000",
@@ -269,8 +281,9 @@ struct Opts {
     pin_grace_us: u64,
 
     /// Pin slots: 1 keeps one core for the busiest thread of the game,
-    /// 2 also holds a second core for another thread of the same
-    /// process once the first has proven its duty.
+    /// 2 (the default) also holds a second core for another thread of
+    /// the same process once the first has proven its duty. Inert
+    /// unless the pin resolves on.
     #[clap(
         long,
         default_value = "2",
@@ -309,9 +322,9 @@ struct Opts {
 
 /// The base slice and the plain-family rodata the options resolve to.
 ///
-/// `gaming` is the only place the two interact: it selects
-/// `--plain-vtime` on an 800us slice. Every other profile keeps the
-/// throughput dispatch and the 1180us slice untouched.
+/// `gaming` selects `--plain-vtime` on an 800us slice and arms the game
+/// pin. Every other profile keeps the throughput dispatch and the
+/// 1180us slice untouched, with the pin off.
 struct Mode {
     gaming: bool,
     deadline_us: u64,
@@ -320,6 +333,8 @@ struct Mode {
     plain_wake: bool,
     plain_vtime: bool,
     game_pin: bool,
+    pin_grace_ns: u64,
+    pin_max: u32,
 }
 
 /// The `-d` defaults: the original DEADLINE_NS, and the gaming slice.
@@ -340,10 +355,15 @@ impl Mode {
          * --plain-vtime both imply --plain-1x. The game pin is an
          * overlay on the plain queue only: without it every pin
          * branch stays dead in the BPF program.
+         *
+         * Gaming arms the pin, --no-game-pin clears it, and an explicit
+         * --game-pin still arms it on --plain-vtime. A run outside the
+         * plain queue resolves to false whatever the flags say.
          */
         let plain_vtime = opts.plain_vtime || gaming;
         let plain_1x = opts.plain_1x || opts.plain_wake || plain_vtime;
         let plain = opts.plain || plain_1x;
+        let game_pin = !opts.no_game_pin && (gaming || opts.game_pin) && plain;
 
         Self {
             gaming,
@@ -352,7 +372,20 @@ impl Mode {
             plain_1x,
             plain_wake: opts.plain_wake,
             plain_vtime,
-            game_pin: opts.game_pin && plain,
+            game_pin,
+            /*
+             * The pin's knobs are rodata the BPF side reads only when
+             * game_pin holds. Publish the resolved values: with the pin
+             * off both read zero, so a default run's rodata is inert
+             * field by field rather than only through the verifier
+             * pruning the pin branches.
+             */
+            pin_grace_ns: if game_pin {
+                opts.pin_grace_us * 1000
+            } else {
+                0
+            },
+            pin_max: if game_pin { opts.pin_max } else { 0 },
         }
     }
 }
@@ -506,13 +539,13 @@ impl<'a> Scheduler<'a> {
         rodata.plain_wake = mode.plain_wake;
         rodata.plain_vtime = mode.plain_vtime;
         /*
-         * The pin is a plain-queue overlay: userspace resolves it to
-         * false unless the plain virtual-time queue is selected, and
-         * the BPF branches below it are verifier-pruned when it is.
+         * Gaming arms the pin; --no-game-pin or a run that never
+         * reaches the plain queue clears it. The BPF branches below it
+         * are verifier-pruned when it is off.
          */
         rodata.game_pin = mode.game_pin;
-        rodata.pin_grace_ns = opts.pin_grace_us * 1000;
-        rodata.pin_max = opts.pin_max;
+        rodata.pin_grace_ns = mode.pin_grace_ns;
+        rodata.pin_max = mode.pin_max;
         /* 1 s bounds the BPF-side product (lag * freq cap * weight). */
         let vtime_lag_ns = opts.vtime_lag_us.min(1_000_000) * 1000;
         rodata.vtime_lag_ns = vtime_lag_ns;
@@ -529,7 +562,8 @@ impl<'a> Scheduler<'a> {
         if mode.game_pin {
             info!(
                 "game pin: {} slot(s), grace {}us",
-                opts.pin_max, opts.pin_grace_us
+                mode.pin_max,
+                mode.pin_grace_ns / 1000
             );
         }
 
@@ -887,27 +921,71 @@ mod tests {
         assert_eq!(two.pin_grace_us, 20000);
     }
 
-    /// --game-pin is an overlay on the plain virtual-time queue: alone
-    /// it resolves to false, with --game it arms, and the default
-    /// profile keeps its old resolution.
+    /*
+     * The pin resolves from the profile and the queue: --game and
+     * --profile gaming arm it, --no-game-pin clears it, an explicit
+     * --game-pin still arms it on --plain-vtime, and a run outside the
+     * plain queue stays off whatever the flags say. The knobs are
+     * rodata the BPF side reads only when the pin is on, so they
+     * publish zero whenever it is off: a default run's rodata is inert
+     * field by field, not only through the verifier pruning the
+     * branches.
+     */
     #[test]
-    fn game_pin_arms_only_on_the_plain_queue() {
-        let alone = Mode::from_opts(&Opts::try_parse_from(["scx_baby", "--game-pin"]).unwrap());
-        assert!(!alone.plain);
-        assert!(!alone.game_pin);
+    fn game_pin_resolves_from_the_profile_and_the_plain_queue() {
+        // argv, then (gaming, plain, plain_1x, plain_vtime, game_pin,
+        // deadline_us, pin_grace_ns, pin_max).
+        let cases: &[(&[&str], (bool, bool, bool, bool, bool, u64, u64, u32))] = &[
+            (&[], (false, false, false, false, false, 1180, 0, 0)),
+            (
+                &["--game"],
+                (true, true, true, true, true, 800, 20_000_000, 2),
+            ),
+            (
+                &["--profile", "gaming"],
+                (true, true, true, true, true, 800, 20_000_000, 2),
+            ),
+            (
+                &["--game", "--no-game-pin"],
+                (true, true, true, true, false, 800, 0, 0),
+            ),
+            (
+                &["--profile", "gaming", "--no-game-pin"],
+                (true, true, true, true, false, 800, 0, 0),
+            ),
+            (
+                &["--plain-vtime"],
+                (false, true, true, true, false, 1180, 0, 0),
+            ),
+            (
+                &["--plain-vtime", "--game-pin"],
+                (false, true, true, true, true, 1180, 20_000_000, 2),
+            ),
+            (
+                &["--game-pin"],
+                (false, false, false, false, false, 1180, 0, 0),
+            ),
+        ];
 
-        let game =
-            Mode::from_opts(&Opts::try_parse_from(["scx_baby", "--game", "--game-pin"]).unwrap());
-        assert!(game.plain && game.plain_vtime);
-        assert!(game.game_pin);
+        for (args, want) in cases {
+            let mut argv = vec!["scx_baby"];
+            argv.extend_from_slice(args);
+            let mode = Mode::from_opts(&Opts::try_parse_from(&argv).unwrap());
+            let got = (
+                mode.gaming,
+                mode.plain,
+                mode.plain_1x,
+                mode.plain_vtime,
+                mode.game_pin,
+                mode.deadline_us,
+                mode.pin_grace_ns,
+                mode.pin_max,
+            );
 
-        let bench = Mode::from_opts(
-            &Opts::try_parse_from(["scx_baby", "--plain-vtime", "--game-pin"]).unwrap(),
-        );
-        assert!(bench.plain_vtime && bench.game_pin);
+            assert_eq!(got, *want, "{args:?}");
+        }
 
-        let default = Mode::from_opts(&Opts::try_parse_from(["scx_baby"]).unwrap());
-        assert!(!default.plain && !default.game_pin);
+        assert!(Opts::try_parse_from(["scx_baby", "--game-pin", "--no-game-pin"]).is_err());
     }
 
     /// Test-only mirror of the wake-rate blend and peak gate in
@@ -1091,8 +1169,9 @@ mod tests {
         ro.plain_wake = plain_wake;
         ro.plain_vtime = plain_vtime;
         ro.game_pin = game_pin;
-        ro.pin_grace_ns = 20_000_000;
-        ro.pin_max = 2;
+        /* The knobs publish zero whenever the pin resolves off. */
+        ro.pin_grace_ns = if game_pin { 20_000_000 } else { 0 };
+        ro.pin_max = if game_pin { 2 } else { 0 };
         ro.vtime_lag_ns = 20_000_000;
         for cpu in 0..nr_cpus.min(ro.topo_node.len()) {
             // Two node-ish halves, eight LLCs, per-pair L2 groups

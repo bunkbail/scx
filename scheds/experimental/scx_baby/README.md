@@ -40,9 +40,10 @@ described here, on the 1180us slice. The gaming profile (`--profile
 gaming`, or `--game`) runs the plain virtual-time queue on an 800us slice
 (`--plain-vtime -d 800`): no warm seats and no fast lane, one shared
 queue per node ordered by weighted runtime, with a wake-frequency bounded
-credit. It trades throughput under saturation for lower frame latency.
-Both profiles share one binary and one BPF program. The profiles are
-rodata flags.
+credit. It arms the SMT-pair game pin as well, and `--no-game-pin` opts
+out of the pin while keeping the rest of the profile. It trades throughput
+under saturation for lower frame latency. Both profiles share one binary
+and one BPF program. The profiles are rodata flags.
 
 ## Design
 
@@ -228,6 +229,23 @@ a long resident that no preemption path can cut, and the shared-node rung
 drops its lane condition because foreground tasks already earn the
 fourfold slice in `task_slice()`.
 
+### Game pin
+
+The gaming profile arms an SMT-pair pin: the two busiest threads of one
+process each keep a physical core to themselves, with the SMT sibling
+shielded from every other task. It is a plain-virtual-time overlay, so it
+exists only when the gaming queue is selected, and `--no-game-pin` turns
+it off.
+
+A slot is claimed by duty, a task's core share in q10: the first slot
+needs 665 across the last window and is released below 500. The second
+slot needs 615 twice in a row and only while the machine is less than 55
+percent busy, so a saturated machine does not give a whole core to a
+second thread. A claimed core stays shielded for a 20ms grace window
+measured from the owner's last stop or enqueue, which spans the gap
+between two frames rather than one, and a slot whose owner has not been
+seen for 600ms can be taken over.
+
 ### Hybrid placement
 
 Below saturation (`nr_running` within two of the little-core count), the
@@ -335,15 +353,21 @@ policy.
   alone.
 - `--profile <default|gaming>`: scheduling profile. `default` is the
   throughput-first placement described above. `gaming` runs the plain
-  virtual-time queue on an 800us slice, trading throughput under
-  saturation for lower frame latency. An explicit `-d` still sets the
-  slice.
+  virtual-time queue on an 800us slice with the game pin armed, trading
+  throughput under saturation for lower frame latency. An explicit `-d`
+  still sets the slice.
 - `--game`: shorthand for `--profile gaming`, mutually exclusive with an
   explicit `--profile`.
 - `--plain`, `--plain-1x`, `--plain-wake`, `--plain-vtime`,
   `--vtime-lag-us`: the plain EDF baseline and its variants. These exist
   for scheduler comparisons; `--plain-vtime` is what `gaming` selects, and
   `--game` is the supported way to run it.
+- `--game-pin`, `--no-game-pin`, `--pin-grace-us <US>`,
+  `--pin-max <1|2>`: the SMT-pair pin. `gaming` arms it, and
+  `--game-pin` arms it on a bare `--plain-vtime` run; `--no-game-pin`
+  clears it, and the two conflict. The grace window defaults to 20000us
+  and `--pin-max` to 2 slots. All three are inert unless the pin resolves
+  on.
 - `--stats <SECS>`: enable the stats report and run normally.
 - `--monitor <SECS>`: run in stats monitoring mode without launching the
   scheduler.
@@ -380,6 +404,7 @@ The binary lands in `target/release/scx_baby`.
 ```sh
 scx_baby                  # run with defaults
 scx_baby --game           # gaming profile: latency over throughput
+scx_baby --game --no-game-pin  # gaming queue, without the SMT-pair pin
 scx_baby -d 500           # 500us deadline and base slice
 scx_baby --stats 1        # print scheduling statistics every second
 ```

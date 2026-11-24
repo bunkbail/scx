@@ -49,9 +49,10 @@ const volatile bool plain_vtime;
 const volatile u64 vtime_lag_ns = 20000000ULL;
 
 /*
- * The game pin (--game-pin). Userspace rewrites only game_pin,
- * pin_grace_ns and pin_max; the rest are tuned here, where the
- * comments in baby.bpf.h explain what each bar means.
+ * The game pin, armed by --game/--profile gaming and cleared by
+ * --no-game-pin or any non-plain run. Userspace rewrites only
+ * game_pin, pin_grace_ns and pin_max; the rest are tuned here, where
+ * the comments in baby.bpf.h explain what each bar means.
  */
 const volatile bool game_pin;
 const volatile u64 pin_grace_ns = 20000000ULL;
@@ -93,7 +94,9 @@ private(BABY) struct bpf_cpumask __kptr *little_cpumask;
 private(BABY) struct bpf_cpumask __kptr *non_lp_cpumask;
 
 /*
- * The game pin (--game-pin; the mechanism is described in baby.bpf.h).
+ * The game pin (armed by --game/--profile gaming, cleared by
+ * --no-game-pin or a non-plain run; the mechanism is described in
+ * baby.bpf.h).
  *
  * pin_slots holds the two claims. Its pid word is the claim word: 0 is
  * free, a nonzero pid is the owner, and a takeover is an atomic CAS
