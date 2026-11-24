@@ -18,6 +18,13 @@ const volatile u64 nr_cpu_ids;
 const volatile u64 nr_node_ids;
 
 /*
+ * Distinct LLC ids, from the same cache dump that fills topo_llc. It
+ * has no kernel count to assert: it only tells the seat-steal walk
+ * whether a ring beyond the caller's own LLC exists at all.
+ */
+const volatile u64 nr_llc_ids;
+
+/*
  * Tier sizes as published by userspace before load. On a platform
  * without a capacity split the little set is empty and the hybrid gates
  * are statically false: the compaction never engages there.

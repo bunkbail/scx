@@ -421,6 +421,15 @@ impl<'a> Scheduler<'a> {
         // memory-only nodes the topology does not list, so the bound is
         // the kernel's possible-node range, not the online node count.
         let nr_node_ids = possible_node_ids().context("failed to read possible NUMA nodes")?;
+        // Distinct LLCs, from the same cache dump that fills topo_llc.
+        // The BPF side drops its node ring on a machine with one LLC,
+        // where that ring can only re-read the LLC ring's CPUs.
+        let nr_llc_ids = topo
+            .all_cpus
+            .values()
+            .map(|c| c.llc_id)
+            .collect::<std::collections::BTreeSet<_>>()
+            .len();
         ensure!(
             nr_node_ids <= consts_BABY_MAX_NODES as usize,
             "too many NUMA node ids ({}) for the {} node DSQs the id layout holds",
@@ -485,6 +494,7 @@ impl<'a> Scheduler<'a> {
         // check and prunes the hybrid arms when a tier is empty.
         rodata.nr_cpu_ids = *NR_CPU_IDS as u64;
         rodata.nr_node_ids = nr_node_ids as u64;
+        rodata.nr_llc_ids = nr_llc_ids as u64;
         rodata.nr_big_cpus = classes.big.len() as u64;
         rodata.nr_little_cpus = classes.little.len() as u64;
 
@@ -518,11 +528,7 @@ impl<'a> Scheduler<'a> {
                 .map(|c| c.l2_id)
                 .collect::<std::collections::BTreeSet<_>>()
                 .len(),
-            topo.all_cpus
-                .values()
-                .map(|c| c.llc_id)
-                .collect::<std::collections::BTreeSet<_>>()
-                .len(),
+            nr_llc_ids,
             topo.nodes.len(),
         );
 
@@ -1225,6 +1231,12 @@ mod tests {
         ro.gaming = gaming;
         ro.nr_cpu_ids = nr_cpus as u64;
         ro.nr_node_ids = 2;
+        /*
+         * The synthetic table below publishes LLC ids cpu % 8, so a
+         * one-CPU load reports a single LLC and takes the arm where
+         * the node ring is pruned.
+         */
+        ro.nr_llc_ids = nr_cpus.min(8) as u64;
         ro.nr_big_cpus = (nr_cpus / 2) as u64;
         ro.nr_little_cpus = (nr_cpus - nr_cpus / 2) as u64;
         ro.plain = plain;

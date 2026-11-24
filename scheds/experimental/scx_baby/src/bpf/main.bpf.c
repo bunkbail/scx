@@ -226,6 +226,13 @@ u64 seat_pending[2][BABY_MAX_CPUS];
 u64 node_pending[2][BABY_NODE_CLOCK_NR];
 
 /*
+ * The newest warm-seat insertion, stamped by balance.bpf.c under a
+ * ten-millisecond throttle. The idle fall-through in ops.dispatch()
+ * reads it once to decide whether any seat can hold work at all.
+ */
+u64 seat_last_enq_ns;
+
+/*
  * Whether a task runs on each CPU, counted by the warm-seat scan into
  * its own per-lane sum. The scan already walks every CPU, so one load
  * per CPU there replaces a pair of global read-modify-writes on the
@@ -2529,6 +2536,21 @@ void BPF_STRUCT_OPS(baby_dispatch, s32 cpu, struct task_struct *prev)
 		 * tries the rest of the node before it hops, so no cross-
 		 * node move is paid while same-node work waits.
 		 *
+		 * The walk is worth nothing when no seat can hold work,
+		 * so the stamp of the newest seat insertion gates it: a
+		 * machine that has not seated anything for the window
+		 * skips the scan on one read-mostly load, which is what
+		 * perf pipe and a quiet desktop pay instead of three
+		 * queue probes per CPU. The window is the stamp's own
+		 * throttle plus a margin, so an empty-seat run pays
+		 * neither the probes nor the store.
+		 *
+		 * The rings are then ordered by what the topology can
+		 * reach. The LLC ring is the whole walk on a single-LLC
+		 * machine, so the node ring runs only when a second LLC
+		 * exists, and the catch-all ring only when a second node
+		 * does.
+		 *
 		 * An LP core never steals. The seats it reaches hold work
 		 * the enqueue placed on a non-LP CPU, and pulling it down
 		 * to a little core trades that placement's throughput for
@@ -2536,25 +2558,43 @@ void BPF_STRUCT_OPS(baby_dispatch, s32 cpu, struct task_struct *prev)
 		 * without tiers, so the test folds away there, and an
 		 * empty mask means no tier has been published yet: the
 		 * steal stays allowed rather than closing on a guess.
+		 *
+		 * A big core at light load does not steal either. The
+		 * wake path packs sub-saturation work onto the little
+		 * tier, so a big core that stops has nothing waiting
+		 * that belongs on it: a steal would pull a little-placed
+		 * task back up a tier, undo the compaction and hold the
+		 * core out of C3 while xz or a desktop idles. Once the
+		 * little tier is oversubscribed by more than its own
+		 * depth, the steal is worth the migration again.
 		 */
-		if (seat_guard) {
-			bool multi = nr_node_ids > 1;
-			bool lp = false;
+		if (seat_guard &&
+		    now - READ_ONCE(seat_last_enq_ns) <= BABY_SEAT_FRESH_NS) {
+			bool multi_llc = nr_llc_ids > 1;
+			bool multi_node = nr_node_ids > 1;
+			bool no_steal = false;
 
 			if (nr_little_cpus && nr_big_cpus) {
 				struct bpf_cpumask *mask = non_lp_cpumask;
+				struct bpf_cpumask *big = big_cpumask;
 
 				if (mask &&
 				    !bpf_cpumask_empty(cast_mask(mask)))
-					lp = !bpf_cpumask_test_cpu(
+					no_steal = !bpf_cpumask_test_cpu(
 						cpu, cast_mask(mask));
+				if (!no_steal &&
+				    nr_running <= nr_little_cpus + 2 &&
+				    big && !bpf_cpumask_empty(cast_mask(big)) &&
+				    bpf_cpumask_test_cpu(cpu, cast_mask(big)))
+					no_steal = true;
 			}
 
-			if (!lp &&
+			if (!no_steal &&
 			    (seat_steal_scan(cpu, now, SEAT_REACH_LLC) ||
-			     (multi &&
+			     (multi_llc &&
 			      seat_steal_scan(cpu, now, SEAT_REACH_NODE)) ||
-			     seat_steal_scan(cpu, now, SEAT_REACH_ANY)))
+			     (multi_node &&
+			      seat_steal_scan(cpu, now, SEAT_REACH_ANY))))
 				return;
 		}
 		/*

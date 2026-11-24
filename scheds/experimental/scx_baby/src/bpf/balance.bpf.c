@@ -214,6 +214,23 @@ __hidden bool balance_try_warm_seat(struct task_struct *p, struct task_ctx *tctx
 						  tctx->deadline, 0,
 						  baby_tag(0, lane, target));
 				WRITE_ONCE(seat_used[lane][tidx], 1);
+				/*
+				 * Date the seat for the idle fall-through,
+				 * which skips its whole walk when no seat
+				 * has been filled for the fresh window.
+				 * The store is throttled to one per
+				 * period: the window is tens of
+				 * milliseconds wide, so a coarse stamp
+				 * decides it, and an unthrottled store
+				 * would bounce this line across every CPU
+				 * that seats a task.
+				 */
+				{
+					u64 last = READ_ONCE(seat_last_enq_ns);
+
+					if (now - last > BABY_SEAT_STAMP_NS)
+						WRITE_ONCE(seat_last_enq_ns, now);
+				}
 			}
 			stamp_wait(tctx, now, target_nr, false);
 			/*

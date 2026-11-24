@@ -43,6 +43,14 @@
 extern const volatile u64 nr_cpu_ids;
 extern const volatile u64 nr_node_ids;
 
+/*
+ * Distinct LLC ids on the machine, from the same dump that fills
+ * topo_llc. The seat-steal walk reads it to drop its node ring on a
+ * single-LLC machine, where the LLC ring already covers every CPU and
+ * the outer rings only re-read the occupancy hints.
+ */
+extern const volatile u64 nr_llc_ids;
+
 static __always_inline u64 cpu2dsq(s32 cpu)
 {
 	return BABY_CPU_DSQ_BASE + cpu;
@@ -302,6 +310,28 @@ extern u64 node_service_at[2][BABY_NODE_CLOCK_NR];
  * which costs that arrival one missed probe, never a stranded task.
  */
 extern u8 seat_used[2][BABY_MAX_CPUS];
+
+/*
+ * Wall-clock time of the newest warm-seat insertion, written by the
+ * enqueue path with the throttle below. It is a lower bound on the true
+ * time of that insert, and ops.dispatch() reads it once before the
+ * steal walk: a seat holds work only while the enqueue keeps filling
+ * one, so a machine that has stopped seating has nothing to steal and
+ * the walk can be skipped outright. A seat is then served by its owner
+ * on its next slice end, and the starve rescue still covers one that
+ * outlives its queue clock.
+ */
+extern u64 seat_last_enq_ns;
+
+/*
+ * The stamp throttle and the window it feeds. Ten milliseconds keeps
+ * the enqueue's store off a line every CPU would otherwise bounce,
+ * which is far below the window that decides whether to scan at all. A
+ * throttled stamp can fire the window up to one period early, so the
+ * window is a fresh-work test, not a proof that every seat is empty.
+ */
+#define BABY_SEAT_STAMP_NS		(10ULL * NSEC_PER_MSEC)
+#define BABY_SEAT_FRESH_NS		(50ULL * NSEC_PER_MSEC)
 
 /*
  * Per-queue pending counts, indexed by lane (0 bulk, 1 fast): the number
