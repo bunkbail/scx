@@ -49,6 +49,15 @@ const volatile bool plain_vtime;
 const volatile u64 vtime_lag_ns = 20000000ULL;
 
 /*
+ * Seat guard: the default profile's alone. It bounds the preemption and
+ * the deep rung a warm-seat placement gets, and lets an about-to-idle
+ * CPU take one task off another seat. baby.bpf.h carries the rationale
+ * and the branches; userspace publishes false for every plain profile
+ * and for --game, where the verifier prunes them.
+ */
+const volatile bool seat_guard;
+
+/*
  * The game pin, armed by --game/--profile gaming and cleared by
  * --no-game-pin or any run that does not select the plain virtual-time
  * queue. Userspace rewrites only game_pin, pin_grace_ns and pin_max;
@@ -163,21 +172,6 @@ private(BABY) struct bpf_cpumask __kptr *pin_worker_cpumask;
  * ceiling, and the peek/lookup/class pattern is already verifier-proven
  * in the rescue timer.
  */
-/*
- * How long a victim must have held a CPU before a waiting task may
- * preempt it. The floor exists so two waiters cannot ping-pong one CPU:
- * a victim that just started makes progress before it is displaced
- * again. On a saturated CPU the floor is also the extra wait every
- * wake-side handoff pays on top of the victim's rotation, and a frame
- * producer at several hundred frames per second runs for only about a
- * millisecond per frame: a victim that has already held the CPU for
- * 200us covers a fifth of that frame, and waiting it out costs a whole
- * frame period. Fifty microseconds still gives a displaced task its
- * first slice of progress; the per-node claim and the latency-critical
- * victim refusal bound the churn on top of it.
- */
-#define BABY_TICK_PREEMPT_PROTECT_NS	(50ULL * NSEC_PER_USEC)
-
 /* Plain wake gate: the residency floor and the short-burst bound. */
 #define PLAIN_WAKE_PROTECT_NS		(200ULL * NSEC_PER_USEC)
 #define PLAIN_WAKE_SHORT_NS		(500ULL * NSEC_PER_USEC)
@@ -193,7 +187,7 @@ private(BABY) struct bpf_cpumask __kptr *pin_worker_cpumask;
  */
 #define BABY_TICK_PREEMPT_FALLBACK_NS	(100ULL * NSEC_PER_USEC)
 
-static u64 cpu_running_at[BABY_MAX_CPUS];
+u64 cpu_running_at[BABY_MAX_CPUS];
 bool cpu_is_lat[BABY_MAX_CPUS];
 
 /*
@@ -263,8 +257,8 @@ bool cpu_running[BABY_MAX_CPUS];
  * how far one burst can push bulk ahead, not how long the fast lane
  * may run.
  */
-static s64 fl_budget_ns[BABY_MAX_CPUS];
-static u64 fl_budget_at[BABY_MAX_CPUS];
+s64 fl_budget_ns[BABY_MAX_CPUS];
+u64 fl_budget_at[BABY_MAX_CPUS];
 static u64 cpu_fl_running_at[BABY_MAX_CPUS];
 
 /*
@@ -1860,6 +1854,15 @@ void BPF_STRUCT_OPS(baby_enqueue, struct task_struct *p, u64 enq_flags)
 	 * keeps the base slice, and latency-critical tasks use their own
 	 * node queue, which dispatch serves ahead of bulk while the time
 	 * budget allows. Plain mode has one queue and one base slice.
+	 *
+	 * Under the seat guard the fourfold rung is bulk-only. A
+	 * non-foreground latency-critical arrival granted four slices
+	 * becomes a fast-lane resident that the tick gate, the wake-path
+	 * preempt and the guarded seat preemption can all no longer cut,
+	 * so the deep queue would hand it the CPU for four slices at the
+	 * exact moment the guard is trying to bound how long it may hold
+	 * one. Foreground tasks still get the fourfold slice from
+	 * task_slice().
 	 */
 	{
 		bool lat = !plain && is_lat_cri(tctx);
@@ -1890,7 +1893,8 @@ void BPF_STRUCT_OPS(baby_enqueue, struct task_struct *p, u64 enq_flags)
 							 (BABY_NODE_CLOCK_NR - 1)] = now;
 
 			slice = backlog_deep(lane_backlog) &&
-					 !tctx->tick_preempted
+				 !tctx->tick_preempted &&
+				 !(seat_guard && lat)
 				? 4 * deadline_ns : task_slice(tctx);
 
 			baby_insert_vtime(p, tctx, dsq, slice,
@@ -1913,6 +1917,90 @@ void BPF_STRUCT_OPS(baby_enqueue, struct task_struct *p, u64 enq_flags)
 	    !(plain && game_pin && READ_ONCE(pin_shield_n) &&
 	      !pin_wholly_shielded(p) && is_cpu_shielded(prev_cpu, now)))
 		scx_bpf_kick_cpu(prev_cpu, SCX_KICK_IDLE);
+}
+
+/*
+ * Take one task off another CPU's warm seat (seat guard).
+ *
+ * A seat is a per-CPU queue: only its owner pulls it. A CPU whose own
+ * queues are empty therefore idles while a sibling's seat holds a
+ * queue, and the enqueue that would have pulled the task to the idle
+ * CPU has already parked it. The steal is the other half of that
+ * bargain - the CPU about to stop takes one task instead of waiting for
+ * the owner's slice to end.
+ *
+ * The lane order is the enqueue's: the fast-lane seat first, the bulk
+ * seat second. A seat whose hint is clear is skipped, and a hinted seat
+ * whose queue reads empty clears its own hint, exactly as the owner's
+ * pull would. A move that fails - an affinity the CPU cannot serve, or
+ * the owner's own pull winning the race - leaves the task where it is;
+ * the steal is an opportunity, never a reservation.
+ */
+static __noinline bool seat_steal_one(s32 other, u32 lane, u64 now)
+{
+	u32 oidx = (u32)other & (BABY_MAX_CPUS - 1);
+	u64 dsq = lane ? fl_cpu2dsq(other) : cpu2dsq(other);
+
+	if (!READ_ONCE(seat_used[lane][oidx]))
+		return false;
+	if (!scx_bpf_dsq_nr_queued(dsq)) {
+		seat_used[lane][oidx] = 0;
+		return false;
+	}
+	if (!scx_bpf_dsq_move_to_local(dsq, 0))
+		return false;
+
+	seat_service_at[lane][oidx] = now;
+	if (!scx_bpf_dsq_nr_queued(dsq))
+		seat_used[lane][oidx] = 0;
+	return true;
+}
+
+/*
+ * Walk every other CPU once, starting one past @cpu so that the same
+ * seat is not the first one every idle CPU looks at. @reach narrows the
+ * walk to a ring: the caller's own LLC, its node, or anywhere. The
+ * caller runs the rings nearest first, so a steal keeps the task in the
+ * cache domain the enqueue placed it in whenever an inner ring can serve
+ * it. On a single-LLC machine the LLC ring is the whole walk and the
+ * outer rings only re-read the occupancy hints. The bound is nr_cpu_ids
+ * clamped to the table width, so the walk and the masked index visit the
+ * same set.
+ */
+#define SEAT_REACH_LLC	0
+#define SEAT_REACH_NODE	1
+#define SEAT_REACH_ANY	2
+
+static __noinline bool seat_steal_scan(s32 cpu, u64 now, u32 reach)
+{
+	u32 nr = (u32)MIN((u64)BABY_MAX_CPUS, nr_cpu_ids);
+	u32 idx = (u32)cpu & (BABY_MAX_CPUS - 1);
+	u32 own_node = topo_node[idx];
+	u32 own_llc = topo_llc[idx];
+	u32 off;
+
+	if (nr < 2)
+		return false;
+
+	bpf_for(off, 0, nr) {
+		u32 other = (u32)cpu + off + 1;
+		u32 oidx;
+
+		if (other >= nr)
+			other -= nr;
+		oidx = other & (BABY_MAX_CPUS - 1);
+		if (reach == SEAT_REACH_LLC && topo_llc[oidx] != own_llc)
+			continue;
+		if (reach == SEAT_REACH_NODE &&
+		    (topo_node[oidx] != own_node ||
+		     topo_llc[oidx] == own_llc))
+			continue;
+		if (seat_steal_one((s32)other, 1, now) ||
+		    seat_steal_one((s32)other, 0, now))
+			return true;
+	}
+
+	return false;
 }
 
 /*
@@ -2432,6 +2520,44 @@ void BPF_STRUCT_OPS(baby_dispatch, s32 cpu, struct task_struct *prev)
 			return;
 		}
 		/*
+		 * Seat steal (seat guard): the enqueue path parks a warm
+		 * arrival on a CPU's own seat, and only that CPU pulls
+		 * its seat, so work can wait there while this CPU stops.
+		 * Take one task off another seat before idling, nearest
+		 * ring first: an LLC-local steal keeps the task in its
+		 * cache domain, and a hybrid or multi-LLC machine then
+		 * tries the rest of the node before it hops, so no cross-
+		 * node move is paid while same-node work waits.
+		 *
+		 * An LP core never steals. The seats it reaches hold work
+		 * the enqueue placed on a non-LP CPU, and pulling it down
+		 * to a little core trades that placement's throughput for
+		 * a migration. The tier counters are zero on a machine
+		 * without tiers, so the test folds away there, and an
+		 * empty mask means no tier has been published yet: the
+		 * steal stays allowed rather than closing on a guess.
+		 */
+		if (seat_guard) {
+			bool multi = nr_node_ids > 1;
+			bool lp = false;
+
+			if (nr_little_cpus && nr_big_cpus) {
+				struct bpf_cpumask *mask = non_lp_cpumask;
+
+				if (mask &&
+				    !bpf_cpumask_empty(cast_mask(mask)))
+					lp = !bpf_cpumask_test_cpu(
+						cpu, cast_mask(mask));
+			}
+
+			if (!lp &&
+			    (seat_steal_scan(cpu, now, SEAT_REACH_LLC) ||
+			     (multi &&
+			      seat_steal_scan(cpu, now, SEAT_REACH_NODE)) ||
+			     seat_steal_scan(cpu, now, SEAT_REACH_ANY)))
+				return;
+		}
+		/*
 		 * The CPU is going idle: drop its performance level. The
 		 * write happens once, when the level changes; see the
 		 * comment on perf_req. An idle dispatch breaks the
@@ -2519,8 +2645,17 @@ void BPF_STRUCT_OPS(baby_tick, struct task_struct *p)
 	 * time budget takes no part: the tick fires between dispatches,
 	 * and counting it would black the lane out with no dispatch to
 	 * reset it. baby_dispatch() owns the budget.
+	 *
+	 * A latency-critical resident is normally exempt: it is the class
+	 * the lane exists for, and a tick that cut it would trade two
+	 * protected tasks against each other. The seat guard makes the
+	 * exemption conditional, because under the guard a guarded seat
+	 * placement may legally park a latency-critical arrival behind a
+	 * latency-critical resident whose slice the guard also bounds;
+	 * without the gate that arrival waits out the fourfold slice with
+	 * no rung left to cut it.
 	 */
-	if (plain_1x || (!plain && !is_lat_cri(tctx))) {
+	if (plain_1x || (!plain && (!is_lat_cri(tctx) || seat_guard))) {
 		s32 cpu = scx_bpf_task_cpu(p);
 		u32 idx = (u32)cpu & (BABY_MAX_CPUS - 1);
 		u64 ran_at = cpu_running_at[idx];

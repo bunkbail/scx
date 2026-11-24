@@ -136,6 +136,22 @@ extern const volatile bool plain_vtime;
 extern const volatile u64 vtime_lag_ns;
 
 /*
+ * Seat guard (default profile): a warm-seat placement has to earn its
+ * preemption and its deep rung, and a CPU about to idle may take one
+ * task off another CPU's seat. The guard exists because the two
+ * defaults it changes are only safe under the full scheduler: a
+ * latency-critical arrival seated behind any resident is handed a
+ * preemption kick, and a deep queue grants four slices to whatever
+ * joins the shared queue.
+ *
+ * Userspace publishes it as !plain && !gaming, so every plain profile
+ * and --game read it as false and the verifier prunes these branches
+ * there. A game cell's rodata is then provably inert, and the guarded
+ * code cannot reach plain or gaming behaviour.
+ */
+extern const volatile bool seat_guard;
+
+/*
  * Game pin: the plain virtual-time queue with one or two SMT pairs
  * held for the busiest threads of the game process. --game and
  * --profile gaming arm it by default, and --no-game-pin clears it
@@ -218,6 +234,54 @@ _Static_assert(BABY_FL_NODE_DSQ_BASE + BABY_MAX_NODES <= BABY_CPU_DSQ_BASE,
  */
 extern bool cpu_is_lat[BABY_MAX_CPUS];
 extern bool cpu_running[BABY_MAX_CPUS];
+
+/*
+ * How long a victim must have held a CPU before a waiting task may
+ * preempt it. The floor exists so two waiters cannot ping-pong one CPU:
+ * a victim that just started makes progress before it is displaced
+ * again. On a saturated CPU the floor is also the extra wait every
+ * wake-side handoff pays on top of the victim's rotation, and a frame
+ * producer at several hundred frames per second runs for only about a
+ * millisecond per frame: a victim that has already held the CPU for
+ * 200us covers a fifth of that frame, and waiting it out costs a whole
+ * frame period. Fifty microseconds still gives a displaced task its
+ * first slice of progress; the per-node claim and the latency-critical
+ * victim refusal bound the churn on top of it.
+ */
+#define BABY_TICK_PREEMPT_PROTECT_NS	(50ULL * NSEC_PER_USEC)
+
+/*
+ * The residency stamp and the fast-lane budget, defined in main.bpf.c.
+ * The guarded warm-seat preemption in balance.bpf.c reads them without
+ * owning them: it asks the same questions the tick gate asks, so a seat
+ * placement and a tick cut cannot disagree about whether a victim is
+ * past the floor or whether the fast lane can still pay.
+ */
+extern u64 cpu_running_at[BABY_MAX_CPUS];
+extern s64 fl_budget_ns[BABY_MAX_CPUS];
+extern u64 fl_budget_at[BABY_MAX_CPUS];
+
+/*
+ * The fast-lane credit a CPU holds after the refill its next dispatch
+ * would perform, computed without mutating the bucket: the seat guard
+ * asks whether the fast lane can still pay before it takes a seat, and
+ * a helper that refilled would grant the credit it is testing for.
+ * Same window cap and two-thirds rate as refill_fl_budget(), capped at
+ * the bucket's own ceiling, so the forecast and the real refill agree.
+ */
+static __always_inline s64 fl_budget_avail(u32 idx, u64 now)
+{
+	u32 i = idx & (BABY_MAX_CPUS - 1);
+	u64 at = READ_ONCE(fl_budget_at[i]);
+	u64 elapsed = now > at ? now - at : 0;
+	s64 avail = fl_budget_ns[i];
+
+	if (elapsed > 100 * NSEC_PER_MSEC)
+		elapsed = 100 * NSEC_PER_MSEC;
+	avail += (s64)(elapsed * 2 / 3);
+
+	return MIN(avail, (s64)(4 * deadline_ns));
+}
 
 /*
  * Per-queue service clocks for the starve rescue (see main.bpf.c). They

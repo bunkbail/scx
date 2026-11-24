@@ -235,8 +235,41 @@ __hidden bool balance_try_warm_seat(struct task_struct *p, struct task_ctx *tctx
 			 * every seat placement. That is the churn the
 			 * wake-side gate refuses to start, so the seat path
 			 * refuses it as well.
+			 *
+			 * Under the seat guard the kick is earned instead of
+			 * granted: the resident must be bulk, be past the
+			 * residency floor, be unpinned and able to move, and
+			 * the fast lane must still hold credit for the seat
+			 * it is taking. A guarded miss keeps the idle kick,
+			 * so the arrival waits out the resident's slice
+			 * rather than displacing work that is making
+			 * progress.
 			 */
-			bool preempt = lat && (!rctx || !is_lat_cri(rctx));
+			bool preempt = false;
+
+			if (lat) {
+				if (seat_guard) {
+					if (res && !(res->flags & PF_IDLE) &&
+					    rctx && !is_lat_cri(rctx)) {
+						u32 sidx = (u32)target &
+							   (BABY_MAX_CPUS - 1);
+						u64 ran_at =
+							cpu_running_at[sidx];
+
+						preempt = !is_pcpu_task(res) &&
+							  p->static_prio <=
+							  res->static_prio &&
+							  ran_at &&
+							  (s64)(now - ran_at) >=
+							  (s64)BABY_TICK_PREEMPT_PROTECT_NS &&
+							  fl_budget_avail(sidx,
+									  now) > 0 &&
+							  can_resched(rctx);
+					}
+				} else {
+					preempt = !rctx || !is_lat_cri(rctx);
+				}
+			}
 
 			scx_bpf_kick_cpu(target, preempt ? SCX_KICK_PREEMPT
 							 : SCX_KICK_IDLE);

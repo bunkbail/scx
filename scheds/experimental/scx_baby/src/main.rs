@@ -335,6 +335,7 @@ struct Mode {
     game_pin: bool,
     pin_grace_ns: u64,
     pin_max: u32,
+    seat_guard: bool,
 }
 
 /// The `-d` defaults: the original DEADLINE_NS, and the gaming slice.
@@ -368,6 +369,15 @@ impl Mode {
         let plain = opts.plain || plain_1x;
         let game_pin = !opts.no_game_pin && (gaming || opts.game_pin) && plain_vtime;
 
+        /*
+         * The seat guard belongs to the default profile alone. Every
+         * plain variant runs the minimal EDF baseline, whose whole
+         * point is the placement without the guard, and --game has to
+         * stay verifier-DCE-isolated from the default's preemption and
+         * steal rules, so both resolve to false there.
+         */
+        let seat_guard = !plain && !gaming;
+
         Self {
             gaming,
             deadline_us,
@@ -389,6 +399,7 @@ impl Mode {
                 0
             },
             pin_max: if game_pin { opts.pin_max } else { 0 },
+            seat_guard,
         }
     }
 }
@@ -541,6 +552,12 @@ impl<'a> Scheduler<'a> {
         rodata.plain_1x = mode.plain_1x;
         rodata.plain_wake = mode.plain_wake;
         rodata.plain_vtime = mode.plain_vtime;
+        /*
+         * The seat guard is the default profile's alone; every plain
+         * variant and --game publish false, so their BPF branches are
+         * pruned by the verifier and their rodata stays inert.
+         */
+        rodata.seat_guard = mode.seat_guard;
         /*
          * Gaming arms the pin; --no-game-pin or a run that never
          * selects the plain virtual-time queue clears it. The BPF
@@ -1002,6 +1019,35 @@ mod tests {
         assert!(Opts::try_parse_from(["scx_baby", "--game-pin", "--no-game-pin"]).is_err());
     }
 
+    /// The seat guard is the default profile's flag alone: every plain
+    /// variant runs the minimal EDF baseline and --game has to stay
+    /// verifier-DCE-isolated from the default's preemption, deep-rung
+    /// and seat-steal rules, so both publish false.
+    #[test]
+    fn seat_guard_resolves_to_the_default_profile_only() {
+        let cases: &[(&[&str], bool)] = &[
+            (&[], true),
+            (&["--game"], false),
+            (&["--profile", "gaming"], false),
+            (&["--game", "--no-game-pin"], false),
+            (&["--game", "-d", "1000"], false),
+            (&["--plain"], false),
+            (&["--plain-1x"], false),
+            (&["--plain-wake"], false),
+            (&["--plain-vtime"], false),
+            (&["--plain-vtime", "--game-pin"], false),
+            (&["--game", "--plain-wake"], false),
+        ];
+
+        for (args, want) in cases {
+            let mut argv = vec!["scx_baby"];
+            argv.extend_from_slice(args);
+            let mode = Mode::from_opts(&Opts::try_parse_from(&argv).unwrap());
+
+            assert_eq!(mode.seat_guard, *want, "{args:?}");
+        }
+    }
+
     /// Test-only mirror of the wake-rate blend and peak gate in
     /// class.bpf.c. The BPF side cannot be unit tested from userspace, so
     /// this pins the arithmetic the class bar depends on: the 50/50
@@ -1186,6 +1232,8 @@ mod tests {
         ro.plain_wake = plain_wake;
         ro.plain_vtime = plain_vtime;
         ro.game_pin = game_pin;
+        /* The seat guard resolves from the profile, like from_opts(). */
+        ro.seat_guard = !plain && !gaming;
         /* The knobs publish zero whenever the pin resolves off. */
         ro.pin_grace_ns = if game_pin { 20_000_000 } else { 0 };
         ro.pin_max = if game_pin { 2 } else { 0 };
