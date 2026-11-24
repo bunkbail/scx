@@ -50,9 +50,10 @@ const volatile u64 vtime_lag_ns = 20000000ULL;
 
 /*
  * The game pin, armed by --game/--profile gaming and cleared by
- * --no-game-pin or any non-plain run. Userspace rewrites only
- * game_pin, pin_grace_ns and pin_max; the rest are tuned here, where
- * the comments in baby.bpf.h explain what each bar means.
+ * --no-game-pin or any run that does not select the plain virtual-time
+ * queue. Userspace rewrites only game_pin, pin_grace_ns and pin_max;
+ * the rest are tuned here, where the comments in baby.bpf.h explain
+ * what each bar means.
  */
 const volatile bool game_pin;
 const volatile u64 pin_grace_ns = 20000000ULL;
@@ -95,8 +96,8 @@ private(BABY) struct bpf_cpumask __kptr *non_lp_cpumask;
 
 /*
  * The game pin (armed by --game/--profile gaming, cleared by
- * --no-game-pin or a non-plain run; the mechanism is described in
- * baby.bpf.h).
+ * --no-game-pin or a run that does not select the plain virtual-time
+ * queue; the mechanism is described in baby.bpf.h).
  *
  * pin_slots holds the two claims. Its pid word is the claim word: 0 is
  * free, a nonzero pid is the owner, and a takeover is an atomic CAS
@@ -1240,6 +1241,14 @@ __hidden __noinline s32 pin_select_cpu_and(struct task_struct *p, s32 prev_cpu,
 	struct task_ctx *tctx;
 	s32 cpu = -1;
 
+	/*
+	 * Older kernels lack the helper. The branch has to fold to this
+	 * return, or the unresolved call fails the whole load: --game
+	 * arms the pin by default, so the call site is live.
+	 */
+	if (!__COMPAT_HAS_scx_bpf_select_cpu_and)
+		return -1;
+
 	if (mask && !bpf_cpumask_empty(cast_mask(mask)))
 		cpu = scx_bpf_select_cpu_and(p, prev_cpu, wake_flags,
 					     cast_mask(mask), 0);
@@ -1483,11 +1492,12 @@ s32 BPF_STRUCT_OPS(baby_select_cpu, struct task_struct *p,
 			/*
 			 * ops.select_cpu() has to name a valid CPU: the
 			 * kernel rejects anything else and aborts the
-			 * scheduler. prev_cpu always is one, and a task
-			 * wholly inside the shield reaches ops.enqueue(),
-			 * where the stranded park serves it.
+			 * scheduler. prev_cpu is not allowed on every arm
+			 * above, so fall back through the affinity mask.
+			 * A task wholly inside the shield reaches
+			 * ops.enqueue(), where the stranded park serves it.
 			 */
-			return cpu >= 0 ? cpu : prev_cpu;
+			return cpu >= 0 ? cpu : any_allowed_cpu(p, prev_cpu);
 		}
 
 		cpu = prev_cpu;
@@ -1495,11 +1505,12 @@ s32 BPF_STRUCT_OPS(baby_select_cpu, struct task_struct *p,
 		cpu = pick_idle_cpu(p, prev_cpu, wake_flags, &is_idle);
 		/*
 		 * A shield published by another CPU after the gate above
-		 * can make the selector decline. Stay on prev_cpu for the
-		 * same reason: a negative return aborts the scheduler.
+		 * can make the selector decline. Fall back through the
+		 * affinity mask for the same reason: an out-of-mask CPU
+		 * aborts the scheduler, and so does a negative return.
 		 */
 		if (cpu < 0)
-			return prev_cpu;
+			return any_allowed_cpu(p, prev_cpu);
 	}
 	if (is_idle) {
 		if (stats_enabled)

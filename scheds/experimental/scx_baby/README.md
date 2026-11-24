@@ -237,14 +237,17 @@ shielded from every other task. It is a plain-virtual-time overlay, so it
 exists only when the gaming queue is selected, and `--no-game-pin` turns
 it off.
 
-A slot is claimed by duty, a task's core share in q10: the first slot
-needs 665 across the last window and is released below 500. The second
-slot needs 615 twice in a row and only while the machine is less than 55
-percent busy, so a saturated machine does not give a whole core to a
-second thread. A claimed core stays shielded for a 20ms grace window
-measured from the owner's last stop or enqueue, which spans the gap
+A slot is claimed by duty, a task's core share in q10. Both slots need a
+duty of 665 and two consecutive windows at 615 or more; the second also
+needs the first slot's process and a machine less than 55 percent busy, so
+a saturated machine does not give a whole core to a second thread. A slot
+is released below 500. A claimed core stays shielded for a 20ms grace
+window measured from the owner's last stop or enqueue, which spans the gap
 between two frames rather than one, and a slot whose owner has not been
 seen for 600ms can be taken over.
+
+On a kernel without `scx_bpf_select_cpu_and()` the pin keeps its shields
+but takes no idle pick, so it queues the way the plain queue would.
 
 ### Hybrid placement
 

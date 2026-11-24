@@ -139,10 +139,10 @@ extern const volatile u64 vtime_lag_ns;
  * Game pin: the plain virtual-time queue with one or two SMT pairs
  * held for the busiest threads of the game process. --game and
  * --profile gaming arm it by default, and --no-game-pin clears it
- * again. It exists only on top of the plain queue; userspace clears
- * game_pin when the run is not plain, and every branch below it is
- * pruned by the verifier otherwise. The pin's rodata knobs publish
- * zero when it is off.
+ * again. It exists only on top of the plain virtual-time queue;
+ * userspace clears game_pin when the run does not select it, and every
+ * branch below it is pruned by the verifier otherwise. The pin's
+ * rodata knobs publish zero when it is off.
  *
  * @pin_grace_ns: how long a slot keeps shielding its home after its
  *		  owner was last seen enqueued or woken.

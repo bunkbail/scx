@@ -543,8 +543,8 @@ impl<'a> Scheduler<'a> {
         rodata.plain_vtime = mode.plain_vtime;
         /*
          * Gaming arms the pin; --no-game-pin or a run that never
-         * reaches the plain queue clears it. The BPF branches below it
-         * are verifier-pruned when it is off.
+         * selects the plain virtual-time queue clears it. The BPF
+         * branches below it are verifier-pruned when it is off.
          */
         rodata.game_pin = mode.game_pin;
         rodata.pin_grace_ns = mode.pin_grace_ns;
@@ -1154,33 +1154,35 @@ mod tests {
     // scheduler. The topology counts are rodata, so the BPF loops and
     // bounds checks are verified against the synthetic width too, and
     // both hybrid-gate arms are exercised by publishing a tier split
-    // for every shape. The plain flags and the game pin are rodata as
-    // well, so each shape is loaded once per reachable flag
-    // combination, with the rodata production sets for it: a branch the
-    // verifier prunes when the flag is off is still checked when it is
-    // on.
+    // for every shape. The plain flags, the game pin and the profile
+    // are rodata as well, so every combination `Mode::from_opts` can
+    // produce is loaded with its production rodata: a branch the
+    // verifier prunes when a flag is off is still checked when it is
+    // on, and a reachable combination left out of the matrix is a
+    // load-time regression waiting for the kernel that trips it.
     fn load_synthetic(
         nr_cpus: usize,
         plain: bool,
+        plain_1x: bool,
         plain_wake: bool,
         plain_vtime: bool,
         game_pin: bool,
+        gaming: bool,
     ) -> anyhow::Result<()> {
         let mut object = MaybeUninit::uninit();
         let builder = BpfSkelBuilder::default();
         let mut skel = scx_ops_open!(builder, &mut object, baby_ops, None)?;
         let ro = skel.maps.rodata_data.as_mut().unwrap();
-        /* --plain-vtime is the gaming queue, and gaming uses 800us. */
-        ro.deadline_ns = if plain_vtime { 800 } else { 1180 } * 1000;
+        /* Gaming is the only profile that selects the 800us slice. */
+        ro.deadline_ns = if gaming { 800 } else { 1180 } * 1000;
         ro.prio_offset_ns = scaled_prio_offsets(ro.deadline_ns);
-        /* --game --plain-wake selects the virtual-time queue and pins. */
-        ro.gaming = plain_vtime;
+        ro.gaming = gaming;
         ro.nr_cpu_ids = nr_cpus as u64;
         ro.nr_node_ids = 2;
         ro.nr_big_cpus = (nr_cpus / 2) as u64;
         ro.nr_little_cpus = (nr_cpus - nr_cpus / 2) as u64;
-        ro.plain = plain || plain_wake || plain_vtime;
-        ro.plain_1x = plain_wake || plain_vtime;
+        ro.plain = plain;
+        ro.plain_1x = plain_1x;
         ro.plain_wake = plain_wake;
         ro.plain_vtime = plain_vtime;
         ro.game_pin = game_pin;
@@ -1210,22 +1212,52 @@ mod tests {
         })));
 
         let mut failures = Vec::new();
-        for (plain, plain_wake, plain_vtime, game_pin) in [
-            (false, false, false, false),
-            (true, false, false, false),
-            (true, true, false, false),
-            (true, false, true, false),
-            (true, true, true, false),
-            (true, false, true, true),
-            (true, true, true, true),
+        /*
+         * Every tuple Mode::from_opts can produce, named by the argv
+         * that produces it. Twelve shapes x three widths: a reachable
+         * combination that is missing here is a load the verifier
+         * never sees.
+         */
+        for (plain, plain_1x, plain_wake, plain_vtime, game_pin, gaming) in [
+            /* default */
+            (false, false, false, false, false, false),
+            /* --plain */
+            (true, false, false, false, false, false),
+            /* --plain-1x */
+            (true, true, false, false, false, false),
+            /* --plain-wake */
+            (true, true, true, false, false, false),
+            /* --plain-vtime */
+            (true, true, false, true, false, false),
+            /* --plain-wake --plain-vtime */
+            (true, true, true, true, false, false),
+            /* --plain-vtime --game-pin */
+            (true, true, false, true, true, false),
+            /* --plain-wake --plain-vtime --game-pin */
+            (true, true, true, true, true, false),
+            /* --game --no-game-pin */
+            (true, true, false, true, false, true),
+            /* --game */
+            (true, true, false, true, true, true),
+            /* --game --no-game-pin --plain-wake */
+            (true, true, true, true, false, true),
+            /* --game --plain-wake */
+            (true, true, true, true, true, true),
         ] {
             for nr_cpus in [1usize, 14, 128] {
-                if let Err(error) =
-                    load_synthetic(nr_cpus, plain, plain_wake, plain_vtime, game_pin)
-                {
+                if let Err(error) = load_synthetic(
+                    nr_cpus,
+                    plain,
+                    plain_1x,
+                    plain_wake,
+                    plain_vtime,
+                    game_pin,
+                    gaming,
+                ) {
                     failures.push(format!(
-                        "{nr_cpus} CPUs plain={plain} wake={plain_wake} \
-                         vtime={plain_vtime} pin={game_pin}: {error:#}"
+                        "{nr_cpus} CPUs plain={plain} 1x={plain_1x} \
+                         wake={plain_wake} vtime={plain_vtime} pin={game_pin} \
+                         gaming={gaming}: {error:#}"
                     ));
                 }
             }
