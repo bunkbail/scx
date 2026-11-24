@@ -149,10 +149,10 @@ extern const volatile u64 vtime_lag_ns;
  * @pin_promote0: duty, in q10 of a core, that a task must have held
  *		  across its last window to claim a slot.
  * @pin_release0: duty below which the owner gives its slot back.
- * @pin_promote1: duty that must hold before a second thread of the
- *		  same process may claim the other slot.
- * @pin_streak_need: consecutive windows at @pin_promote1 needed for
- *		  that second claim.
+ * @pin_promote1: duty a window must hold to extend the streak that
+ *		  @pin_streak_need counts.
+ * @pin_streak_need: consecutive windows at @pin_promote1 that either
+ *		  slot needs before it is claimed.
  * @pin_busy_max: machine-wide busy share, in q10, above which the
  *		  second slot stays unclaimed.
  * @pin_stale_ns: age at which a slot's owner is presumed gone and
@@ -922,7 +922,7 @@ __hidden s32 select_cpu_no_lp(struct task_struct *p, s32 prev_cpu,
  * while a bursty helper does not. A slot is claimed by an atomic CAS
  * on its pid word, refreshed by its owner on every window roll, and
  * released when the owner's duty falls under the release bar. The two
- * slots cover an SMT pair: slot 0 is open to the busiest thread, slot
+ * slots each hold one SMT pair: slot 0 is open to the busiest thread, slot
  * 1 is held for a second thread of the same process once the first has
  * proven its duty and the machine has headroom, and its home must be a
  * different physical core so the pair lands on two cores rather than

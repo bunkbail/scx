@@ -1504,10 +1504,11 @@ s32 BPF_STRUCT_OPS(baby_select_cpu, struct task_struct *p,
 	} else {
 		cpu = pick_idle_cpu(p, prev_cpu, wake_flags, &is_idle);
 		/*
-		 * A shield published by another CPU after the gate above
-		 * can make the selector decline. Fall back through the
-		 * affinity mask for the same reason: an out-of-mask CPU
-		 * aborts the scheduler, and so does a negative return.
+		 * A shield published after the gate above can make the
+		 * selector decline. Fall back through the affinity mask:
+		 * a negative return aborts, and an out-of-mask CPU is no
+		 * placement, its node queue unreachable from the CPUs
+		 * that can run the task.
 		 */
 		if (cpu < 0)
 			return any_allowed_cpu(p, prev_cpu);

@@ -247,7 +247,8 @@ between two frames rather than one, and a slot whose owner has not been
 seen for 600ms can be taken over.
 
 On a kernel without `scx_bpf_select_cpu_and()` the pin keeps its shields
-but takes no idle pick, so it queues the way the plain queue would.
+but takes no idle pick: a shield makes the wake selector decline, so a wake
+queues while another CPU may idle. `--no-game-pin` avoids that.
 
 ### Hybrid placement
 
@@ -369,8 +370,8 @@ policy.
   `--pin-max <1|2>`: the SMT-pair pin. `gaming` arms it, and
   `--game-pin` arms it on a bare `--plain-vtime` run; `--no-game-pin`
   clears it, and the two conflict. The grace window defaults to 20000us
-  and `--pin-max` to 2 slots. All three are inert unless the pin resolves
-  on.
+  and `--pin-max` to 2 slots. The two knobs are inert unless the pin
+  resolves on.
 - `--stats <SECS>`: enable the stats report and run normally.
 - `--monitor <SECS>`: run in stats monitoring mode without launching the
   scheduler.
