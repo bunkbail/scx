@@ -353,17 +353,20 @@ impl Mode {
         /*
          * Each plain variant implies --plain, and --plain-wake and
          * --plain-vtime both imply --plain-1x. The game pin is an
-         * overlay on the plain queue only: without it every pin
-         * branch stays dead in the BPF program.
+         * overlay on the plain virtual-time queue only: without it
+         * every pin branch stays dead in the BPF program.
          *
          * Gaming arms the pin, --no-game-pin clears it, and an explicit
-         * --game-pin still arms it on --plain-vtime. A run outside the
-         * plain queue resolves to false whatever the flags say.
+         * --game-pin still arms it on --plain-vtime. The gate is
+         * plain_vtime rather than plain, so --plain, --plain-1x and
+         * --plain-wake, which never select the virtual-time queue,
+         * stay pin-free. That is the queue the warning names and the
+         * README describes.
          */
         let plain_vtime = opts.plain_vtime || gaming;
         let plain_1x = opts.plain_1x || opts.plain_wake || plain_vtime;
         let plain = opts.plain || plain_1x;
-        let game_pin = !opts.no_game_pin && (gaming || opts.game_pin) && plain;
+        let game_pin = !opts.no_game_pin && (gaming || opts.game_pin) && plain_vtime;
 
         Self {
             gaming,
@@ -794,7 +797,7 @@ fn main() -> Result<()> {
             mode.deadline_us
         );
     }
-    if opts.game_pin && !mode.plain {
+    if opts.game_pin && !mode.plain_vtime {
         warn!(
             "--game-pin needs the plain virtual-time queue (--game or \
              --plain-vtime), ignoring it"
@@ -925,10 +928,13 @@ mod tests {
      * The pin resolves from the profile and the queue: --game and
      * --profile gaming arm it, --no-game-pin clears it, an explicit
      * --game-pin still arms it on --plain-vtime, and a run outside the
-     * plain queue stays off whatever the flags say. The knobs are
-     * rodata the BPF side reads only when the pin is on, so they
-     * publish zero whenever it is off: a default run's rodata is inert
-     * field by field, not only through the verifier pruning the
+     * plain virtual-time queue stays off whatever the flags say. The
+     * last two cases pin that boundary: --plain-wake alone never
+     * selects the virtual-time queue, and --game --plain-wake does,
+     * which makes it a pin-on shape the verifier gate has to load. The
+     * knobs are rodata the BPF side reads only when the pin is on, so
+     * they publish zero whenever it is off: a default run's rodata is
+     * inert field by field, not only through the verifier pruning the
      * branches.
      */
     #[test]
@@ -964,6 +970,14 @@ mod tests {
             (
                 &["--game-pin"],
                 (false, false, false, false, false, 1180, 0, 0),
+            ),
+            (
+                &["--plain-wake", "--game-pin"],
+                (false, true, true, false, false, 1180, 0, 0),
+            ),
+            (
+                &["--game", "--plain-wake"],
+                (true, true, true, true, true, 800, 20_000_000, 2),
             ),
         ];
 
@@ -1159,7 +1173,8 @@ mod tests {
         /* --plain-vtime is the gaming queue, and gaming uses 800us. */
         ro.deadline_ns = if plain_vtime { 800 } else { 1180 } * 1000;
         ro.prio_offset_ns = scaled_prio_offsets(ro.deadline_ns);
-        ro.gaming = plain_vtime && !plain_wake;
+        /* --game --plain-wake selects the virtual-time queue and pins. */
+        ro.gaming = plain_vtime;
         ro.nr_cpu_ids = nr_cpus as u64;
         ro.nr_node_ids = 2;
         ro.nr_big_cpus = (nr_cpus / 2) as u64;
@@ -1202,6 +1217,7 @@ mod tests {
             (true, false, true, false),
             (true, true, true, false),
             (true, false, true, true),
+            (true, true, true, true),
         ] {
             for nr_cpus in [1usize, 14, 128] {
                 if let Err(error) =
