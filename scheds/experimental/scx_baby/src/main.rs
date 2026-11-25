@@ -1150,6 +1150,74 @@ mod tests {
         assert!(peak >= 5);
     }
 
+    /// TIME_PERIOD / 4, the runtime a seat-guarded task may accumulate
+    /// without a wake before its peak hold is dropped.
+    const WAKELESS_DEMOTE_NS: u64 = 200_000_000 / 4;
+
+    /// Test-only mirror of the seat-guard arm of update_bursts(): the
+    /// peak is zeroed once the runtime since the last wake passes the
+    /// demotion bar. Wakes alone cannot demote a task that stopped
+    /// waking, so this is the only path that unlatches the class.
+    fn wakeless_peak(guard: bool, peak: u32, runs: &[u64]) -> u32 {
+        let total: u64 = runs.iter().sum();
+
+        if guard && total > WAKELESS_DEMOTE_NS {
+            0
+        } else {
+            peak
+        }
+    }
+
+    #[test]
+    fn a_burst_then_hog_loses_the_peak() {
+        // One 120Hz burst earns the foreground hold, then the task runs
+        // continuously and never wakes again. 50ms of runtime keeps the
+        // credit, the next accounting tick past it drops the peak.
+        let peak = class_peak_after(&[12; 48]);
+
+        assert!(peak >= 10);
+        assert_eq!(wakeless_peak(true, peak, &[1_000_000; 50]), peak);
+        assert_eq!(wakeless_peak(true, peak, &[1_000_000; 51]), 0);
+    }
+
+    #[test]
+    fn wakeless_demotion_is_off_outside_the_guard() {
+        // --game and every plain variant publish seat_guard false, so the
+        // verifier prunes the demotion branch there and their behaviour is
+        // unchanged no matter how long a task runs without waking.
+        for args in [&["--game"][..], &["--plain"][..], &["--plain-1x"][..]] {
+            let mut argv = vec!["scx_baby"];
+            argv.extend_from_slice(args);
+
+            let mode = Mode::from_opts(&Opts::try_parse_from(&argv).unwrap());
+
+            assert_eq!(
+                wakeless_peak(mode.seat_guard, 12, &[3_000_000_000]),
+                12,
+                "{args:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_latency_bar_interval_stays_under_the_demotion_bar() {
+        // A task exactly at the latency bar wakes every 20ms, well under
+        // the 50ms demotion bar, so a waker that still meets the bar is
+        // never demoted between two of its wakes.
+        assert_eq!(wakeless_peak(true, 5, &[100_000_000 / 5]), 5);
+    }
+
+    #[test]
+    fn a_hitch_re_earns_the_class_from_the_kept_average() {
+        // The peak is zeroed but wake_samples and wakeup_freq are kept,
+        // so a throttled 60Hz thread re-earns the class on its next
+        // wakes instead of replaying the four-sample warmup.
+        let avg = wake_rate_blend(6, 1, 4);
+
+        assert_eq!(avg, 5);
+        assert!(wake_rate_blend(avg, 6, 4) >= 5);
+    }
+
     #[test]
     fn woke_task_keeps_interactive_through_a_zero_window() {
         // Mirror of is_interactive: runtime in either window, or four

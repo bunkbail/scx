@@ -101,6 +101,21 @@ _Static_assert(FOREGROUND_WAKE_FREQ > LAT_CRI_WAKE_FREQ,
 	       "the foreground bar must stay above the latency bar");
 _Static_assert(FOREGROUND_WAKE_FREQ <= 100,
 	       "the wake sample is capped at 100, so a higher bar is unreachable");
+
+/*
+ * CPU runtime, since the last wake, a seat-guarded task may accumulate
+ * before its latency credit is dropped.
+ *
+ * The peak hold latches by design (see struct task_ctx), and a task that
+ * bursts once and then runs continuously never re-enters
+ * class_on_runnable() to decay it, so the hold alone keeps a burst-then-
+ * hog in the latency class forever. One quarter window is the heavy bar,
+ * and it sits above the interval of a task at the latency bar, so a
+ * waker that still meets the bar is never demoted between two wakes.
+ */
+#define WAKELESS_DEMOTE_NS	(TIME_PERIOD / 4)
+_Static_assert(WAKELESS_DEMOTE_NS > 100ULL * NSEC_PER_MSEC / LAT_CRI_WAKE_FREQ,
+	       "a task at the latency bar must not be demoted between wakes");
 #define MIN_NICE		(-20)
 #define MAX_NICE		19
 #define MAX_RT_PRIO		100
@@ -549,10 +564,13 @@ struct task_ctx {
 	 * done. The hold then decays by 1/64 per wake only while above
 	 * 64 (a shift of a value below 64 is zero), so it falls from a
 	 * spike to 63 and stays there. 63 is far above the class bar
-	 * (5): the latency class latches once earned, by design. A real
-	 * decay would strip the class from a frame-paced thread the
-	 * moment overcommit throttles its frame rate, which is the state
-	 * the credit exists for.
+	 * (5): on wakes alone the latency class latches once earned, by
+	 * design. A real wake-rate decay would strip the class from a
+	 * frame-paced thread the moment overcommit throttles its frame
+	 * rate, which is the state the credit exists for. The latch is
+	 * only safe while the task keeps waking: one that stops is
+	 * demoted by update_bursts() after WAKELESS_DEMOTE_NS of runtime
+	 * (seat guard only), so a burst-then-hog cannot keep the class.
 	 */
 	u32 peak_freq;
 
@@ -645,6 +663,15 @@ struct task_ctx {
 	u32 duty_q10;
 	u8 pin_streak;
 	u64 pin_window;
+
+	/*
+	 * CPU runtime since the last wake, seat guard only: a value above
+	 * WAKELESS_DEMOTE_NS drops the peak hold, which is how a task that
+	 * burst once and then became a continuous hog loses its latency
+	 * credit. Reset on every wake, so only a task that stopped waking
+	 * accumulates it.
+	 */
+	u64 wakeless_ns;
 };
 
 /* Virtual-time key encoding for --plain-vtime (main.bpf.c). */
@@ -786,7 +813,8 @@ static __always_inline bool is_heavy_proven(const struct task_ctx *tctx)
  * consumes almost nothing still has latency to protect. A task that
  * never leaves runnable state (preempted, slice-expired) never re-runs
  * the wake-rate EWMA, so a preempted batch victim cannot pass as a
- * waker.
+ * waker, and one that burst once and then ran continuously drops the
+ * credit once it has run WAKELESS_DEMOTE_NS since its last wake.
  */
 static __always_inline bool is_lat_cri(const struct task_ctx *tctx)
 {

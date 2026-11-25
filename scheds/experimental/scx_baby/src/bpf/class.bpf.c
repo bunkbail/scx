@@ -88,6 +88,12 @@ __hidden void update_bursts(struct task_ctx *tctx, u64 now)
 	if (delta) {
 		account_bursts(tctx, delta, now);
 		tctx->last_acc_at = now;
+		if (seat_guard) {
+			tctx->wakeless_ns += delta;
+			if (tctx->peak_freq &&
+			    tctx->wakeless_ns > WAKELESS_DEMOTE_NS)
+				tctx->peak_freq = 0;
+		}
 	}
 }
 
@@ -167,6 +173,9 @@ __hidden void class_on_runnable(struct task_ctx *tctx, u64 enq_flags, u64 now)
 	if (!(enq_flags & SCX_ENQ_WAKEUP))
 		return;
 
+	if (seat_guard)
+		tctx->wakeless_ns = 0;
+
 	/*
 	 * A wake that skipped ops.select_cpu() still needs the burst
 	 * window rolled before the tier decision below reads it.
@@ -241,7 +250,9 @@ __hidden void class_on_runnable(struct task_ctx *tctx, u64 enq_flags, u64 now)
 		 * four-sample warmup is done. The warmup itself rejects
 		 * a single spike: one 100 sample followed by three slow
 		 * ones blends down to 7, and the peak cannot arm before
-		 * the fourth sample.
+		 * the fourth sample. Wakes alone cannot demote a task
+		 * that stopped waking; update_bursts() drops the hold
+		 * after WAKELESS_DEMOTE_NS of runtime without one.
 		 */
 		tctx->peak_freq -= tctx->peak_freq >> 6;
 		if (tctx->wake_samples >= WAKE_SANE_MIN) {
@@ -314,6 +325,7 @@ __hidden void class_init_task(struct task_ctx *tctx, struct task_struct *p, u64 
 	tctx->wakeup_freq = 0;
 	tctx->peak_freq = 0;
 	tctx->wake_samples = 0;
+	tctx->wakeless_ns = 0;
 	tctx->prev_bursts = 0;
 	{
 		struct task_struct *parent = p->real_parent;
