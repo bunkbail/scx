@@ -49,6 +49,7 @@
     "scx_rusty"
   ],
   "experimental": [
+    "scx_baby",
     "scx_chaos",
     "scx_flow",
     "scx_forge",
