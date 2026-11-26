@@ -383,7 +383,7 @@ extern u64 node_pending[2][BABY_NODE_CLOCK_NR];
  * counters must not share its line (see stats.bpf.c).
  */
 extern volatile u64 nr_running __attribute__((aligned(64)));
-extern volatile u64 nr_direct_dispatches;
+extern volatile u64 nr_direct_dispatches __attribute__((aligned(64)));
 extern volatile u64 nr_preemptions, nr_boosts, nr_sticky;
 extern volatile u64 nr_preempt_refused_lat;
 extern volatile u64 nr_coldspreads;
