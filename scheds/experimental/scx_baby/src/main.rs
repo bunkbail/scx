@@ -948,6 +948,10 @@ mod tests {
         assert_eq!(two.pin_grace_us, 20000);
     }
 
+    /// The pin state a case expects: (gaming, plain, plain_1x,
+    /// plain_vtime, game_pin, deadline_us, pin_grace_ns, pin_max).
+    type PinExpect = (bool, bool, bool, bool, bool, u64, u64, u32);
+
     /*
      * The pin resolves from the profile and the queue: --game and
      * --profile gaming arm it, --no-game-pin clears it, an explicit
@@ -963,9 +967,8 @@ mod tests {
      */
     #[test]
     fn game_pin_resolves_from_the_profile_and_the_plain_queue() {
-        // argv, then (gaming, plain, plain_1x, plain_vtime, game_pin,
-        // deadline_us, pin_grace_ns, pin_max).
-        let cases: &[(&[&str], (bool, bool, bool, bool, bool, u64, u64, u32))] = &[
+        // argv, then the expected PinExpect fields.
+        let cases: &[(&[&str], PinExpect)] = &[
             (&[], (false, false, false, false, false, 1180, 0, 0)),
             (
                 &["--game"],
