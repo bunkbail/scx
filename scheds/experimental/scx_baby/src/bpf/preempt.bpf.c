@@ -50,22 +50,9 @@
  */
 #define BABY_TICK_PREEMPT_FALLBACK_NS	(100ULL * NSEC_PER_USEC)
 
-/*
- * Periodic tick: account bursts, advance the CPU performance ledger and
- * renew the deadline once reached. The only tick-driven preemption is
- * the saturation gate below; the rotation order stays the deadline
- * order.
- */
-void BPF_STRUCT_OPS(baby_tick, struct task_struct *p)
+static __always_inline void
+tick_charge_fast_lane(struct task_struct *p, struct task_ctx *tctx, u64 now)
 {
-	struct task_ctx *tctx = try_lookup_task_ctx(p);
-	u64 now;
-
-	if (!tctx)
-		return;
-
-	now = bpf_ktime_get_ns();
-
 	/*
 	 * Keep the fast-lane budget current: a tick inside a long
 	 * fast-lane slice accounts the contested runtime since the last
@@ -79,23 +66,11 @@ void BPF_STRUCT_OPS(baby_tick, struct task_struct *p)
 		refill_fl_budget(idx, now);
 		charge_fl_runtime(idx, now, bulk_waiting(cpu));
 	}
+}
 
-	update_bursts(tctx, now);
-
-	/*
-	 * The game pin samples the window the burst tracker just rolled:
-	 * inside a window this returns on the stamp, so the tick pays
-	 * nothing until the next 200ms boundary.
-	 */
-	if (game_pin)
-		pin_account(p, tctx, now);
-
-	cpuperf_on_tick(p, now,
-			is_heavy_proven(tctx) || is_foreground(tctx));
-
-	if (reached_deadline(tctx, now))
-		tctx->deadline = calc_deadline(p, tctx, now);
-
+static __always_inline void
+tick_saturation_gate(struct task_struct *p, struct task_ctx *tctx, u64 now)
+{
 	/*
 	 * The saturation preemption gate (see the top of the file). The
 	 * victim's residency comes from its ops.running() stamp; the
@@ -185,6 +160,43 @@ void BPF_STRUCT_OPS(baby_tick, struct task_struct *p)
 			}
 		}
 	}
+}
+
+/*
+ * Periodic tick: account bursts, advance the CPU performance ledger and
+ * renew the deadline once reached. The only tick-driven preemption is
+ * the saturation gate below; the rotation order stays the deadline
+ * order.
+ */
+void BPF_STRUCT_OPS(baby_tick, struct task_struct *p)
+{
+	struct task_ctx *tctx = try_lookup_task_ctx(p);
+	u64 now;
+
+	if (!tctx)
+		return;
+
+	now = bpf_ktime_get_ns();
+
+	tick_charge_fast_lane(p, tctx, now);
+
+	update_bursts(tctx, now);
+
+	/*
+	 * The game pin samples the window the burst tracker just rolled:
+	 * inside a window this returns on the stamp, so the tick pays
+	 * nothing until the next 200ms boundary.
+	 */
+	if (game_pin)
+		pin_account(p, tctx, now);
+
+	cpuperf_on_tick(p, now,
+			is_heavy_proven(tctx) || is_foreground(tctx));
+
+	if (reached_deadline(tctx, now))
+		tctx->deadline = calc_deadline(p, tctx, now);
+
+	tick_saturation_gate(p, tctx, now);
 }
 
 /*
