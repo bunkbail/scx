@@ -14,6 +14,7 @@ fn main() {
         .add_source("src/bpf/idle.bpf.c")
         .add_source("src/bpf/power.bpf.c")
         .add_source("src/bpf/balance.bpf.c")
+        .add_source("src/bpf/pin.bpf.c")
         .compile_link_gen()
         .unwrap();
 }
