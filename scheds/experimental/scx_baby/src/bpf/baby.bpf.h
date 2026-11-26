@@ -15,6 +15,19 @@
 #include "intf.h"
 
 /*
+ * The tier masks and the pin worker mask. Each is allocated once in
+ * ops.init() and replaced only through bpf_kptr_xchg, so the storage
+ * lives in .data.BABY in main.bpf.c and every other module reads it
+ * through these declarations. A module that accidentally gets its own
+ * definition compiles and loads, but starts NULL, and every reader
+ * treats a NULL mask as "no restriction".
+ */
+extern struct bpf_cpumask __kptr *big_cpumask;
+extern struct bpf_cpumask __kptr *little_cpumask;
+extern struct bpf_cpumask __kptr *non_lp_cpumask;
+extern struct bpf_cpumask __kptr *pin_worker_cpumask;
+
+/*
  * Tasks wait in one deadline-ordered queue per NUMA node, mirroring the
  * original global run list. The DSQ id is the node id; a single-node
  * machine has one queue. An idle CPU pulls the earliest-deadline task,
