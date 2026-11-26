@@ -1102,7 +1102,7 @@ extern u32 pin_shield_n;
 extern volatile u32 machine_busy_q10;
 
 /*
- * main.bpf.c: the game pin's accounting, placement and dispatch hooks.
+ * pin.bpf.c: the game pin's accounting, placement and dispatch hooks.
  */
 
 __hidden void pin_mask_rebuild(void);
