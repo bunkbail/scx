@@ -1,7 +1,7 @@
 /* SPDX-License-Identifier: GPL-2.0 */
 /*
  * scx_baby: the queue occupancy and pending counts, the tag encoding, the
- * fast-lane budget forecast and the dispatch.bpf.c prototypes.
+ * fast-lane budget accounting and the dispatch.bpf.c prototypes.
  *
  * Scoped header: baby.bpf.h includes it, and it includes nothing
  * itself, so it reads the core types and macros defined there.
@@ -206,6 +206,95 @@ static __always_inline bool baby_insert_vtime(struct task_struct *p,
 	}
 	tctx->queued_tag = tag;
 	return true;
+}
+
+/*
+ * Bulk backstop: the longest a CPU may run nothing but the fast lane
+ * while bulk work keeps waiting for it. The time budget alone cannot
+ * bound this: its credit is wall time, so a supply of fast-lane work
+ * that switches often enough keeps the credit ahead of the charges. A
+ * bulk task pinned to the CPU then waits behind a lane no other CPU can
+ * pull, and the kernel's runnable-task watchdog unloads the scheduler
+ * after five seconds. When the stamp is older than the bound, the
+ * dispatcher serves bulk whatever the budget says.
+ *
+ * The stamp means "bulk last ran here, or had nothing to wait for
+ * here": a quiet period refreshes it, so a burst that arrives after
+ * 20ms of no bulk starts the clock instead of inheriting the idle time
+ * and displacing a latency-critical resident at once.
+ */
+#define BABY_BULK_BACKSTOP_NS	(20ULL * NSEC_PER_MSEC)
+
+static __always_inline void refill_fl_budget(u32 idx, u64 now)
+{
+	u64 elapsed = now - fl_budget_at[idx];
+	s64 credit;
+
+	if (!elapsed)
+		return;
+	/*
+	 * Cap the credit window: a CPU that has been idle for a long
+	 * time may start with a full bucket, not an unbounded one.
+	 */
+	if (elapsed > 100 * NSEC_PER_MSEC)
+		elapsed = 100 * NSEC_PER_MSEC;
+	credit = (s64)(elapsed * 2 / 3);
+	fl_budget_ns[idx] = MIN(fl_budget_ns[idx] + credit,
+				(s64)(4 * deadline_ns));
+	fl_budget_at[idx] = now;
+}
+
+/*
+ * Whether bulk work waits for a CPU: its own seat or the node queue.
+ */
+static __always_inline bool bulk_waiting(s32 cpu)
+{
+	s32 node = __COMPAT_scx_bpf_cpu_node(cpu);
+	u32 idx = (u32)cpu & (BABY_MAX_CPUS - 1);
+	u32 nidx = (u32)node & (BABY_NODE_CLOCK_NR - 1);
+
+	/*
+	 * Both counts at zero prove nothing was waiting on either bulk
+	 * queue when the reader looked, so the probes below are skipped on
+	 * the uncontended case. A count that a departure the scheduler
+	 * never observed left high only costs the probes.
+	 */
+	if (!READ_ONCE(seat_pending[0][idx]) &&
+	    !READ_ONCE(node_pending[0][nidx]))
+		return false;
+
+	return (READ_ONCE(seat_pending[0][idx]) &&
+		scx_bpf_dsq_nr_queued(cpu2dsq(cpu))) ||
+	       (READ_ONCE(node_pending[0][nidx]) &&
+		scx_bpf_dsq_nr_queued(node));
+}
+
+/*
+ * Charge the fast-lane runtime consumed since the last accounting
+ * point. Only a contested interval debits the bucket: while no bulk
+ * work waits, the fast lane runs freely and must not bank debt that
+ * would stall it the moment bulk appears. The charge is capped at one
+ * fourfold slice, the longest a fast-lane task can run without a tick,
+ * so a stale stamp cannot clear the bucket in one go. The debt floor
+ * is two base slices.
+ */
+static __always_inline void charge_fl_runtime(u32 idx, u64 now,
+					      bool contended)
+{
+	u64 started = cpu_fl_running_at[idx];
+	s64 floor = -(s64)(2 * deadline_ns);
+	u64 ran;
+
+	if (!started) {
+		cpu_fl_running_at[idx] = now;
+		return;
+	}
+	ran = now - started;
+	if (ran > 4 * deadline_ns)
+		ran = 4 * deadline_ns;
+	if (contended)
+		fl_budget_ns[idx] = MAX(fl_budget_ns[idx] - (s64)ran, floor);
+	cpu_fl_running_at[idx] = now;
 }
 
 #endif /* __BABY_DISPATCH_H */

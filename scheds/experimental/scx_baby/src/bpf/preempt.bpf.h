@@ -1,7 +1,7 @@
 /* SPDX-License-Identifier: GPL-2.0 */
 /*
  * scx_baby: the preemption floor the tick gate and the warm-seat placement
- * both read.
+ * read, and the plain wake gate.
  *
  * Scoped header: baby.bpf.h includes it, and it includes nothing
  * itself, so it reads the core types and macros defined there.
@@ -34,5 +34,21 @@
  * tick, the enqueue and the dispatch all test it.
  */
 extern u64 node_preempt_claim[BABY_NODE_CLOCK_NR];
+
+/* Plain wake gate: the residency floor and the short-burst bound. */
+#define PLAIN_WAKE_PROTECT_NS		(200ULL * NSEC_PER_USEC)
+#define PLAIN_WAKE_SHORT_NS		(500ULL * NSEC_PER_USEC)
+
+/* Whether a plain-mode wake may cut @victim for @wakee. */
+static __always_inline bool plain_wake_cut(const struct task_ctx *wakee,
+					   const struct task_ctx *victim)
+{
+	if ((s64)(victim->deadline - wakee->deadline) >
+	    (s64)(deadline_ns / 2))
+		return true;
+
+	return !is_foreground(wakee) &&
+	       wakee->last_run_ns < PLAIN_WAKE_SHORT_NS;
+}
 
 #endif /* __BABY_PREEMPT_H */
