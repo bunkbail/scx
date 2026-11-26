@@ -2,11 +2,14 @@
 /*
  * scx_baby: sched_ext port of the Baby Scheduler deadline variant (baby-dl)
  *
- * Shared interface of the BPF modules. Every module includes this header:
- * it holds the shared types, the declarations of the tunables and counters
- * the skeleton publishes to userspace, the pure helpers and the
- * cross-module prototypes. Maps and globals are defined in exactly one
- * module and reached elsewhere only through what is declared here.
+ * Umbrella header of the BPF modules: every module includes this one, and
+ * this one includes the scoped headers. It keeps the shared types, the
+ * tunables and counters the skeleton publishes to userspace, the pure
+ * helpers and the cross-module prototypes. The queue counters and the
+ * statistics sit in stats.bpf.h and dispatch.bpf.h, the preemption floor
+ * in preempt.bpf.h, the idle and direct-dispatch interface in idle.bpf.h
+ * and the game pin in pin.bpf.h. Maps and globals are defined in exactly
+ * one module and reached elsewhere only through what is declared here.
  */
 #ifndef __BABY_H
 #define __BABY_H
@@ -188,42 +191,6 @@ extern const volatile u64 vtime_lag_ns;
 extern const volatile bool seat_guard;
 
 /*
- * Game pin: the plain virtual-time queue with one or two SMT pairs
- * held for the busiest threads of the game process. --game and
- * --profile gaming arm it by default, and --no-game-pin clears it
- * again. It exists only on top of the plain virtual-time queue;
- * userspace clears game_pin when the run does not select it, and every
- * branch below it is pruned by the verifier otherwise. The pin's
- * rodata knobs publish zero when it is off.
- *
- * @pin_grace_ns: how long a slot keeps shielding its home after its
- *		  owner was last seen enqueued or woken.
- * @pin_promote0: duty, in q10 of a core, that a task must have held
- *		  across its last window to claim a slot.
- * @pin_release0: duty below which the owner gives its slot back.
- * @pin_promote1: duty a window must hold to extend the streak that
- *		  @pin_streak_need counts.
- * @pin_streak_need: consecutive windows at @pin_promote1 that either
- *		  slot needs before it is claimed.
- * @pin_busy_max: machine-wide busy share, in q10, above which the
- *		  second slot stays unclaimed.
- * @pin_stale_ns: age at which a slot's owner is presumed gone and
- *		  any task may take the slot over.
- * @pin_challenger: duty margin by which a live slot can still be
- *		  taken over by a busier task.
- */
-extern const volatile bool game_pin;
-extern const volatile u64 pin_grace_ns;
-extern const volatile u32 pin_max;
-extern const volatile u32 pin_promote0;
-extern const volatile u32 pin_release0;
-extern const volatile u64 pin_stale_ns;
-extern const volatile u32 pin_promote1;
-extern const volatile u32 pin_streak_need;
-extern const volatile u32 pin_busy_max;
-extern const volatile u32 pin_challenger;
-
-/*
  * The wait/census instrument and the distance histograms run; set
  * from --stats at load.
  */
@@ -259,267 +226,6 @@ _Static_assert(BABY_CPU_DSQ_BASE + BABY_MAX_CPUS <= BABY_FL_CPU_DSQ_BASE,
 	       "per-CPU DSQ id space overlaps the fast-lane seats");
 _Static_assert(BABY_FL_NODE_DSQ_BASE + BABY_MAX_NODES <= BABY_CPU_DSQ_BASE,
 	       "per-node DSQ id space overlaps the bulk seats");
-
-/*
- * Per-CPU running-class residency, stamped in ops.running() and cleared
- * in ops.stopping(). Queue depth cannot answer whether a CPU runs a
- * tick-cuttable bulk resident: CPU-bound workers never queue, so bulk
- * depth can read zero while bulk residency is total. The fast-lane
- * oversubscription gate, the fast-lane budget and the dispatch keep
- * read this instead.
- */
-extern bool cpu_is_lat[BABY_MAX_CPUS];
-extern bool cpu_running[BABY_MAX_CPUS];
-
-/*
- * How long a victim must have held a CPU before a waiting task may
- * preempt it. The floor exists so two waiters cannot ping-pong one CPU:
- * a victim that just started makes progress before it is displaced
- * again. On a saturated CPU the floor is also the extra wait every
- * wake-side handoff pays on top of the victim's rotation, and a frame
- * producer at several hundred frames per second runs for only about a
- * millisecond per frame: a victim that has already held the CPU for
- * 200us covers a fifth of that frame, and waiting it out costs a whole
- * frame period. Fifty microseconds still gives a displaced task its
- * first slice of progress; the per-node claim and the latency-critical
- * victim refusal bound the churn on top of it.
- */
-#define BABY_TICK_PREEMPT_PROTECT_NS	(50ULL * NSEC_PER_USEC)
-
-/*
- * The residency stamp and the fast-lane budget, defined in main.bpf.c.
- * The guarded warm-seat preemption in balance.bpf.c reads them without
- * owning them: it asks the same questions the tick gate asks, so a seat
- * placement and a tick cut cannot disagree about whether a victim is
- * past the floor or whether the fast lane can still pay.
- */
-extern u64 cpu_running_at[BABY_MAX_CPUS];
-extern s64 fl_budget_ns[BABY_MAX_CPUS];
-extern u64 fl_budget_at[BABY_MAX_CPUS];
-
-/*
- * The fast-lane credit a CPU holds after the refill its next dispatch
- * would perform, computed without mutating the bucket: the seat guard
- * asks whether the fast lane can still pay before it takes a seat, and
- * a helper that refilled would grant the credit it is testing for.
- * Same window cap and two-thirds rate as refill_fl_budget(), capped at
- * the bucket's own ceiling, so the forecast and the real refill agree.
- */
-static __always_inline s64 fl_budget_avail(u32 idx, u64 now)
-{
-	u32 i = idx & (BABY_MAX_CPUS - 1);
-	u64 at = READ_ONCE(fl_budget_at[i]);
-	u64 elapsed = now > at ? now - at : 0;
-	s64 avail = fl_budget_ns[i];
-
-	if (elapsed > 100 * NSEC_PER_MSEC)
-		elapsed = 100 * NSEC_PER_MSEC;
-	avail += (s64)(elapsed * 2 / 3);
-
-	return MIN(avail, (s64)(4 * deadline_ns));
-}
-
-/*
- * Per-queue service clocks for the starve rescue (see main.bpf.c). They
- * are shared with the seat insertion path in balance.bpf.c. The node
- * table is padded to a power of two so the node id can be masked, and
- * the init-time bound check keeps every real node id inside it.
- */
-#define BABY_NODE_CLOCK_NR	64
-
-extern u64 seat_service_at[2][BABY_MAX_CPUS];
-extern u64 node_service_at[2][BABY_NODE_CLOCK_NR];
-
-/*
- * Per-CPU warm-seat occupancy hints, indexed by lane (0 bulk, 1 fast).
- * A seat is probed only while its hint is set, so an empty seat costs
- * no queue-depth kfunc in the warm-seat scan. The hint is deliberately
- * conservative: a racing pull can clear it while an insertion lands,
- * which costs that arrival one missed probe, never a stranded task.
- */
-extern u8 seat_used[2][BABY_MAX_CPUS];
-
-/*
- * Wall-clock time of the newest warm-seat insertion, written by the
- * enqueue path with the throttle below. It is a lower bound on the true
- * time of that insert, and ops.dispatch() reads it once before the
- * steal walk: a seat holds work only while the enqueue keeps filling
- * one, so a machine that has stopped seating has nothing to steal and
- * the walk can be skipped outright. A seat is then served by its owner
- * on its next slice end, and the starve rescue still covers one that
- * outlives its queue clock.
- */
-extern u64 seat_last_enq_ns;
-
-/*
- * The stamp throttle and the window it feeds. Ten milliseconds keeps
- * the enqueue's store off a line every CPU would otherwise bounce,
- * which is far below the window that decides whether to scan at all. A
- * throttled stamp can fire the window up to one period early, so the
- * window is a fresh-work test, not a proof that every seat is empty.
- */
-#define BABY_SEAT_STAMP_NS		(10ULL * NSEC_PER_MSEC)
-#define BABY_SEAT_FRESH_NS		(50ULL * NSEC_PER_MSEC)
-
-/*
- * Per-queue pending counts, indexed by lane (0 bulk, 1 fast): the number
- * of arrivals the scheduler inserted into that queue and has not yet
- * seen leave it. A zero count is a fact about the queue when the reader
- * looked, not a hint: it lets ops.dispatch() and the contention
- * accounting skip the peeks and pull attempts a lane would otherwise
- * cost on every switch, and only the arrival-side work that fills the
- * queue raises it. An insert raises the count before it commits and
- * rolls a refusal back, so a queue a reader finds at zero holds no work
- * that has committed. A departure the scheduler never observes - a
- * kernel-side pop, a task exiting while queued - leaves the count high,
- * which costs a probe and never strands work.
- */
-extern u64 seat_pending[2][BABY_MAX_CPUS];
-extern u64 node_pending[2][BABY_NODE_CLOCK_NR];
-
-/*
- * Scheduling statistics. nr_running owns a cache line: it is a
- * control-plane input read on the hot paths, and the diagnostic
- * counters must not share its line (see stats.bpf.c).
- */
-extern volatile u64 nr_running __attribute__((aligned(64)));
-extern volatile u64 nr_direct_dispatches __attribute__((aligned(64)));
-extern volatile u64 nr_preemptions, nr_boosts, nr_sticky;
-extern volatile u64 nr_preempt_refused_lat;
-extern volatile u64 nr_coldspreads;
-
-/*
- * Class census at run start (class composition and lane), behind the
- * same --stats flag as the rest of the instrument.
- */
-extern volatile u64 nr_class[BABY_WCLS_NR];
-extern volatile u64 nr_lane[2];
-
-/*
- * Where placements land, by distance rank.
- */
-extern volatile u64 nr_land[BABY_DIST_NR];
-extern volatile u64 nr_wake_land[BABY_DIST_NR];
-extern volatile u64 nr_seat_self;
-extern volatile u64 nr_seat_move[BABY_DIST_NR];
-extern volatile u64 nr_pull_land[BABY_DIST_NR];
-
-/*
- * Wait-at-depth instrument: the wait a task actually served, filed by the
- * depth it waited behind (0, 1, 2, 3+).
- */
-extern volatile u64 nr_wait_n[BABY_WDEPTH_NR];
-extern volatile u64 nr_wait_ns[BABY_WDEPTH_NR];
-extern volatile u64 nr_wait_max[BABY_WDEPTH_NR];
-extern volatile u64 nr_wait_slow[BABY_WDEPTH_NR];
-
-/*
- * The same charge, split by class: class-major, entry
- * class * BABY_WDEPTH_NR + depth.
- */
-extern volatile u64 nr_wait_cls_n[BABY_WDEPTH_NR * BABY_WCLS_NR];
-extern volatile u64 nr_wait_cls_ns[BABY_WDEPTH_NR * BABY_WCLS_NR];
-extern volatile u64 nr_wait_cls_max[BABY_WDEPTH_NR * BABY_WCLS_NR];
-extern volatile u64 nr_wait_cls_slow[BABY_WDEPTH_NR * BABY_WCLS_NR];
-
-/*
- * The same charge, split by arrival type: type-major, entry
- * type * BABY_WDEPTH_NR + depth.
- */
-extern volatile u64 nr_wait_type_n[BABY_WDEPTH_NR * BABY_WTYPE_NR];
-extern volatile u64 nr_wait_type_ns[BABY_WDEPTH_NR * BABY_WTYPE_NR];
-extern volatile u64 nr_wait_type_max[BABY_WDEPTH_NR * BABY_WTYPE_NR];
-extern volatile u64 nr_wait_type_slow[BABY_WDEPTH_NR * BABY_WTYPE_NR];
-
-/*
- * The same charge, split by wake-rate latency-criticality (2 * 4
- * entries, lcri-major: lcri * BABY_WDEPTH_NR + depth). It answers
- * whether latency-critical wakees actually wait, at what depth, and
- * for how long, or whether they are served at depth 0.
- */
-extern volatile u64 nr_wait_lcri_n[BABY_WDEPTH_NR * 2];
-extern volatile u64 nr_wait_lcri_ns[BABY_WDEPTH_NR * 2];
-extern volatile u64 nr_wait_lcri_max[BABY_WDEPTH_NR * 2];
-extern volatile u64 nr_wait_lcri_slow[BABY_WDEPTH_NR * 2];
-
-/*
- * The latency-critical charge, split by the wake-gate miss reason: why
- * the depth-0 wake preempt at ops.select_cpu() did not fire for the
- * task's most recent wake. Depth-major within each reason row, entry
- * depth * BABY_WG_NR + reason; a rotation requeue files reason 0. The
- * classes partition the wlcri lat bucket: per depth, the reason sums
- * equal the wlcri lat counts and ns.
- */
-#define BABY_WG_NON_WAKE	0	/* rotation requeue, not a wake */
-#define BABY_WG_NO_GATE		1	/* no wake-gate contact this cycle */
-#define BABY_WG_M1_NOT_LAT	2	/* wakee not lat-cri at gate time */
-#define BABY_WG_M2_AFFINITY	3	/* wakee cannot run on prev_cpu */
-#define BABY_WG_M3_SEAT_BUSY	4	/* the wakee's seat holds a head */
-#define BABY_WG_M3_LOCAL_BUSY	5	/* an in-flight wakee holds the local DSQ */
-#define BABY_WG_M4_DEGEN	6	/* victim unusable: null/self/idle/no ctx */
-#define BABY_WG_M4_VICTIM_LAT	7	/* the victim is lat-cri */
-#define BABY_WG_M4_PRIO		8	/* the wakee loses on static_prio */
-#define BABY_WG_M5_RESIDENCY	9	/* the victim is under the 200us floor */
-
-extern volatile u64 nr_wait_wg_n[BABY_WDEPTH_NR * BABY_WG_NR];
-extern volatile u64 nr_wait_wg_ns[BABY_WDEPTH_NR * BABY_WG_NR];
-extern volatile u64 nr_wait_wg_max[BABY_WDEPTH_NR * BABY_WG_NR];
-extern volatile u64 nr_wait_wg_slow[BABY_WDEPTH_NR * BABY_WG_NR];
-
-/*
- * Saturation preemption instrument: the victims ops.tick() cut short
- * because a latency-critical task waited at a queue head, split by
- * where the waiter sat (the shared queue or the CPU's own seat).
- */
-extern volatile u64 nr_tick_preempts, nr_tick_preempts_warm;
-
-/*
- * Tick cuts whose waiter the following dispatch did not serve: the
- * tick gate claimed a waiter without consulting the CPU's budget.
- */
-extern volatile u64 nr_tick_cut_refused;
-
-/*
- * RT-lease take-back instrument: latency-critical tasks requeued from
- * an RT lease, and the dispatches that served one back on its home CPU.
- */
-extern volatile u64 nr_lease_requeues, nr_home_takebacks;
-
-/*
- * Fast-lane services under bulk pressure: dispatches that served the
- * fast lane while the CPU's bulk queue held waiting work, each served
- * under the CPU's time budget, split by which fast-lane queue held the
- * task.
- */
-extern volatile u64 nr_depth1_pulls, nr_depth1_pulls_seat;
-
-/*
- * Dispatches where the bulk backstop withheld a fast-lane task: the
- * CPU had served only the fast lane for the whole bound while bulk
- * work waited for it.
- */
-extern volatile u64 nr_bulk_backstop;
-
-/*
- * Wake-path preempts: latency-critical wakees handed a busy CPU at wake
- * time, preempting a non-latency-critical victim instead of waiting for
- * the tick.
- */
-extern volatile u64 nr_wake_preempts;
-
-/*
- * Where each arrival type landed: wake or rotation, warm seat or
- * shared queue. Indexed type * 2 + shared.
- */
-extern volatile u64 nr_arr_type[2 * 2];
-
-/*
- * Consumption census: the queue state a lane sees when it comes to pick
- * work - the depth left in its warm seat and the shared backlog the
- * rotation turns on.
- */
-extern volatile u64 nr_census_seat[BABY_CENSUS_NR];
-extern volatile u64 nr_census_shared[BABY_CENSUS_NR];
 
 /*
  * Exit information (defined by UEI_DEFINE in util.bpf.c).
@@ -690,89 +396,6 @@ struct task_ctx {
 /* Virtual-time key encoding for --plain-vtime (main.bpf.c). */
 __hidden u64 vtime_encode(const struct task_struct *p, struct task_ctx *tctx,
 			  s32 node);
-
-/*
- * A granted slice and the tag it needs share no storage: the tick, the
- * yield and the dispatch keep path all rewrite p->scx.slice, and every
- * caller of the helpers below already holds the task context. The tag
- * names one of the four tagged queues, seat or node queue in one of the
- * two lanes, plus one so that zero reads as "not queued".
- */
-#define BABY_TAG_LANE_SHIFT	7	/* one bit, above the 7-bit index */
-#define BABY_TAG_NODE_SHIFT	8	/* 0 seat, 1 node queue */
-#define BABY_TAG_NODE_BIT	(1U << BABY_TAG_NODE_SHIFT)
-
-static __always_inline u32 baby_tag(u32 node, u32 lane, u32 idx)
-{
-	idx &= node ? (BABY_NODE_CLOCK_NR - 1) : (BABY_MAX_CPUS - 1);
-
-	return ((node << BABY_TAG_NODE_SHIFT) | (lane << BABY_TAG_LANE_SHIFT) |
-		idx) + 1;
-}
-
-static __always_inline void baby_pending_add(u32 tag)
-{
-	u32 t = tag - 1;
-
-	if (t & BABY_TAG_NODE_BIT)
-		__sync_fetch_and_add(
-			&node_pending[(t >> BABY_TAG_LANE_SHIFT) & 1]
-				     [t & (BABY_NODE_CLOCK_NR - 1)], 1);
-	else
-		__sync_fetch_and_add(
-			&seat_pending[(t >> BABY_TAG_LANE_SHIFT) & 1]
-				     [t & (BABY_MAX_CPUS - 1)], 1);
-}
-
-static __always_inline void baby_pending_sub(u32 tag)
-{
-	u32 t = tag - 1;
-
-	if (t & BABY_TAG_NODE_BIT)
-		__sync_fetch_and_sub(
-			&node_pending[(t >> BABY_TAG_LANE_SHIFT) & 1]
-				     [t & (BABY_NODE_CLOCK_NR - 1)], 1);
-	else
-		__sync_fetch_and_sub(
-			&seat_pending[(t >> BABY_TAG_LANE_SHIFT) & 1]
-				     [t & (BABY_MAX_CPUS - 1)], 1);
-}
-
-/*
- * Account that the task has visibly left the queue its tag names. The
- * tag is cleared here, so a second call is a no-op and a stale tag
- * cannot lower a count twice.
- */
-static __always_inline void baby_untag(struct task_ctx *tctx)
-{
-	u32 tag = tctx->queued_tag;
-
-	if (!tag)
-		return;
-	tctx->queued_tag = 0;
-	baby_pending_sub(tag);
-}
-
-/*
- * Insert an arrival into one of the tagged queues. The count is raised
- * before the insert commits so that a reader cannot see zero while an
- * insert that will land is in flight, and a refused insert rolls the
- * raise back so the count never outlives a task that did not join.
- */
-static __always_inline bool baby_insert_vtime(struct task_struct *p,
-					      struct task_ctx *tctx, u64 dsq,
-					      u64 slice, u64 deadline,
-					      u64 enq_flags, u32 tag)
-{
-	baby_untag(tctx);
-	baby_pending_add(tag);
-	if (!scx_bpf_dsq_insert_vtime(p, dsq, slice, deadline, enq_flags)) {
-		baby_pending_sub(tag);
-		return false;
-	}
-	tctx->queued_tag = tag;
-	return true;
-}
 
 /*
  * Roll the 200ms burst window to the window @now falls in. A task that
@@ -990,13 +613,6 @@ __hidden struct task_ctx *init_task_ctx(struct task_struct *p);
 __hidden u32 cpu_dist(s32 a, s32 b);
 
 /*
- * stats.bpf.c: the wait-at-depth instrument and the consumption census.
- */
-__hidden void stamp_wait(struct task_ctx *tctx, u64 now, u64 depth, bool shared);
-__hidden void charge_wait(struct task_ctx *tctx, u64 now);
-__hidden void census_sample(s32 cpu);
-
-/*
  * class.bpf.c: bursts, wake frequency, class predicates and deadline math.
  */
 __hidden void update_bursts(struct task_ctx *tctx, u64 now);
@@ -1010,16 +626,6 @@ __hidden void class_on_running(struct task_struct *p, struct task_ctx *tctx,
 __hidden void class_boost_on_sleep(struct task_struct *p, struct task_ctx *tctx,
 			  bool runnable, u64 now);
 __hidden void class_init_task(struct task_ctx *tctx, struct task_struct *p, u64 now);
-
-/*
- * idle.bpf.c: idle-CPU acquisition and direct dispatch.
- */
-__hidden s32 pick_idle_cpu(struct task_struct *p, s32 prev_cpu, u64 wake_flags,
-			  bool *is_idle);
-__hidden bool cpu_smt_shared(s32 cpu);
-__hidden s32 cpu_smt_sibling(s32 cpu);
-__hidden bool try_direct_dispatch(struct task_struct *p, struct task_ctx *tctx,
-				 s32 prev_cpu, u64 enq_flags, bool is_running);
 
 /*
  * power.bpf.c: CPU performance scaling.
@@ -1038,88 +644,13 @@ __hidden bool balance_try_warm_seat(struct task_struct *p, struct task_ctx *tctx
 			   u64 now);
 
 /*
- * main.bpf.c: the kernel idle-CPU selection restricted to the non-LP
- * mask while the tier masks exist.
+ * The scoped headers. Nothing above this point depends on them; each one
+ * reads the core types and macros defined before it.
  */
-__hidden s32 select_cpu_no_lp(struct task_struct *p, s32 prev_cpu,
-			      u64 wake_flags);
-
-/*
- * The game pin (--game-pin): a game's render thread and its submission
- * thread each keep one physical core to themselves. Under the plain
- * virtual-time queue every task competes in one shared order, so a
- * helper that woke first can hold the core the render thread needs at
- * the next frame deadline. The pin gives the two busiest threads of a
- * process a private home CPU and keeps every other task off it.
- *
- * Duty is an EWMA over the burst tracker's 200ms window, in q10 of one
- * core, so a thread that holds most of a core across windows qualifies
- * while a bursty helper does not. A slot is claimed by an atomic CAS
- * on its pid word, refreshed by its owner on every window roll, and
- * released when the owner's duty falls under the release bar. The two
- * slots each hold one SMT pair: slot 0 is open to the busiest thread, slot
- * 1 is held for a second thread of the same process once the first has
- * proven its duty and the machine has headroom, and its home must be a
- * different physical core so the pair lands on two cores rather than
- * two threads of one.
- *
- * A slot's shielding outlives its owner's sleep by the grace window,
- * so the short gaps between two frames do not hand the core away and
- * buy a migration on every wake. A slot whose owner has gone stale, or
- * whose duty a live challenger now beats by the challenger margin, can
- * be taken over, so a process that stops using the pin does not hold
- * the core forever.
- *
- * A slot's pid word is its claim word: 0 is free, a nonzero pid is the
- * owner. Every other field is written only by the owner, so a reader
- * that matched the pid may see one field still holding the previous
- * owner's value for the few instructions the new owner takes to fill
- * the slot. Such a snapshot costs one misplacement, never an unsafe
- * CPU id or a stranded task.
- */
-struct pin_slot {
-	u32 pid;
-	u32 tgid;
-	s32 home_cpu;
-	s32 sib_cpu;
-	u32 duty_q10;
-	u32 busy_q10;
-	u32 core_id;
-	u32 pad_;
-	u64 last_seen_ns;
-	u64 active_until;
-	u64 nr_enq;
-	u64 pad2_;
-};
-
-/*
- * The shielded CPUs as a byte test (the dispatch and wake paths ask
- * per CPU) and their count, rebuilt only when a slot changes. The
- * busy share of the machine, in q10, gates the second slot.
- */
-extern u8 pin_shield_cpu[BABY_MAX_CPUS];
-extern u32 pin_shield_n;
-extern volatile u32 machine_busy_q10;
-
-/*
- * pin.bpf.c: the game pin's accounting, placement and dispatch hooks.
- */
-
-__hidden void pin_mask_rebuild(void);
-__hidden void pin_account(struct task_struct *p, struct task_ctx *tctx,
-			  u64 now);
-__hidden void pin_stopping_stamp(struct task_struct *p, u64 now);
-__hidden bool pin_enqueue_pinned(struct task_struct *p, struct task_ctx *tctx,
-				 u64 enq_flags, u64 now);
-__hidden bool pin_select_pinned(struct task_struct *p, struct task_ctx *tctx,
-				s32 prev_cpu, u64 now, s32 *out_cpu);
-__hidden s32 pin_select_cpu_and(struct task_struct *p, s32 prev_cpu,
-				u64 wake_flags);
-__hidden s32 pin_next_unshielded(struct task_struct *p, s32 prev_cpu, u64 now);
-__hidden bool pin_owns_cpu(s32 cpu, const struct task_struct *p);
-__hidden bool is_cpu_shielded(s32 cpu, u64 now);
-__hidden bool pin_wholly_shielded(const struct task_struct *p);
-__hidden bool pin_stranded_enqueue(struct task_struct *p, u64 enq_flags,
-				   u64 now);
+#include "stats.bpf.h"
+#include "dispatch.bpf.h"
+#include "preempt.bpf.h"
+#include "idle.bpf.h"
+#include "pin.bpf.h"
 
 #endif /* __BABY_H */
