@@ -308,6 +308,76 @@ __hidden u64 vtime_encode(const struct task_struct *p, struct task_ctx *tctx,
 }
 
 /*
+ * check_preempt_wakeup(): preempt the previous CPU's task when the
+ * waker has an earlier deadline and no lower priority, provided the
+ * CPU has no warm backlog and the running task can be cut. A
+ * preemption into a deep queue would only trade places with work
+ * that runs anyway, and a burst hog must not be preempted. Only
+ * interactive and foreground wakers are eligible: a task that never
+ * wakes has no latency to protect.
+ *
+ * The victim rules mirror ops.select_cpu()'s wake gate: a
+ * latency-critical resident keeps its CPU (two pipeline stages must
+ * not take turns on one), a victim pinned to a single CPU has
+ * nowhere else to go, and a resident still inside the residency
+ * floor has not had a turn worth taking. The wakee must be allowed
+ * on the target, and no in-flight wakee may hold the local DSQ (the
+ * insert would queue behind it). The deadline order arbitrates
+ * between two bulk tasks as before.
+ */
+static __always_inline bool
+enqueue_wake_preempt(struct task_struct *p, struct task_ctx *tctx, s32 prev_cpu,
+		     s32 node, u64 enq_flags, u64 now)
+{
+	if ((plain_wake || !plain) && (enq_flags & SCX_ENQ_WAKEUP) &&
+	    bpf_cpumask_test_cpu(prev_cpu, p->cpus_ptr) &&
+	    (plain_wake ? !scx_bpf_dsq_nr_queued(node) :
+	     (!scx_bpf_dsq_nr_queued(fl_cpu2dsq(prev_cpu)) &&
+	      !scx_bpf_dsq_nr_queued(cpu2dsq(prev_cpu)))) &&
+	    !scx_bpf_dsq_nr_queued(SCX_DSQ_LOCAL_ON | prev_cpu) &&
+	    (plain_wake || is_interactive(tctx) || is_foreground(tctx))) {
+		u32 pidx = (u32)prev_cpu & (BABY_MAX_CPUS - 1);
+		u64 ran_at = cpu_running_at[pidx];
+		struct task_struct *curr =
+			__COMPAT_scx_bpf_cpu_curr(prev_cpu);
+
+		if (curr && curr != p && !(curr->flags & PF_IDLE)) {
+			struct task_ctx *cctx =
+				try_lookup_task_ctx(curr);
+
+			if (!plain_wake && cctx && is_lat_cri(cctx)) {
+				if (stats_enabled)
+					__sync_fetch_and_add(
+						&nr_preempt_refused_lat,
+						1);
+			} else if (cctx && !is_pcpu_task(curr) &&
+				   ran_at &&
+				   (s64)(now - ran_at) >=
+					   (s64)(plain_wake ?
+						 PLAIN_WAKE_PROTECT_NS :
+						 BABY_TICK_PREEMPT_PROTECT_NS) &&
+				   (plain_wake ?
+				    plain_wake_cut(tctx, cctx) :
+				    (s64)(tctx->deadline -
+					  cctx->deadline) < 0) &&
+				   p->static_prio <= curr->static_prio &&
+				   can_resched(cctx)) {
+				scx_bpf_dsq_insert(
+					p, SCX_DSQ_LOCAL_ON | prev_cpu,
+					task_slice(tctx),
+					enq_flags | SCX_ENQ_PREEMPT);
+				if (stats_enabled)
+					__sync_fetch_and_add(
+						&nr_preemptions, 1);
+				return true;
+			}
+		}
+	}
+
+	return false;
+}
+
+/*
  * Enqueue a task with no idle CPU to run on. The node queue is ordered
  * by deadline, and dispatch takes the earliest one.
  */
@@ -424,70 +494,9 @@ void BPF_STRUCT_OPS(baby_enqueue, struct task_struct *p, u64 enq_flags)
 					is_running))
 			return;
 
-		/*
-		 * check_preempt_wakeup(): preempt the previous CPU's task
-		 * when the waker has an earlier deadline and no lower
-		 * priority, provided the CPU has no warm backlog and the
-		 * running task can be cut. A preemption into a deep queue
-		 * would only trade places with work that runs anyway, and a
-		 * burst hog must not be preempted. Only interactive and
-		 * foreground wakers are eligible: a task that never wakes
-		 * has no latency to protect.
-		 *
-		 * The victim rules mirror ops.select_cpu()'s wake gate: a
-		 * latency-critical resident keeps its CPU (two pipeline
-		 * stages must not take turns on one), a victim pinned to a
-		 * single CPU has nowhere else to go, and a resident still
-		 * inside the residency floor has not had a turn worth
-		 * taking. The wakee must be allowed on the target, and no
-		 * in-flight wakee may hold the local DSQ (the insert would
-		 * queue behind it). The deadline order arbitrates between
-		 * two bulk tasks as before.
-		 */
-		if ((plain_wake || !plain) && (enq_flags & SCX_ENQ_WAKEUP) &&
-		    bpf_cpumask_test_cpu(prev_cpu, p->cpus_ptr) &&
-		    (plain_wake ? !scx_bpf_dsq_nr_queued(node) :
-		     (!scx_bpf_dsq_nr_queued(fl_cpu2dsq(prev_cpu)) &&
-		      !scx_bpf_dsq_nr_queued(cpu2dsq(prev_cpu)))) &&
-		    !scx_bpf_dsq_nr_queued(SCX_DSQ_LOCAL_ON | prev_cpu) &&
-		    (plain_wake || is_interactive(tctx) || is_foreground(tctx))) {
-			u32 pidx = (u32)prev_cpu & (BABY_MAX_CPUS - 1);
-			u64 ran_at = cpu_running_at[pidx];
-			struct task_struct *curr =
-				__COMPAT_scx_bpf_cpu_curr(prev_cpu);
-
-			if (curr && curr != p && !(curr->flags & PF_IDLE)) {
-				struct task_ctx *cctx =
-					try_lookup_task_ctx(curr);
-
-				if (!plain_wake && cctx && is_lat_cri(cctx)) {
-					if (stats_enabled)
-						__sync_fetch_and_add(
-							&nr_preempt_refused_lat,
-							1);
-				} else if (cctx && !is_pcpu_task(curr) &&
-					   ran_at &&
-					   (s64)(now - ran_at) >=
-						   (s64)(plain_wake ?
-							 PLAIN_WAKE_PROTECT_NS :
-							 BABY_TICK_PREEMPT_PROTECT_NS) &&
-					   (plain_wake ?
-					    plain_wake_cut(tctx, cctx) :
-					    (s64)(tctx->deadline -
-						  cctx->deadline) < 0) &&
-					   p->static_prio <= curr->static_prio &&
-					   can_resched(cctx)) {
-					scx_bpf_dsq_insert(
-						p, SCX_DSQ_LOCAL_ON | prev_cpu,
-						task_slice(tctx),
-						enq_flags | SCX_ENQ_PREEMPT);
-					if (stats_enabled)
-						__sync_fetch_and_add(
-							&nr_preemptions, 1);
-					return;
-				}
-			}
-		}
+		if (enqueue_wake_preempt(p, tctx, prev_cpu, node, enq_flags,
+					 now))
+			return;
 
 		/*
 		 * Warm seat, gated on oversubscription (see balance.bpf.c).
