@@ -885,6 +885,7 @@ fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write as _;
 
     #[test]
     fn deadline_us_outside_the_range_is_rejected() {
@@ -1270,6 +1271,99 @@ mod tests {
         assert_eq!(ok.perf_lvl, 1024);
     }
 
+    /*
+     * Verifier telemetry for the synthetic loads. The kernel reports
+     * verified_insns and the xlated and jited program lengths per
+     * loaded program, which is the only signal that shows a move
+     * changing what the verifier walks. SCX_BABY_VERIFIER_LOG names a
+     * file, or holds "1", "true" or "stderr" for stderr; unset or
+     * empty leaves the sink cold and every load pays one option test.
+     */
+    enum VerifierSink {
+        Stderr,
+        File(std::io::BufWriter<std::fs::File>),
+    }
+
+    struct VerifierLog {
+        sink: Option<VerifierSink>,
+        warned: bool,
+    }
+
+    impl VerifierLog {
+        fn from_env() -> Self {
+            let spec = match std::env::var("SCX_BABY_VERIFIER_LOG") {
+                Ok(spec) if !spec.is_empty() => spec,
+                _ => {
+                    return Self {
+                        sink: None,
+                        warned: false,
+                    };
+                }
+            };
+            let sink = match spec.as_str() {
+                "1" | "true" | "stderr" => VerifierSink::Stderr,
+                path => match std::fs::File::create(path) {
+                    Ok(file) => VerifierSink::File(std::io::BufWriter::new(file)),
+                    Err(error) => {
+                        eprintln!("SCX_BABY_VERIFIER_LOG={path}: {error}, using stderr");
+                        VerifierSink::Stderr
+                    }
+                },
+            };
+            Self {
+                sink: Some(sink),
+                warned: false,
+            }
+        }
+
+        fn enabled(&self) -> bool {
+            self.sink.is_some()
+        }
+
+        fn record(
+            &mut self,
+            shape: &str,
+            width: usize,
+            prog: &str,
+            info: &libbpf_sys::bpf_prog_info,
+        ) {
+            let row = |out: &mut dyn std::io::Write| {
+                writeln!(
+                    out,
+                    "{shape},{width},{prog},{},{},{}",
+                    info.verified_insns, info.xlated_prog_len, info.jited_prog_len
+                )
+            };
+            match self.sink.as_mut() {
+                None => {}
+                Some(VerifierSink::Stderr) => {
+                    let _ = row(&mut std::io::stderr());
+                }
+                Some(VerifierSink::File(file)) => {
+                    let _ = row(file);
+                }
+            }
+        }
+
+        /* baby_enqueue is the program closest to the -E2BIG budget. */
+        fn warn_if_hot(&mut self, info: &libbpf_sys::bpf_prog_info) {
+            if self.warned || info.verified_insns <= 900_000 {
+                return;
+            }
+            self.warned = true;
+            eprintln!(
+                "scx_baby: baby_enqueue verified_insns {} is within 10% of the 1M budget",
+                info.verified_insns
+            );
+        }
+
+        fn finish(&mut self) {
+            if let Some(VerifierSink::File(file)) = self.sink.as_mut() {
+                let _ = file.flush();
+            }
+        }
+    }
+
     // Load only, never attach: the synthetic shapes drive no live
     // scheduler. The topology counts are rodata, so the BPF loops and
     // bounds checks are verified against the synthetic width too, and
@@ -1281,14 +1375,12 @@ mod tests {
     // on, and a reachable combination left out of the matrix is a
     // load-time regression waiting for the kernel that trips it.
     fn load_synthetic(
+        shape: &str,
         nr_cpus: usize,
-        plain: bool,
-        plain_1x: bool,
-        plain_wake: bool,
-        plain_vtime: bool,
-        game_pin: bool,
-        gaming: bool,
+        flags: [bool; 6],
+        log: &mut VerifierLog,
     ) -> anyhow::Result<()> {
+        let [plain, plain_1x, plain_wake, plain_vtime, game_pin, gaming] = flags;
         let mut object = MaybeUninit::uninit();
         let builder = BpfSkelBuilder::default();
         let mut skel = scx_ops_open!(builder, &mut object, baby_ops, None)?;
@@ -1328,6 +1420,25 @@ mod tests {
             ro.topo_core[cpu] = (cpu / 2) as u32 + 1;
         }
         let loaded = scx_ops_load!(skel, baby_ops, uei)?;
+        if log.enabled() {
+            use libbpf_rs::skel::Skel as _;
+            use std::os::fd::AsFd as _;
+            use std::os::fd::AsRawFd as _;
+
+            for prog in loaded.object().progs() {
+                let mut info = libbpf_sys::bpf_prog_info::default();
+                let mut size = std::mem::size_of::<libbpf_sys::bpf_prog_info>() as u32;
+                let fd = prog.as_fd().as_raw_fd();
+                if unsafe { libbpf_sys::bpf_prog_get_info_by_fd(fd, &mut info, &mut size) } < 0 {
+                    continue;
+                }
+                let name = prog.name().to_string_lossy();
+                log.record(shape, nr_cpus, &name, &info);
+                if name == "baby_enqueue" {
+                    log.warn_if_hot(&info);
+                }
+            }
+        }
         drop(loaded);
         Ok(())
     }
@@ -1340,48 +1451,58 @@ mod tests {
         })));
 
         let mut failures = Vec::new();
+        let mut log = VerifierLog::from_env();
         /*
          * Every tuple Mode::from_opts can produce, named by the argv
          * that produces it. Twelve shapes x three widths: a reachable
          * combination that is missing here is a load the verifier
          * never sees.
          */
-        for (plain, plain_1x, plain_wake, plain_vtime, game_pin, gaming) in [
+        for (shape, flags) in [
             /* default */
-            (false, false, false, false, false, false),
+            ("default", [false, false, false, false, false, false]),
             /* --plain */
-            (true, false, false, false, false, false),
+            ("--plain", [true, false, false, false, false, false]),
             /* --plain-1x */
-            (true, true, false, false, false, false),
+            ("--plain-1x", [true, true, false, false, false, false]),
             /* --plain-wake */
-            (true, true, true, false, false, false),
+            ("--plain-wake", [true, true, true, false, false, false]),
             /* --plain-vtime */
-            (true, true, false, true, false, false),
+            ("--plain-vtime", [true, true, false, true, false, false]),
             /* --plain-wake --plain-vtime */
-            (true, true, true, true, false, false),
+            (
+                "--plain-wake --plain-vtime",
+                [true, true, true, true, false, false],
+            ),
             /* --plain-vtime --game-pin */
-            (true, true, false, true, true, false),
+            (
+                "--plain-vtime --game-pin",
+                [true, true, false, true, true, false],
+            ),
             /* --plain-wake --plain-vtime --game-pin */
-            (true, true, true, true, true, false),
+            (
+                "--plain-wake --plain-vtime --game-pin",
+                [true, true, true, true, true, false],
+            ),
             /* --game --no-game-pin */
-            (true, true, false, true, false, true),
+            (
+                "--game --no-game-pin",
+                [true, true, false, true, false, true],
+            ),
             /* --game */
-            (true, true, false, true, true, true),
+            ("--game", [true, true, false, true, true, true]),
             /* --game --no-game-pin --plain-wake */
-            (true, true, true, true, false, true),
+            (
+                "--game --no-game-pin --plain-wake",
+                [true, true, true, true, false, true],
+            ),
             /* --game --plain-wake */
-            (true, true, true, true, true, true),
+            ("--game --plain-wake", [true, true, true, true, true, true]),
         ] {
+            let [plain, plain_1x, plain_wake, plain_vtime, game_pin, gaming] = flags;
+
             for nr_cpus in [1usize, 14, 128] {
-                if let Err(error) = load_synthetic(
-                    nr_cpus,
-                    plain,
-                    plain_1x,
-                    plain_wake,
-                    plain_vtime,
-                    game_pin,
-                    gaming,
-                ) {
+                if let Err(error) = load_synthetic(shape, nr_cpus, flags, &mut log) {
                     failures.push(format!(
                         "{nr_cpus} CPUs plain={plain} 1x={plain_1x} \
                          wake={plain_wake} vtime={plain_vtime} pin={game_pin} \
@@ -1390,6 +1511,7 @@ mod tests {
                 }
             }
         }
+        log.finish();
         anyhow::ensure!(failures.is_empty(), "{}", failures.join("\n"));
         Ok(())
     }
