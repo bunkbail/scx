@@ -36,6 +36,16 @@ extern s64 fl_budget_ns[BABY_MAX_CPUS];
 extern u64 fl_budget_at[BABY_MAX_CPUS];
 
 /*
+ * The fast-lane interval stamps: when this CPU's fast-lane run started,
+ * whether bulk work waited at the stop that ended it, and the bulk
+ * backstop clock. Defined in main.bpf.c, which stamps them from
+ * ops.dispatch() and ops.stopping().
+ */
+extern u64 cpu_fl_running_at[BABY_MAX_CPUS];
+extern bool cpu_bulk_wait[BABY_MAX_CPUS];
+extern u64 cpu_bulk_at[BABY_MAX_CPUS];
+
+/*
  * The fast-lane credit a CPU holds after the refill its next dispatch
  * would perform, computed without mutating the bucket: the seat guard
  * asks whether the fast lane can still pay before it takes a seat, and

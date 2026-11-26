@@ -198,7 +198,7 @@ bool cpu_is_lat[BABY_MAX_CPUS];
  * claim is cleared by a successful pull from that node's fast-lane
  * queue, not by a bulk pull or a seat pull, which serve other work.
  */
-static u64 node_preempt_claim[BABY_NODE_CLOCK_NR];
+u64 node_preempt_claim[BABY_NODE_CLOCK_NR];
 
 /*
  * The per-node virtual clock (--plain-vtime). It advances to the
@@ -266,7 +266,7 @@ bool cpu_running[BABY_MAX_CPUS];
  */
 s64 fl_budget_ns[BABY_MAX_CPUS];
 u64 fl_budget_at[BABY_MAX_CPUS];
-static u64 cpu_fl_running_at[BABY_MAX_CPUS];
+u64 cpu_fl_running_at[BABY_MAX_CPUS];
 
 /*
  * The contention state stamped by the stop that ended this CPU's last
@@ -276,7 +276,7 @@ static u64 cpu_fl_running_at[BABY_MAX_CPUS];
  * nanoseconds later. A bulk run or an idle dispatch clears the stamp
  * with the fast-lane clock.
  */
-static bool cpu_bulk_wait[BABY_MAX_CPUS];
+bool cpu_bulk_wait[BABY_MAX_CPUS];
 
 /*
  * Bulk backstop: the longest a CPU may run nothing but the fast lane
@@ -295,7 +295,7 @@ static bool cpu_bulk_wait[BABY_MAX_CPUS];
  */
 #define BABY_BULK_BACKSTOP_NS	(20ULL * NSEC_PER_MSEC)
 
-static u64 cpu_bulk_at[BABY_MAX_CPUS];
+u64 cpu_bulk_at[BABY_MAX_CPUS];
 
 static __always_inline void refill_fl_budget(u32 idx, u64 now)
 {

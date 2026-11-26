@@ -28,4 +28,11 @@
  */
 #define BABY_TICK_PREEMPT_PROTECT_NS	(50ULL * NSEC_PER_USEC)
 
+/*
+ * The anti-herd claim the tick gate sets per node and a successful pull
+ * from that node's fast-lane queue clears. Defined in main.bpf.c; the
+ * tick, the enqueue and the dispatch all test it.
+ */
+extern u64 node_preempt_claim[BABY_NODE_CLOCK_NR];
+
 #endif /* __BABY_PREEMPT_H */
