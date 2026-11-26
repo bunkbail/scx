@@ -117,7 +117,7 @@ __hidden void pin_stopping_stamp(struct task_struct *p, u64 now);
 __hidden bool pin_enqueue_pinned(struct task_struct *p, struct task_ctx *tctx,
 				 u64 enq_flags, u64 now);
 __hidden bool pin_select_pinned(struct task_struct *p, struct task_ctx *tctx,
-				s32 prev_cpu, u64 now, s32 *out_cpu);
+				u64 now, s32 *out_cpu);
 __hidden s32 pin_select_cpu_and(struct task_struct *p, s32 prev_cpu,
 				u64 wake_flags);
 __hidden s32 pin_next_unshielded(struct task_struct *p, s32 prev_cpu, u64 now);

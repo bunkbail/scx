@@ -300,7 +300,7 @@ s32 BPF_STRUCT_OPS(baby_select_cpu, struct task_struct *p,
 	 * the enqueue that follows decides how the home is taken.
 	 */
 	if (game_pin && READ_ONCE(pin_shield_n) && tctx &&
-	    pin_select_pinned(p, tctx, prev_cpu, now, &cpu))
+	    pin_select_pinned(p, tctx, now, &cpu))
 		return cpu;
 
 	/*

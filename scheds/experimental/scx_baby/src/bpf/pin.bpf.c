@@ -687,8 +687,7 @@ __hidden __noinline bool pin_stranded_enqueue(struct task_struct *p,
  */
 __hidden __noinline bool pin_select_pinned(struct task_struct *p,
 					   struct task_ctx *tctx,
-					   s32 prev_cpu, u64 now,
-					   s32 *out_cpu)
+					   u64 now, s32 *out_cpu)
 {
 	struct pin_slot *slot;
 	u32 key = 0, pid = (u32)p->pid;
