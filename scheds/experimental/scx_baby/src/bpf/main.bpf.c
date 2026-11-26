@@ -494,45 +494,6 @@ static __always_inline bool plain_wake_cut(const struct task_ctx *wakee,
 }
 
 /*
- * The kernel idle-CPU selection, restricted to the non-LP mask while
- * the tiers exist. scx_bpf_select_cpu_and() clears the chosen CPU's
- * kernel idle bit, and there is no helper that puts it back, so an LP
- * core picked here and then abandoned would stay marked busy and never
- * be picked again. The full task mask remains the fallback for a task
- * whose affinity allows only LP cores, and the CPU it returns is used.
- */
-__hidden s32 select_cpu_no_lp(struct task_struct *p, s32 prev_cpu,
-			      u64 wake_flags)
-{
-	struct bpf_cpumask *mask = non_lp_cpumask;
-	s32 cpu = -1;
-
-	/*
-	 * While a shield is up the selector may only see the pin worker
-	 * mask: non_lp_cpumask still names the slots' homes, and an idle
-	 * pick from it would hand a worker the core the pin holds. The
-	 * task-affinity fallback below stays out of this branch for the
-	 * same reason - it can return a shielded CPU just as well.
-	 */
-	if (plain && game_pin && READ_ONCE(pin_shield_n)) {
-		mask = pin_worker_cpumask;
-		if (mask && !bpf_cpumask_empty(cast_mask(mask)))
-			cpu = scx_bpf_select_cpu_and(p, prev_cpu, wake_flags,
-						     cast_mask(mask), 0);
-		return cpu;
-	}
-
-	if (mask && !bpf_cpumask_empty(cast_mask(mask)))
-		cpu = scx_bpf_select_cpu_and(p, prev_cpu, wake_flags,
-					     cast_mask(mask), 0);
-
-	if (cpu < 0)
-		cpu = scx_bpf_select_cpu_and(p, prev_cpu, wake_flags,
-					     p->cpus_ptr, 0);
-	return cpu;
-}
-
-/*
  * Rebuild the shield state after a slot change: the mask the wake
  * selector is restricted to, the per-CPU byte array the dispatch and
  * enqueue paths test, and the count that gates them. Only a claim, a
