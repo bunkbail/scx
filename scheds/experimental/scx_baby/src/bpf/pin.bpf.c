@@ -656,7 +656,7 @@ __hidden __noinline bool pin_wholly_shielded(const struct task_struct *p)
  * queue, so that is the one queue which always reaches it.
  */
 __hidden __noinline bool pin_stranded_enqueue(struct task_struct *p,
-					      u64 enq_flags, u64 now)
+					      u64 enq_flags)
 {
 	struct task_ctx *tctx;
 	u64 slice;

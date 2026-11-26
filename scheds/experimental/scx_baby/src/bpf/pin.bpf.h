@@ -124,8 +124,7 @@ __hidden s32 pin_next_unshielded(struct task_struct *p, s32 prev_cpu, u64 now);
 __hidden bool pin_owns_cpu(s32 cpu, const struct task_struct *p);
 __hidden bool is_cpu_shielded(s32 cpu, u64 now);
 __hidden bool pin_wholly_shielded(const struct task_struct *p);
-__hidden bool pin_stranded_enqueue(struct task_struct *p, u64 enq_flags,
-				   u64 now);
+__hidden bool pin_stranded_enqueue(struct task_struct *p, u64 enq_flags);
 __hidden bool pin_release_stale(u64 now);
 __hidden bool pin_slot_live(void);
 

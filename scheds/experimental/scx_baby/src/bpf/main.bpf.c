@@ -406,7 +406,7 @@ void BPF_STRUCT_OPS(baby_enqueue, struct task_struct *p, u64 enq_flags)
 	 */
 	if (plain && game_pin && READ_ONCE(pin_shield_n) &&
 	    (pin_enqueue_pinned(p, tctx, enq_flags, now) ||
-	     pin_stranded_enqueue(p, enq_flags, now)))
+	     pin_stranded_enqueue(p, enq_flags)))
 		return;
 
 	/*
