@@ -160,23 +160,21 @@ fn split_lps(
 mod tests {
     use super::*;
 
+    /// A fixture table read by CPU id.
+    type Table<T> = Box<dyn Fn(usize) -> Option<T>>;
+
     /// Build a CPU id list 0..n and closures reading the fixture
     /// tables by id.
     fn fixture(
         caps: Vec<Option<u32>>,
         bigs: Vec<Option<bool>>,
         freqs: Vec<Option<u32>>,
-    ) -> (
-        Vec<usize>,
-        impl Fn(usize) -> Option<u32>,
-        impl Fn(usize) -> Option<bool>,
-        impl Fn(usize) -> Option<u32>,
-    ) {
+    ) -> (Vec<usize>, Table<u32>, Table<bool>, Table<u32>) {
         (
             (0..caps.len()).collect(),
-            move |id| caps[id],
-            move |id| bigs[id],
-            move |id| freqs[id],
+            Box::new(move |id| caps[id]),
+            Box::new(move |id| bigs[id]),
+            Box::new(move |id| freqs[id]),
         )
     }
 
