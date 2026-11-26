@@ -780,3 +780,62 @@ __hidden __noinline s32 pin_next_unshielded(struct task_struct *p,
 	}
 	return -1;
 }
+
+/*
+ * Release a slot whose owner has not refreshed it for the stale window.
+ * Nothing else does: a slot is given back by its own owner at a window
+ * roll, and taken over only by a task that reaches the promotion bar.
+ * When a game exits or a thread blocks for good, neither happens, so the
+ * claim would outlive its process and keep the home and sibling out of
+ * the wake selector's mask; a reused pid would also inherit the claim,
+ * because the pid is the claim word. The rescue timer is the one path
+ * that runs while the machine is too quiet to promote anything, which
+ * makes it the right place for this.
+ */
+__hidden __noinline bool pin_release_stale(u64 now)
+{
+	struct pin_slot *slot;
+	bool released = false;
+	u32 key = 0, pid;
+
+	slot = bpf_map_lookup_elem(&pin_slots, &key);
+	if (slot) {
+		pid = READ_ONCE(slot->pid);
+		if (pid && now - READ_ONCE(slot->last_seen_ns) > pin_stale_ns &&
+		    __sync_val_compare_and_swap(&slot->pid, pid, 0) == pid)
+			released = true;
+	}
+
+	key = 1;
+	slot = bpf_map_lookup_elem(&pin_slots, &key);
+	if (slot) {
+		pid = READ_ONCE(slot->pid);
+		if (pid && now - READ_ONCE(slot->last_seen_ns) > pin_stale_ns &&
+		    __sync_val_compare_and_swap(&slot->pid, pid, 0) == pid)
+			released = true;
+	}
+
+	if (released)
+		pin_mask_rebuild();
+	return released;
+}
+
+/*
+ * Whether either slot has an owner. The rescue timer uses it to decide
+ * whether a rebuild is worth its cost: the count alone cannot answer
+ * this, because a lost rebuild is exactly the case where the record says
+ * zero while a slot is live.
+ */
+__hidden __noinline bool pin_slot_live(void)
+{
+	struct pin_slot *slot;
+	u32 key = 0;
+
+	slot = bpf_map_lookup_elem(&pin_slots, &key);
+	if (slot && READ_ONCE(slot->pid))
+		return true;
+
+	key = 1;
+	slot = bpf_map_lookup_elem(&pin_slots, &key);
+	return slot && READ_ONCE(slot->pid);
+}
