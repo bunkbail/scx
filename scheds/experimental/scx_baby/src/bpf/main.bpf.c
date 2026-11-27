@@ -123,8 +123,14 @@ volatile u32 machine_busy_q10;
  */
 private(BABY) struct bpf_cpumask __kptr *pin_worker_cpumask;
 
-u64 cpu_running_at[BABY_MAX_CPUS];
-bool cpu_is_lat[BABY_MAX_CPUS];
+/*
+ * The per-CPU state every callback writes. One 64-byte record per CPU;
+ * the layout, the field meanings and the cross-CPU ownership rule are in
+ * state.bpf.h. The alignment keeps every record on its own cache line, so
+ * a stop on one CPU that clears another CPU's record does not invalidate
+ * a third CPU's.
+ */
+struct cpu_state cpu_state[BABY_MAX_CPUS] __attribute__((aligned(64)));
 
 /*
  * One anti-herd claim per node: the high 32 bits hold the waiter's pid,
@@ -167,55 +173,6 @@ u64 node_pending[2][BABY_NODE_CLOCK_NR];
  * reads it once to decide whether any seat can hold work at all.
  */
 u64 seat_last_enq_ns;
-
-/*
- * Whether a task runs on each CPU, counted by the warm-seat scan into
- * its own per-lane sum. The scan already walks every CPU, so one load
- * per CPU there replaces a pair of global read-modify-writes on the
- * switch path.
- */
-bool cpu_running[BABY_MAX_CPUS];
-
-/*
- * Fast-lane time budget, per CPU. The bucket accrues two thirds of
- * wall time as fast-lane credit and holds at most four base slices.
- * It is charged the span a fast-lane interval covers: the run itself,
- * not the slice it is granted, plus the stop-to-run gap to the next
- * run on the same CPU while bulk waits, charged before that run starts
- * whether it is bulk or fast-lane work. A task that sleeps early pays
- * only for what it used, a 50-60Hz frame thread keeps its share, and
- * the scheduling overhead between two fast-lane runs is not credited
- * for free. While a fast-lane interval runs the
- * net rate is +2/3 - 1 = -1/3 of wall time; while bulk runs it is
- * +2/3. The steady state is therefore a two thirds fast-lane and one
- * third bulk share of a contended CPU, independent of how long each
- * slice runs.
- *
- * A bulk run or an idle dispatch breaks the interval: the CPU was
- * doing other work, so the run that follows charges no gap for it.
- * An RT lease does the same; its time belongs to the RT task.
- *
- * The budget is consulted only while bulk work waits; on an
- * otherwise idle CPU the fast lane runs freely. The debt floor bounds
- * how far one burst can push bulk ahead, not how long the fast lane
- * may run.
- */
-s64 fl_budget_ns[BABY_MAX_CPUS];
-u64 fl_budget_at[BABY_MAX_CPUS];
-u64 cpu_fl_running_at[BABY_MAX_CPUS];
-
-/*
- * The contention state stamped by the stop that ended this CPU's last
- * fast-lane run. The run that follows charges the stop-to-run gap
- * against the bulk work that waited when the run ended, so it reuses
- * the stop's probe instead of taking a second one a few hundred
- * nanoseconds later. A bulk run or an idle dispatch clears the stamp
- * with the fast-lane clock.
- */
-bool cpu_bulk_wait[BABY_MAX_CPUS];
-
-/* See dispatch.bpf.h. */
-u64 cpu_bulk_at[BABY_MAX_CPUS];
 
 /*
  * Allocate/re-allocate a new cpumask.
@@ -317,7 +274,7 @@ enqueue_wake_preempt(struct task_struct *p, struct task_ctx *tctx, s32 prev_cpu,
 	    !scx_bpf_dsq_nr_queued(SCX_DSQ_LOCAL_ON | prev_cpu) &&
 	    (plain_wake || is_interactive(tctx) || is_foreground(tctx))) {
 		u32 pidx = (u32)prev_cpu & (BABY_MAX_CPUS - 1);
-		u64 ran_at = cpu_running_at[pidx];
+		u64 ran_at = cpu_state[pidx].running_at;
 		struct task_struct *curr =
 			__COMPAT_scx_bpf_cpu_curr(prev_cpu);
 
@@ -582,8 +539,8 @@ void BPF_STRUCT_OPS(baby_cpu_release, s32 cpu,
 	 * is shimmed to void through the compat layer on others; call it
 	 * as void, the re-enqueue happens either way.
 	 */
-	cpu_fl_running_at[(u32)cpu & (BABY_MAX_CPUS - 1)] = 0;
-	cpu_bulk_wait[(u32)cpu & (BABY_MAX_CPUS - 1)] = false;
+	cpu_state[(u32)cpu & (BABY_MAX_CPUS - 1)].fl_running_at = 0;
+	cpu_state[(u32)cpu & (BABY_MAX_CPUS - 1)].bulk_wait = false;
 	scx_bpf_reenqueue_local();
 }
 
@@ -629,18 +586,18 @@ void BPF_STRUCT_OPS(baby_stopping, struct task_struct *p, bool runnable)
 		 * stop-to-run gap before it starts, bulk or fast-lane; a
 		 * bulk stop clears the stamp.
 		 */
-		if (cpu_is_lat[idx]) {
+		if (cpu_state[idx].is_lat) {
 			bool contended = bulk_waiting(last_cpu);
 
 			refill_fl_budget(idx, now);
 			charge_fl_runtime(idx, now, contended);
-			cpu_bulk_wait[idx] = contended;
+			cpu_state[idx].bulk_wait = contended;
 		} else {
-			cpu_fl_running_at[idx] = 0;
-			cpu_bulk_wait[idx] = false;
+			cpu_state[idx].fl_running_at = 0;
+			cpu_state[idx].bulk_wait = false;
 		}
-		cpu_is_lat[idx] = false;
-		cpu_running[idx] = false;
+		cpu_state[idx].is_lat = false;
+		cpu_state[idx].running = false;
 	}
 
 	if (!tctx)
@@ -726,17 +683,17 @@ void BPF_STRUCT_OPS(baby_running, struct task_struct *p)
 	 * The victim-residency stamp for the tick gate, and the point where
 	 * a task that was cut short stops carrying the preempted mark: the
 	 * requeue has happened by now. The running class feeds the warm
-	 * gate and the relocation filter (see cpu_is_lat).
+	 * gate and the relocation filter (see state.bpf.h).
 	 */
 	{
 		s32 cpu = scx_bpf_task_cpu(p);
 		u32 cpu_idx = (u32)cpu & (BABY_MAX_CPUS - 1);
 
-		cpu_running_at[cpu_idx] = now;
-		cpu_running[cpu_idx] = true;
-		cpu_is_lat[cpu_idx] = !plain && tctx && is_lat_cri(tctx);
-		if (!cpu_is_lat[cpu_idx])
-			cpu_bulk_at[cpu_idx] = now;
+		cpu_state[cpu_idx].running_at = now;
+		cpu_state[cpu_idx].running = true;
+		cpu_state[cpu_idx].is_lat = !plain && tctx && is_lat_cri(tctx);
+		if (!cpu_state[cpu_idx].is_lat)
+			cpu_state[cpu_idx].bulk_at = now;
 		/*
 		 * The fast-lane clock. A non-zero stamp means the CPU's last
 		 * run was fast-lane work and no bulk run or idle dispatch
@@ -745,12 +702,13 @@ void BPF_STRUCT_OPS(baby_running, struct task_struct *p)
 		 * starts, whether it is bulk or fast-lane work. A bulk run
 		 * or an idle dispatch clears the stamp.
 		 */
-		if (cpu_fl_running_at[cpu_idx]) {
+		if (cpu_state[cpu_idx].fl_running_at) {
 			refill_fl_budget(cpu_idx, now);
 			charge_fl_runtime(cpu_idx, now,
-					  cpu_bulk_wait[cpu_idx]);
+					  cpu_state[cpu_idx].bulk_wait);
 		}
-		cpu_fl_running_at[cpu_idx] = cpu_is_lat[cpu_idx] ? now : 0;
+		cpu_state[cpu_idx].fl_running_at =
+			cpu_state[cpu_idx].is_lat ? now : 0;
 		if (tctx) {
 			tctx->last_cpu = cpu;
 			tctx->run_start_ns = now;

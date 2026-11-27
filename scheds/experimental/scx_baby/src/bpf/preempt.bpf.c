@@ -93,7 +93,7 @@ tick_saturation_gate(struct task_struct *p, struct task_ctx *tctx, u64 now)
 	if (plain_1x || !plain) {
 		s32 cpu = scx_bpf_task_cpu(p);
 		u32 idx = (u32)cpu & (BABY_MAX_CPUS - 1);
-		u64 ran_at = cpu_running_at[idx];
+		u64 ran_at = cpu_state[idx].running_at;
 
 		if (now - ran_at >= BABY_TICK_PREEMPT_PROTECT_NS) {
 			s32 node = __COMPAT_scx_bpf_cpu_node(cpu);
@@ -409,7 +409,7 @@ s32 BPF_STRUCT_OPS(baby_select_cpu, struct task_struct *p,
 			 * context untouched.
 			 */
 			{
-				u64 ran_at = cpu_running_at[pidx];
+				u64 ran_at = cpu_state[pidx].running_at;
 
 				if (ran_at &&
 				    now - ran_at >=
@@ -590,7 +590,7 @@ s32 BPF_STRUCT_OPS(baby_select_cpu, struct task_struct *p,
 			return cpu;
 		}
 
-		ran_at = cpu_running_at[pcpu_idx];
+		ran_at = cpu_state[pcpu_idx].running_at;
 		if (!ran_at ||
 		    now - ran_at < (plain_wake ? PLAIN_WAKE_PROTECT_NS :
 					BABY_TICK_PREEMPT_PROTECT_NS)) {

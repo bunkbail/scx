@@ -122,7 +122,7 @@ void BPF_STRUCT_OPS(baby_dispatch, s32 cpu, struct task_struct *prev)
 	 * budget off the debt floor on every call and the exemption would
 	 * be granted forever.
 	 */
-	s64 fl_budget_in = fl_budget_ns[idx];
+	s64 fl_budget_in = cpu_state[idx].fl_budget_ns;
 
 	/*
 	 * Only the keep paths and the stats counters read the previous
@@ -234,7 +234,7 @@ void BPF_STRUCT_OPS(baby_dispatch, s32 cpu, struct task_struct *prev)
 			tctx->tick_preempted = false;
 			tctx->yield_pending = false;
 			tctx->last_cpu = cpu;
-			cpu_running_at[idx] = now;
+			cpu_state[idx].running_at = now;
 		}
 		scx_bpf_task_set_slice(prev,
 				       tctx ? task_slice(tctx) : deadline_ns);
@@ -289,9 +289,9 @@ void BPF_STRUCT_OPS(baby_dispatch, s32 cpu, struct task_struct *prev)
 	 * An uncontested interval must not leave debt behind: the fast
 	 * lane ran freely, so clear what an earlier contention left.
 	 */
-	if (!has_bulk && fl_budget_ns[idx] < 0)
-		fl_budget_ns[idx] = 0;
-	fl_allowed = !has_bulk || fl_budget_ns[idx] > 0;
+	if (!has_bulk && cpu_state[idx].fl_budget_ns < 0)
+		cpu_state[idx].fl_budget_ns = 0;
+	fl_allowed = !has_bulk || cpu_state[idx].fl_budget_ns > 0;
 	serve_fl = has_fl && fl_allowed;
 
 	/*
@@ -300,16 +300,16 @@ void BPF_STRUCT_OPS(baby_dispatch, s32 cpu, struct task_struct *prev)
 	 * has never recorded a run), so a burst after a quiet period does
 	 * not fire the backstop on its first dispatch.
 	 */
-	if (!has_bulk || !cpu_bulk_at[idx])
-		cpu_bulk_at[idx] = now;
+	if (!has_bulk || !cpu_state[idx].bulk_at)
+		cpu_state[idx].bulk_at = now;
 
 	/*
-	 * Bulk backstop (see cpu_bulk_at): a CPU that has run nothing but
+	 * Bulk backstop (see state.bpf.h): a CPU that has run nothing but
 	 * the fast lane for a full bound serves bulk now, whatever the
 	 * budget or a home head says. Pinned bulk work has no other CPU
 	 * to run on, so the alternative is the kernel's stall watchdog.
 	 */
-	if (has_bulk && now - cpu_bulk_at[idx] > BABY_BULK_BACKSTOP_NS) {
+	if (has_bulk && now - cpu_state[idx].bulk_at > BABY_BULK_BACKSTOP_NS) {
 		if (stats_enabled &&
 		    (has_fl || (need_running && tctx && is_lat_cri(tctx))))
 			__sync_fetch_and_add(&nr_bulk_backstop, 1);
@@ -398,10 +398,10 @@ void BPF_STRUCT_OPS(baby_dispatch, s32 cpu, struct task_struct *prev)
 				update_bursts(tctx, now);
 				tctx->tick_preempted = false;
 				tctx->last_cpu = cpu;
-				cpu_running_at[idx] = now;
-				cpu_is_lat[idx] = is_lat_cri(tctx);
-				if (!cpu_is_lat[idx])
-					cpu_bulk_at[idx] = now;
+				cpu_state[idx].running_at = now;
+				cpu_state[idx].is_lat = is_lat_cri(tctx);
+				if (!cpu_state[idx].is_lat)
+					cpu_state[idx].bulk_at = now;
 				/*
 				 * The cpuperf ledger is deliberately left
 				 * alone: ticks advance it, and charging the
@@ -568,12 +568,12 @@ void BPF_STRUCT_OPS(baby_dispatch, s32 cpu, struct task_struct *prev)
 			tctx->tick_preempted = false;
 			tctx->yield_pending = false;
 			tctx->last_cpu = cpu;
-			cpu_running_at[idx] = now;
-			cpu_is_lat[idx] = is_lat_cri(tctx);
-			if (cpu_is_lat[idx])
+			cpu_state[idx].running_at = now;
+			cpu_state[idx].is_lat = is_lat_cri(tctx);
+			if (cpu_state[idx].is_lat)
 				charge_fl_runtime(idx, now, has_bulk);
 			else
-				cpu_bulk_at[idx] = now;
+				cpu_state[idx].bulk_at = now;
 		}
 		scx_bpf_task_set_slice(prev,
 				       tctx ? task_slice(tctx) : deadline_ns);
@@ -684,9 +684,9 @@ void BPF_STRUCT_OPS(baby_dispatch, s32 cpu, struct task_struct *prev)
 		 * comment on perf_req. An idle dispatch breaks the
 		 * fast-lane interval, so the next run charges no gap.
 		 */
-		cpu_fl_running_at[idx] = 0;
-		cpu_bulk_at[idx] = 0;
-		cpu_bulk_wait[idx] = false;
+		cpu_state[idx].fl_running_at = 0;
+		cpu_state[idx].bulk_at = 0;
+		cpu_state[idx].bulk_wait = false;
 		cpuperf_on_idle(cpu);
 	}
 }

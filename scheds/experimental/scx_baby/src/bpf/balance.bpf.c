@@ -67,7 +67,7 @@ __hidden bool balance_try_warm_seat(struct task_struct *p, struct task_ctx *tctx
 			 * instead of the switch path paying a global
 			 * read-modify-write for it.
 			 */
-			if (cpu_running[ci])
+			if (cpu_state[ci].running)
 				n_running++;
 			/*
 			 * Probe only seats the occupancy hint marks as
@@ -80,7 +80,7 @@ __hidden bool balance_try_warm_seat(struct task_struct *p, struct task_ctx *tctx
 			u64 q_nr = seat_used[1][ci] ?
 					   scx_bpf_dsq_nr_queued(fl_cpu2dsq(i)) : 0;
 			u64 nr = lat ? q_nr : b_nr;
-			bool i_lat = cpu_is_lat[ci];
+			bool i_lat = cpu_state[ci].is_lat;
 
 			b_warm += b_nr;
 			q_warm += q_nr;
@@ -105,7 +105,7 @@ __hidden bool balance_try_warm_seat(struct task_struct *p, struct task_ctx *tctx
 			s32 sib = cpu_smt_sibling((s32)i);
 
 			if (sib >= 0 &&
-			    cpu_is_lat[(u32)sib & (BABY_MAX_CPUS - 1)])
+			    cpu_state[(u32)sib & (BABY_MAX_CPUS - 1)].is_lat)
 				cmp += 2;
 
 			if (cmp < best_cmp ||
@@ -258,7 +258,7 @@ __hidden bool balance_try_warm_seat(struct task_struct *p, struct task_ctx *tctx
 						u32 sidx = (u32)target &
 							   (BABY_MAX_CPUS - 1);
 						u64 ran_at =
-							cpu_running_at[sidx];
+							cpu_state[sidx].running_at;
 
 						preempt = !is_pcpu_task(res) &&
 							  p->static_prio <=

@@ -628,6 +628,7 @@ __hidden bool balance_try_warm_seat(struct task_struct *p, struct task_ctx *tctx
  * reads the core types and macros defined before it.
  */
 #include "stats.bpf.h"
+#include "state.bpf.h"
 #include "dispatch.bpf.h"
 #include "preempt.bpf.h"
 #include "idle.bpf.h"

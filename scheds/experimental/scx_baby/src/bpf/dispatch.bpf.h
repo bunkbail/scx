@@ -14,38 +14,6 @@
 #endif
 
 /*
- * Per-CPU running-class residency, stamped in ops.running() and cleared
- * in ops.stopping(). Queue depth cannot answer whether a CPU runs a
- * tick-cuttable bulk resident: CPU-bound workers never queue, so bulk
- * depth can read zero while bulk residency is total. The fast-lane
- * oversubscription gate, the fast-lane budget and the dispatch keep
- * read this instead.
- */
-extern bool cpu_is_lat[BABY_MAX_CPUS];
-extern bool cpu_running[BABY_MAX_CPUS];
-
-/*
- * The residency stamp and the fast-lane budget, defined in main.bpf.c.
- * The guarded warm-seat preemption in balance.bpf.c reads them without
- * owning them: it asks the same questions the tick gate asks, so a seat
- * placement and a tick cut cannot disagree about whether a victim is
- * past the floor or whether the fast lane can still pay.
- */
-extern u64 cpu_running_at[BABY_MAX_CPUS];
-extern s64 fl_budget_ns[BABY_MAX_CPUS];
-extern u64 fl_budget_at[BABY_MAX_CPUS];
-
-/*
- * The fast-lane interval stamps: when this CPU's fast-lane run started,
- * whether bulk work waited at the stop that ended it, and the bulk
- * backstop clock. Defined in main.bpf.c, which stamps them from
- * ops.dispatch() and ops.stopping().
- */
-extern u64 cpu_fl_running_at[BABY_MAX_CPUS];
-extern bool cpu_bulk_wait[BABY_MAX_CPUS];
-extern u64 cpu_bulk_at[BABY_MAX_CPUS];
-
-/*
  * The fast-lane credit a CPU holds after the refill its next dispatch
  * would perform, computed without mutating the bucket: the seat guard
  * asks whether the fast lane can still pay before it takes a seat, and
@@ -56,9 +24,9 @@ extern u64 cpu_bulk_at[BABY_MAX_CPUS];
 static __always_inline s64 fl_budget_avail(u32 idx, u64 now)
 {
 	u32 i = idx & (BABY_MAX_CPUS - 1);
-	u64 at = READ_ONCE(fl_budget_at[i]);
+	u64 at = READ_ONCE(cpu_state[i].fl_budget_at);
 	u64 elapsed = now > at ? now - at : 0;
-	s64 avail = fl_budget_ns[i];
+	s64 avail = cpu_state[i].fl_budget_ns;
 
 	if (elapsed > 100 * NSEC_PER_MSEC)
 		elapsed = 100 * NSEC_PER_MSEC;
@@ -227,7 +195,7 @@ static __always_inline bool baby_insert_vtime(struct task_struct *p,
 
 static __always_inline void refill_fl_budget(u32 idx, u64 now)
 {
-	u64 elapsed = now - fl_budget_at[idx];
+	u64 elapsed = now - cpu_state[idx].fl_budget_at;
 	s64 credit;
 
 	if (!elapsed)
@@ -239,9 +207,9 @@ static __always_inline void refill_fl_budget(u32 idx, u64 now)
 	if (elapsed > 100 * NSEC_PER_MSEC)
 		elapsed = 100 * NSEC_PER_MSEC;
 	credit = (s64)(elapsed * 2 / 3);
-	fl_budget_ns[idx] = MIN(fl_budget_ns[idx] + credit,
-				(s64)(4 * deadline_ns));
-	fl_budget_at[idx] = now;
+	cpu_state[idx].fl_budget_ns = MIN(cpu_state[idx].fl_budget_ns + credit,
+					  (s64)(4 * deadline_ns));
+	cpu_state[idx].fl_budget_at = now;
 }
 
 /*
@@ -281,20 +249,21 @@ static __always_inline bool bulk_waiting(s32 cpu)
 static __always_inline void charge_fl_runtime(u32 idx, u64 now,
 					      bool contended)
 {
-	u64 started = cpu_fl_running_at[idx];
+	u64 started = cpu_state[idx].fl_running_at;
 	s64 floor = -(s64)(2 * deadline_ns);
 	u64 ran;
 
 	if (!started) {
-		cpu_fl_running_at[idx] = now;
+		cpu_state[idx].fl_running_at = now;
 		return;
 	}
 	ran = now - started;
 	if (ran > 4 * deadline_ns)
 		ran = 4 * deadline_ns;
 	if (contended)
-		fl_budget_ns[idx] = MAX(fl_budget_ns[idx] - (s64)ran, floor);
-	cpu_fl_running_at[idx] = now;
+		cpu_state[idx].fl_budget_ns =
+			MAX(cpu_state[idx].fl_budget_ns - (s64)ran, floor);
+	cpu_state[idx].fl_running_at = now;
 }
 
 #endif /* __BABY_DISPATCH_H */
