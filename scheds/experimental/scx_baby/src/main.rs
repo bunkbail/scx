@@ -435,6 +435,25 @@ fn publish_mode(ro: &mut bpf_skel::types::rodata, mode: &Mode) {
     ro.stats_enabled = mode.stats;
 }
 
+/// Split the class census into (other, fast-lane) run counts.
+///
+/// Class 2 and 3 are the two latency-critical classes, so the BPF side
+/// counted a fast-lane run exactly when the class was one of them, and
+/// it only did so on the profiles that keep the plain dispatch off. That
+/// gate is why the split is not simply the sum of those two classes:
+/// under `plain` every run belongs to the other lane, whatever its
+/// class. The total is the whole census, so the two lanes always add up
+/// to it.
+fn lane_split(nr_class: &[u64], plain: bool) -> Vec<u64> {
+    let fast = if plain {
+        0
+    } else {
+        nr_class.get(2).copied().unwrap_or(0) + nr_class.get(3).copied().unwrap_or(0)
+    };
+    let total: u64 = nr_class.iter().sum();
+    vec![total - fast, fast]
+}
+
 struct Scheduler<'a> {
     skel: BpfSkel<'a>,
     struct_ops: Option<libbpf_rs::Link>,
@@ -685,7 +704,6 @@ impl<'a> Scheduler<'a> {
          * sample; the report is diagnostic and the counts are not.
          */
         let bss_data = self.skel.maps.bss_data.as_mut().unwrap();
-        bss_data.nr_wait_max.fill(0);
         bss_data.nr_wait_cls_max.fill(0);
         bss_data.nr_wait_type_max.fill(0);
         bss_data.nr_wait_lcri_max.fill(0);
@@ -696,9 +714,19 @@ impl<'a> Scheduler<'a> {
 
     fn read_metrics(&self) -> Metrics {
         let bss_data = self.skel.maps.bss_data.as_ref().unwrap();
+        let rodata = self.skel.maps.rodata_data.as_ref().unwrap();
+        // The class table is the single source for the per-depth totals
+        // and the lane split; both folds are exact because the BPF side
+        // charges the class entry in the same block as the run itself.
+        let (wait_n, wait_ns, wait_max, wait_slow) = WaitB::from_cls(
+            &bss_data.nr_wait_cls_n,
+            &bss_data.nr_wait_cls_ns,
+            &bss_data.nr_wait_cls_max,
+            &bss_data.nr_wait_cls_slow,
+        );
         Metrics {
             nr_running: bss_data.nr_running,
-            stats_enabled: self.skel.maps.rodata_data.as_ref().unwrap().stats_enabled as u64,
+            stats_enabled: rodata.stats_enabled as u64,
             nr_direct_dispatches: bss_data.nr_direct_dispatches,
             nr_preemptions: bss_data.nr_preemptions,
             nr_preempt_refused_lat: bss_data.nr_preempt_refused_lat,
@@ -706,7 +734,7 @@ impl<'a> Scheduler<'a> {
             nr_sticky: bss_data.nr_sticky,
             nr_coldspreads: bss_data.nr_coldspreads,
             nr_class: bss_data.nr_class.to_vec(),
-            nr_lane: bss_data.nr_lane.to_vec(),
+            nr_lane: lane_split(&bss_data.nr_class, rodata.plain),
             nr_tick_preempts: bss_data.nr_tick_preempts,
             nr_tick_preempts_warm: bss_data.nr_tick_preempts_warm,
             nr_tick_cut_refused: bss_data.nr_tick_cut_refused,
@@ -725,10 +753,10 @@ impl<'a> Scheduler<'a> {
             // arrival is type * 2, a shared arrival type * 2 + 1.
             nr_arr_seat: bss_data.nr_arr_type[0] + bss_data.nr_arr_type[2],
             nr_arr_shared: bss_data.nr_arr_type[1] + bss_data.nr_arr_type[3],
-            wait_n: WaitB::of(&bss_data.nr_wait_n),
-            wait_ns: WaitB::of(&bss_data.nr_wait_ns),
-            wait_max: WaitB::of(&bss_data.nr_wait_max),
-            wait_slow: WaitB::of(&bss_data.nr_wait_slow),
+            wait_n,
+            wait_ns,
+            wait_max,
+            wait_slow,
             wait_cls: WaitCls::of(
                 &bss_data.nr_wait_cls_n,
                 &bss_data.nr_wait_cls_ns,
@@ -955,6 +983,41 @@ mod tests {
             Mode::from_opts(&Opts::try_parse_from(["scx_baby", "--game", "--stats", "1"]).unwrap());
         assert!(game.stats && game.gaming && game.plain_vtime);
         assert_eq!(game.deadline_us, 800);
+    }
+
+    /// The wait totals and the lane split are folds over the class
+    /// tables, so dropping the five per-purpose BPF globals moves no
+    /// reported number. The lane split is gated on `plain`, because the
+    /// class counters are not: class 2 and 3 survive under plain, where
+    /// the fast-lane count did not.
+    #[test]
+    fn derived_wait_totals_and_lane_split_fold_the_class_tables() {
+        // Depth-minor: entry class * 4 + depth, the layout the BPF side
+        // writes and WaitCls already folds.
+        let mut n = [0u64; 16];
+        let mut ns = [0u64; 16];
+        let mut max = [0u64; 16];
+        let mut slow = [0u64; 16];
+        for c in 0..4u64 {
+            for b in 0..4u64 {
+                let i = (c * 4 + b) as usize;
+                n[i] = (c + 1) * 10 + b;
+                ns[i] = (c + 1) * 100 + b;
+                max[i] = c * 10 + b;
+                slow[i] = u64::from(b > 1);
+            }
+        }
+
+        let (wn, wns, wmax, wslow) = WaitB::from_cls(&n, &ns, &max, &slow);
+        assert_eq!([wn.b0, wn.b1, wn.b2, wn.b3], [100, 104, 108, 112]);
+        assert_eq!([wns.b0, wns.b1, wns.b2, wns.b3], [1000, 1004, 1008, 1012]);
+        assert_eq!([wmax.b0, wmax.b1, wmax.b2, wmax.b3], [30, 31, 32, 33]);
+        assert_eq!([wslow.b0, wslow.b1, wslow.b2, wslow.b3], [0, 0, 4, 4]);
+
+        // Class 2 plus 3 is the fast lane on the default profile; under
+        // plain the same census reports every run in the other lane.
+        assert_eq!(lane_split(&[5, 6, 7, 8], false), vec![11, 15]);
+        assert_eq!(lane_split(&[5, 6, 7, 8], true), vec![26, 0]);
     }
 
     /// The pin knobs bind their ranges at parse time: at most two slots

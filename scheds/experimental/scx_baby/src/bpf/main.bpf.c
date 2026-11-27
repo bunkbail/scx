@@ -782,14 +782,13 @@ void BPF_STRUCT_OPS(baby_running, struct task_struct *p)
 	/*
 	 * Class census at the point of truth: 0 bulk normal, 1 bulk
 	 * heavy, 2 fast lane base slice, 3 fast lane fourfold slice.
-	 * Class 2 plus class 3 is the fast-lane run count.
+	 * Class 2 plus class 3 is the fast-lane run count; userspace
+	 * folds the lane split from these four counters.
 	 */
 	if (stats_enabled) {
 		u32 cls = task_nr_class(tctx);
 
 		__sync_fetch_and_add(&nr_class[cls & (BABY_WCLS_NR - 1)], 1);
-		__sync_fetch_and_add(
-			&nr_lane[!plain && is_lat_cri(tctx) ? 1 : 0], 1);
 	}
 
 	/*

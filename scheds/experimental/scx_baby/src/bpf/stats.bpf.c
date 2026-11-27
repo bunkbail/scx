@@ -37,12 +37,12 @@ volatile u64 nr_preemptions, nr_boosts, nr_sticky, nr_coldspreads;
 volatile u64 nr_preempt_refused_lat;
 
 /*
- * Class census at run start: the class composition and the lane of
- * every dispatched task. "Measured, not declared" classification needs
- * to be countable, or a latched class is invisible.
+ * Class census at run start: the class composition of every dispatched
+ * task. "Measured, not declared" classification needs to be countable,
+ * or a latched class is invisible. The lane split is the same census
+ * folded in userspace, so it is not counted twice here.
  */
 volatile u64 nr_class[BABY_WCLS_NR];
-volatile u64 nr_lane[2];
 
 /*
  * Saturation preemption instrument: victims ops.tick() cut short
@@ -101,21 +101,19 @@ volatile u64 nr_pull_land[BABY_DIST_NR];
  * behind (0, 1, 2, 3+). ops.running() charges the realized wait to that
  * bucket, so a tail can be attributed to consumption (depth 0) or
  * rotation cost.
+ *
+ * One table, split by class: each stamped task carries two class bits
+ * from ops.runnable(), where the burst and wake-frequency EWMAs are
+ * fresh: bit 0 interactive, bit 1 foreground. ops.running() files the
+ * wait into class-major 4x4 arrays, entry class * BABY_WDEPTH_NR +
+ * depth. The per-depth totals are the column sums of these arrays, so
+ * userspace folds them rather than the BPF side keeping a second copy
+ * of the same charge. Every stamped run adds to its class entry in the
+ * same block, with no early return between them, which is what makes
+ * the fold exact.
  */
-volatile u64 nr_wait_n[BABY_WDEPTH_NR];
-volatile u64 nr_wait_ns[BABY_WDEPTH_NR];
-volatile u64 nr_wait_max[BABY_WDEPTH_NR];
-volatile u64 nr_wait_slow[BABY_WDEPTH_NR];
-
 #define BABY_WAIT_SLOW_NS	(5ULL * NSEC_PER_MSEC)
 
-/*
- * The same charge, split by class. Each stamped task carries two class
- * bits from ops.runnable(), where the burst and wake-frequency EWMAs
- * are fresh: bit 0 interactive, bit 1 foreground. ops.running() files
- * the wait into class-major 4x4 arrays, entry class * BABY_WDEPTH_NR +
- * depth.
- */
 volatile u64 nr_wait_cls_n[BABY_WDEPTH_NR * BABY_WCLS_NR];
 volatile u64 nr_wait_cls_ns[BABY_WDEPTH_NR * BABY_WCLS_NR];
 volatile u64 nr_wait_cls_max[BABY_WDEPTH_NR * BABY_WCLS_NR];
@@ -234,12 +232,6 @@ __hidden void charge_wait(struct task_ctx *tctx, u64 now)
 		u32 c = tctx->wait_cls & (BABY_WCLS_NR - 1);
 		u32 i = c * BABY_WDEPTH_NR + b;
 
-		__sync_fetch_and_add(&nr_wait_n[b], 1);
-		__sync_fetch_and_add(&nr_wait_ns[b], wait);
-		if (wait > nr_wait_max[b])
-			nr_wait_max[b] = wait;
-		if (wait > BABY_WAIT_SLOW_NS)
-			__sync_fetch_and_add(&nr_wait_slow[b], 1);
 		__sync_fetch_and_add(&nr_wait_cls_n[i], 1);
 		__sync_fetch_and_add(&nr_wait_cls_ns[i], wait);
 		if (wait > nr_wait_cls_max[i])

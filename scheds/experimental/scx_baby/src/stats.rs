@@ -134,6 +134,19 @@ fn max2(a: &[u64], r0: usize, r1: usize) -> [u64; WDEPTH] {
     std::array::from_fn(|b| a[r0 * WDEPTH + b].max(a[r1 * WDEPTH + b]))
 }
 
+/// The column sum of a class-major table: one depth row holding the
+/// total over every class.
+fn sum_all(a: &[u64; WDEPTH * WCLS]) -> [u64; WDEPTH] {
+    std::array::from_fn(|b| (0..WCLS).map(|c| a[c * WDEPTH + b]).sum())
+}
+
+/// The column maximum of a class-major table. The maximum over classes
+/// of the per-class maxima is the maximum over all of them, so the fold
+/// is exact rather than an approximation.
+fn max_all(a: &[u64; WDEPTH * WCLS]) -> [u64; WDEPTH] {
+    std::array::from_fn(|b| (0..WCLS).map(|c| a[c * WDEPTH + b]).max().unwrap_or(0))
+}
+
 /// One vector-width wait row: the wlcri rows and the wake-gate depth
 /// rows. The mean uses integer division, unlike the fixed-width rows.
 fn fmt_vec_wait<W: Write>(
@@ -264,6 +277,27 @@ impl WaitB {
             b2: a[2],
             b3: a[3],
         }
+    }
+
+    /// The per-depth totals, folded from the class table: (count,
+    /// nanoseconds, maximum, slow count).
+    ///
+    /// Every stamped wait is charged to its class entry in the same
+    /// block that used to charge a second, class-blind set of globals,
+    /// so the columns of the class table are those globals. Keeping one
+    /// table also keeps the two from disagreeing across a dump.
+    pub fn from_cls(
+        a_n: &[u64; WDEPTH * WCLS],
+        a_ns: &[u64; WDEPTH * WCLS],
+        a_max: &[u64; WDEPTH * WCLS],
+        a_slow: &[u64; WDEPTH * WCLS],
+    ) -> (Self, Self, Self, Self) {
+        (
+            WaitB::of(&sum_all(a_n)),
+            WaitB::of(&sum_all(a_ns)),
+            WaitB::of(&max_all(a_max)),
+            WaitB::of(&sum_all(a_slow)),
+        )
     }
 
     sub_fields! {

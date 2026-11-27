@@ -25,11 +25,11 @@ extern volatile u64 nr_preempt_refused_lat;
 extern volatile u64 nr_coldspreads;
 
 /*
- * Class census at run start (class composition and lane), behind the
- * same --stats flag as the rest of the instrument.
+ * Class census at run start (class composition), behind the same
+ * --stats flag as the rest of the instrument. The lane split is folded
+ * from these four counters in userspace.
  */
 extern volatile u64 nr_class[BABY_WCLS_NR];
-extern volatile u64 nr_lane[2];
 
 /*
  * Where placements land, by distance rank.
@@ -41,17 +41,9 @@ extern volatile u64 nr_seat_move[BABY_DIST_NR];
 extern volatile u64 nr_pull_land[BABY_DIST_NR];
 
 /*
- * Wait-at-depth instrument: the wait a task actually served, filed by the
- * depth it waited behind (0, 1, 2, 3+).
- */
-extern volatile u64 nr_wait_n[BABY_WDEPTH_NR];
-extern volatile u64 nr_wait_ns[BABY_WDEPTH_NR];
-extern volatile u64 nr_wait_max[BABY_WDEPTH_NR];
-extern volatile u64 nr_wait_slow[BABY_WDEPTH_NR];
-
-/*
- * The same charge, split by class: class-major, entry
- * class * BABY_WDEPTH_NR + depth.
+ * Wait-at-depth instrument, split by class: class-major, entry
+ * class * BABY_WDEPTH_NR + depth. The per-depth totals userspace
+ * reports are the column sums of this table.
  */
 extern volatile u64 nr_wait_cls_n[BABY_WDEPTH_NR * BABY_WCLS_NR];
 extern volatile u64 nr_wait_cls_ns[BABY_WDEPTH_NR * BABY_WCLS_NR];
