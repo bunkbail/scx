@@ -259,9 +259,9 @@ static __noinline bool pin_slot_take(struct pin_slot *slot,
 
 	if (old == pid)
 		return false;
-	if (old != 0 && now - READ_ONCE(slot->last_seen_ns) <= pin_stale_ns &&
-	    (tctx->duty_q10 <= READ_ONCE(slot->duty_q10) + pin_challenger ||
-	     tctx->pin_streak < pin_streak_need))
+	if (old != 0 && now - READ_ONCE(slot->last_seen_ns) <= BABY_PIN_STALE_NS &&
+	    (tctx->duty_q10 <= READ_ONCE(slot->duty_q10) + BABY_PIN_CHALLENGER ||
+	     tctx->pin_streak < BABY_PIN_STREAK_NEED))
 		return false;
 
 	home = pin_home_pick(p, other_home);
@@ -317,8 +317,8 @@ static __noinline bool pin_slot_take(struct pin_slot *slot,
 
 /*
  * Try to give @p a slot. Slot 0 goes to a task over the promotion bar
- * whose duty has held across pin_streak_need windows: two windows at
- * pin_promote1 is 400 ms of sustained 60% duty, so a one-window
+ * whose duty has held across the required streak: two windows at the
+ * promote bar is 400 ms of sustained 60% duty, so a one-window
  * plasmashell spike cannot claim a core. Slot 1 is reserved for a
  * second thread of the process that owns slot 0: a game's render
  * thread and its submission thread are the pair, and letting two
@@ -348,7 +348,7 @@ static __noinline void pin_try_promote(struct task_struct *p,
 	 * other.
 	 */
 	other = (slot1 && READ_ONCE(slot1->pid)) ? slot1->home_cpu : -1;
-	if (slot0 && tctx->pin_streak >= pin_streak_need &&
+	if (slot0 && tctx->pin_streak >= BABY_PIN_STREAK_NEED &&
 	    pin_slot_take(slot0, p, tctx, now, busy, other))
 		return;
 
@@ -356,7 +356,7 @@ static __noinline void pin_try_promote(struct task_struct *p,
 		return;
 	if (!READ_ONCE(slot0->pid) ||
 	    READ_ONCE(slot0->tgid) != (u32)p->tgid ||
-	    tctx->pin_streak < pin_streak_need || busy > pin_busy_max)
+	    tctx->pin_streak < BABY_PIN_STREAK_NEED || busy > BABY_PIN_BUSY_MAX)
 		return;
 
 	other = slot0->home_cpu;
@@ -388,7 +388,7 @@ __hidden __noinline void pin_account(struct task_struct *p,
 	duty = tctx->duty_q10 ?
 	       (u32)((3 * tctx->duty_q10 + raw + 2) >> 2) : (u32)raw;
 	tctx->duty_q10 = duty;
-	tctx->pin_streak = duty >= pin_promote1 ?
+	tctx->pin_streak = duty >= BABY_PIN_PROMOTE1 ?
 			   (u8)MIN((u32)tctx->pin_streak + 1, 255) : 0;
 
 	/*
@@ -426,7 +426,7 @@ __hidden __noinline void pin_account(struct task_struct *p,
 				    READ_ONCE(slot0->tgid) != (u32)p->tgid;
 		}
 
-		if (duty < pin_release0 || pair_lost) {
+		if (duty < BABY_PIN_RELEASE0 || pair_lost) {
 			__sync_val_compare_and_swap(&slot->pid, (u32)p->pid,
 						    0);
 			pin_mask_rebuild();
@@ -443,7 +443,7 @@ __hidden __noinline void pin_account(struct task_struct *p,
 	 * is its duty, so a thread that spent the window on the CPU
 	 * qualifies at once and one that did not cannot.
 	 */
-	if (duty >= pin_promote0)
+	if (duty >= BABY_PIN_PROMOTE0)
 		pin_try_promote(p, tctx, now);
 }
 
@@ -800,7 +800,7 @@ __hidden __noinline bool pin_release_stale(u64 now)
 	slot = bpf_map_lookup_elem(&pin_slots, &key);
 	if (slot) {
 		pid = READ_ONCE(slot->pid);
-		if (pid && now - READ_ONCE(slot->last_seen_ns) > pin_stale_ns &&
+		if (pid && now - READ_ONCE(slot->last_seen_ns) > BABY_PIN_STALE_NS &&
 		    __sync_val_compare_and_swap(&slot->pid, pid, 0) == pid)
 			released = true;
 	}
@@ -809,7 +809,7 @@ __hidden __noinline bool pin_release_stale(u64 now)
 	slot = bpf_map_lookup_elem(&pin_slots, &key);
 	if (slot) {
 		pid = READ_ONCE(slot->pid);
-		if (pid && now - READ_ONCE(slot->last_seen_ns) > pin_stale_ns &&
+		if (pid && now - READ_ONCE(slot->last_seen_ns) > BABY_PIN_STALE_NS &&
 		    __sync_val_compare_and_swap(&slot->pid, pid, 0) == pid)
 			released = true;
 	}

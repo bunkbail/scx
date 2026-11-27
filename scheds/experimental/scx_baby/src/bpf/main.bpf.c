@@ -54,13 +54,6 @@ const volatile u64 vtime_lag_ns = 20000000ULL;
 const volatile bool game_pin;
 const volatile u64 pin_grace_ns = 20000000ULL;
 const volatile u32 pin_max = 2;
-const volatile u32 pin_promote0 = 665;		/* ~65% of a core in 0..1024 */
-const volatile u32 pin_release0 = 500;		/* ~49% */
-const volatile u64 pin_stale_ns = 600ULL * NSEC_PER_MSEC;
-const volatile u32 pin_promote1 = 615;		/* ~60% */
-const volatile u32 pin_streak_need = 2;
-const volatile u32 pin_busy_max = 563;		/* 55% in q10 */
-const volatile u32 pin_challenger = 100;	/* ~10% */
 
 /* cosmos's MAX_WAKEUP_FREQ cap on the credit multiplier. */
 #define BABY_VTIME_WAKE_FREQ_MAX	1024

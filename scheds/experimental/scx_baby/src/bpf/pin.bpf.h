@@ -22,32 +22,37 @@
  * branch below it is pruned by the verifier otherwise. The pin's
  * rodata knobs publish zero when it is off.
  *
- * @pin_grace_ns: how long a slot keeps shielding its home after its
- *		  owner was last seen enqueued or woken.
- * @pin_promote0: duty, in q10 of a core, that a task must have held
- *		  across its last window to claim a slot.
- * @pin_release0: duty below which the owner gives its slot back.
- * @pin_promote1: duty a window must hold to extend the streak that
- *		  @pin_streak_need counts.
- * @pin_streak_need: consecutive windows at @pin_promote1 that either
- *		  slot needs before it is claimed.
- * @pin_busy_max: machine-wide busy share, in q10, above which the
- *		  second slot stays unclaimed.
- * @pin_stale_ns: age at which a slot's owner is presumed gone and
- *		  any task may take the slot over.
- * @pin_challenger: duty margin by which a live slot can still be
- *		  taken over by a busier task.
+ * Two knobs are rodata because argv publishes them: --pin-grace-us and
+ * --pin-max. The rest are fixed. No option writes them, so a rodata
+ * global only buys a load the verifier cannot fold, in the branches
+ * every pinned run takes; as constants they fold into the comparison
+ * and leave the guard as the only gate on the code.
+ *
+ * @BABY_PIN_PROMOTE0: duty, in q10 of a core, that a task must have
+ *		       held across its last window to claim a slot.
+ * @BABY_PIN_RELEASE0: duty below which the owner gives its slot back.
+ * @BABY_PIN_PROMOTE1: duty a window must hold to extend the streak that
+ *		       @BABY_PIN_STREAK_NEED counts.
+ * @BABY_PIN_STREAK_NEED: consecutive windows at @BABY_PIN_PROMOTE1 that
+ *		       either slot needs before it is claimed.
+ * @BABY_PIN_BUSY_MAX: machine-wide busy share, in q10, above which the
+ *		       second slot stays unclaimed.
+ * @BABY_PIN_STALE_NS: age at which a slot's owner is presumed gone and
+ *		       any task may take the slot over.
+ * @BABY_PIN_CHALLENGER: duty margin by which a live slot can still be
+ *		       taken over by a busier task.
  */
 extern const volatile bool game_pin;
 extern const volatile u64 pin_grace_ns;
 extern const volatile u32 pin_max;
-extern const volatile u32 pin_promote0;
-extern const volatile u32 pin_release0;
-extern const volatile u64 pin_stale_ns;
-extern const volatile u32 pin_promote1;
-extern const volatile u32 pin_streak_need;
-extern const volatile u32 pin_busy_max;
-extern const volatile u32 pin_challenger;
+
+#define BABY_PIN_PROMOTE0	665	/* ~65% of a core in 0..1024 */
+#define BABY_PIN_RELEASE0	500	/* ~49% */
+#define BABY_PIN_PROMOTE1	615	/* ~60% */
+#define BABY_PIN_STREAK_NEED	2
+#define BABY_PIN_BUSY_MAX	563	/* 55% in q10 */
+#define BABY_PIN_STALE_NS	(600ULL * NSEC_PER_MSEC)
+#define BABY_PIN_CHALLENGER	100	/* ~10% */
 
 /*
  * The game pin (--game-pin): a game's render thread and its submission
