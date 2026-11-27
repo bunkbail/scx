@@ -85,51 +85,33 @@ static __always_inline u64 fl_node2dsq(s32 node)
 /*
  * Scheduling constants, carried over from the original bs.c.
  *
- * @TIME_PERIOD: window over which a task's runtime (bursts) is accounted.
  * @TO_COMPLETE: slack given to a task to complete its previous window.
- * @DEADLINE_NS: default deadline offset assigned to every task.
+ * @RESCHED_DELTA: runtime a victim may have left before it is cuttable.
+ *
+ * TIME_PERIOD and the class bars live in intf.h's enum consts, so
+ * src/class_model.rs can read them through bindgen and mirror this
+ * arithmetic without a second copy here.
  */
-#define TIME_PERIOD		(200ULL * NSEC_PER_MSEC)
 #define TO_COMPLETE		(5ULL * NSEC_PER_MSEC)
 #define RESCHED_DELTA		(25ULL * NSEC_PER_MSEC)
-
-/*
- * Wakes per 100ms that separate the wake-rate classes from the rest.
- *
- * The latency-critical bar is 5: a 60Hz frame thread or a 59Hz request
- * probe wakes about every 17ms, and the integer rate of that interval
- * is 5. The foreground bar is 10: that class also earns the fourfold
- * slice, so it stays a true 100Hz signal. Four consecutive samples at
- * or above the latency bar arm the peak hold; four at or above the
- * foreground bar are needed before the peak can reach 10.
- */
-#define LAT_CRI_WAKE_FREQ	5
-#define FOREGROUND_WAKE_FREQ	10
-#define WAKE_SANE_MIN		4
 
 /*
  * The two bars are a hierarchy, not independent knobs: the foreground
  * class also earns the fourfold slice, so it has to stay strictly
  * narrower than the latency class, and no bar may sit above the wake
  * sample's cap (100 wakes per 100ms), or no task could ever reach it.
+ *
+ * The peak hold latches by design (see struct task_ctx), and a task that
+ * bursts once and then runs continuously never re-enters
+ * class_on_runnable() to decay it, so the hold alone would keep a burst-
+ * then-hog in the latency class forever. WAKELESS_DEMOTE_NS sits above
+ * the interval of a task at the latency bar, so a waker that still meets
+ * the bar is never demoted between two of its wakes.
  */
 _Static_assert(FOREGROUND_WAKE_FREQ > LAT_CRI_WAKE_FREQ,
 	       "the foreground bar must stay above the latency bar");
 _Static_assert(FOREGROUND_WAKE_FREQ <= 100,
 	       "the wake sample is capped at 100, so a higher bar is unreachable");
-
-/*
- * CPU runtime, since the last wake, a seat-guarded task may accumulate
- * before its latency credit is dropped.
- *
- * The peak hold latches by design (see struct task_ctx), and a task that
- * bursts once and then runs continuously never re-enters
- * class_on_runnable() to decay it, so the hold alone keeps a burst-then-
- * hog in the latency class forever. One quarter window is the heavy bar,
- * and it sits above the interval of a task at the latency bar, so a
- * waker that still meets the bar is never demoted between two wakes.
- */
-#define WAKELESS_DEMOTE_NS	(TIME_PERIOD / 4)
 _Static_assert(WAKELESS_DEMOTE_NS > 100ULL * NSEC_PER_MSEC / LAT_CRI_WAKE_FREQ,
 	       "a task at the latency bar must not be demoted between wakes");
 #define MIN_NICE		(-20)

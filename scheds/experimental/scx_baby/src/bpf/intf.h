@@ -19,6 +19,29 @@ enum consts {
 	NSEC_PER_SEC = (1000ULL * NSEC_PER_MSEC),
 
 	/*
+	 * The class model's window and bars: the window a task's runtime
+	 * is accounted over, the runtime a seat-guarded task may accrue
+	 * without a wake before its peak hold is dropped, and the wake
+	 * cadence, per 100ms, that separates the latency-critical and
+	 * foreground classes, after WAKE_SANE_MIN samples of warmup.
+	 *
+	 * The bars are a hierarchy, not independent knobs: the foreground
+	 * class also earns the fourfold slice, so it stays strictly
+	 * narrower than the latency class, and no bar may sit above the
+	 * wake sample's cap (100 wakes per 100ms) or no task could reach
+	 * it. A task at the latency bar wakes every 20ms, under the
+	 * demotion bar, so a waker that still meets the bar is never
+	 * demoted between two of its wakes. These live here because
+	 * src/class_model.rs mirrors the BPF arithmetic and reads them
+	 * through bindgen, so the two cannot drift.
+	 */
+	TIME_PERIOD = (200ULL * NSEC_PER_MSEC),
+	WAKELESS_DEMOTE_NS = (TIME_PERIOD / 4),
+	LAT_CRI_WAKE_FREQ = 5,
+	FOREGROUND_WAKE_FREQ = 10,
+	WAKE_SANE_MIN = 4,
+
+	/*
 	 * DSQ ID layout. FL marks the fast lane, the latency-critical
 	 * class's own queues:
 	 *   [0 .. BABY_FL_NODE_DSQ_BASE)          : bulk per-node DSQs
