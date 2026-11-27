@@ -404,6 +404,41 @@ impl Mode {
     }
 }
 
+/// Publish every rodata field the profile resolves to.
+///
+/// `init()` resolves the live argv; `load_synthetic()` resolves each
+/// verifier-matrix shape through the same parser, so both publish the
+/// same bytes for the same argv. A hand-kept table of flags would drift
+/// from `from_opts()` and load a profile no argv can produce.
+///
+/// The slice and the plain family are one block because they are one
+/// decision: gaming selects the plain virtual-time queue on an 800us
+/// slice, and a shape that published only some of them would describe a
+/// run the parser never emits.
+fn publish_mode(ro: &mut bpf_skel::types::rodata, mode: &Mode) {
+    ro.deadline_ns = mode.deadline_us * 1000;
+    ro.prio_offset_ns = scaled_prio_offsets(ro.deadline_ns);
+    ro.gaming = mode.gaming;
+    ro.plain = mode.plain;
+    ro.plain_1x = mode.plain_1x;
+    ro.plain_wake = mode.plain_wake;
+    ro.plain_vtime = mode.plain_vtime;
+    /*
+     * The seat guard is the default profile's alone; every plain variant
+     * and --game publish false, so their BPF branches are pruned by the
+     * verifier and their rodata stays inert.
+     */
+    ro.seat_guard = mode.seat_guard;
+    /*
+     * Gaming arms the pin; --no-game-pin or a run that never selects the
+     * plain virtual-time queue clears it. The BPF branches below it are
+     * verifier-pruned when it is off.
+     */
+    ro.game_pin = mode.game_pin;
+    ro.pin_grace_ns = mode.pin_grace_ns;
+    ro.pin_max = mode.pin_max;
+}
+
 struct Scheduler<'a> {
     skel: BpfSkel<'a>,
     struct_ops: Option<libbpf_rs::Link>,
@@ -484,8 +519,7 @@ impl<'a> Scheduler<'a> {
         // Override default BPF scheduling parameters.
         let rodata = skel.maps.rodata_data.as_mut().unwrap();
         let mode = Mode::from_opts(opts);
-        rodata.deadline_ns = mode.deadline_us * 1000;
-        rodata.prio_offset_ns = scaled_prio_offsets(rodata.deadline_ns);
+        publish_mode(rodata, &mode);
 
         // The wait/census instrument and the distance histograms run
         // only when the scheduler was started with --stats: the flag
@@ -556,25 +590,6 @@ impl<'a> Scheduler<'a> {
             "profile: {}",
             if mode.gaming { "gaming" } else { "default" }
         );
-        rodata.gaming = mode.gaming;
-        rodata.plain = mode.plain;
-        rodata.plain_1x = mode.plain_1x;
-        rodata.plain_wake = mode.plain_wake;
-        rodata.plain_vtime = mode.plain_vtime;
-        /*
-         * The seat guard is the default profile's alone; every plain
-         * variant and --game publish false, so their BPF branches are
-         * pruned by the verifier and their rodata stays inert.
-         */
-        rodata.seat_guard = mode.seat_guard;
-        /*
-         * Gaming arms the pin; --no-game-pin or a run that never
-         * selects the plain virtual-time queue clears it. The BPF
-         * branches below it are verifier-pruned when it is off.
-         */
-        rodata.game_pin = mode.game_pin;
-        rodata.pin_grace_ns = mode.pin_grace_ns;
-        rodata.pin_max = mode.pin_max;
         /* 1 s bounds the BPF-side product (lag * freq cap * weight). */
         let vtime_lag_ns = opts.vtime_lag_us.min(1_000_000) * 1000;
         rodata.vtime_lag_ns = vtime_lag_ns;
@@ -1382,19 +1397,24 @@ mod tests {
     // load-time regression waiting for the kernel that trips it.
     fn load_synthetic(
         shape: &str,
+        args: &str,
         nr_cpus: usize,
-        flags: [bool; 6],
         log: &mut VerifierLog,
     ) -> anyhow::Result<()> {
-        let [plain, plain_1x, plain_wake, plain_vtime, game_pin, gaming] = flags;
         let mut object = MaybeUninit::uninit();
         let builder = BpfSkelBuilder::default();
         let mut skel = scx_ops_open!(builder, &mut object, baby_ops, None)?;
+        /*
+         * Resolve the shape through the real parser, so this load
+         * publishes the rodata that argv publishes in production. A
+         * second, hand-kept flag list is what lets a reachable profile
+         * go unloaded.
+         */
+        let mut argv = vec!["scx_baby"];
+        argv.extend(args.split_whitespace());
+        let mode = Mode::from_opts(&Opts::try_parse_from(&argv)?);
         let ro = skel.maps.rodata_data.as_mut().unwrap();
-        /* Gaming is the only profile that selects the 800us slice. */
-        ro.deadline_ns = if gaming { 800 } else { 1180 } * 1000;
-        ro.prio_offset_ns = scaled_prio_offsets(ro.deadline_ns);
-        ro.gaming = gaming;
+        publish_mode(ro, &mode);
         ro.nr_cpu_ids = nr_cpus as u64;
         ro.nr_node_ids = 2;
         /*
@@ -1405,16 +1425,6 @@ mod tests {
         ro.nr_llc_ids = nr_cpus.min(8) as u64;
         ro.nr_big_cpus = (nr_cpus / 2) as u64;
         ro.nr_little_cpus = (nr_cpus - nr_cpus / 2) as u64;
-        ro.plain = plain;
-        ro.plain_1x = plain_1x;
-        ro.plain_wake = plain_wake;
-        ro.plain_vtime = plain_vtime;
-        ro.game_pin = game_pin;
-        /* The seat guard resolves from the profile, like from_opts(). */
-        ro.seat_guard = !plain && !gaming;
-        /* The knobs publish zero whenever the pin resolves off. */
-        ro.pin_grace_ns = if game_pin { 20_000_000 } else { 0 };
-        ro.pin_max = if game_pin { 2 } else { 0 };
         ro.vtime_lag_ns = 20_000_000;
         for cpu in 0..nr_cpus.min(ro.topo_node.len()) {
             // Two node-ish halves, eight LLCs, per-pair L2 groups
@@ -1464,56 +1474,30 @@ mod tests {
          * combination that is missing here is a load the verifier
          * never sees.
          */
-        for (shape, flags) in [
+        for (shape, args) in [
             /* default */
-            ("default", [false, false, false, false, false, false]),
-            /* --plain */
-            ("--plain", [true, false, false, false, false, false]),
-            /* --plain-1x */
-            ("--plain-1x", [true, true, false, false, false, false]),
-            /* --plain-wake */
-            ("--plain-wake", [true, true, true, false, false, false]),
-            /* --plain-vtime */
-            ("--plain-vtime", [true, true, false, true, false, false]),
-            /* --plain-wake --plain-vtime */
-            (
-                "--plain-wake --plain-vtime",
-                [true, true, true, true, false, false],
-            ),
-            /* --plain-vtime --game-pin */
-            (
-                "--plain-vtime --game-pin",
-                [true, true, false, true, true, false],
-            ),
-            /* --plain-wake --plain-vtime --game-pin */
+            ("default", ""),
+            ("--plain", "--plain"),
+            ("--plain-1x", "--plain-1x"),
+            ("--plain-wake", "--plain-wake"),
+            ("--plain-vtime", "--plain-vtime"),
+            ("--plain-wake --plain-vtime", "--plain-wake --plain-vtime"),
+            ("--plain-vtime --game-pin", "--plain-vtime --game-pin"),
             (
                 "--plain-wake --plain-vtime --game-pin",
-                [true, true, true, true, true, false],
+                "--plain-wake --plain-vtime --game-pin",
             ),
-            /* --game --no-game-pin */
-            (
-                "--game --no-game-pin",
-                [true, true, false, true, false, true],
-            ),
-            /* --game */
-            ("--game", [true, true, false, true, true, true]),
-            /* --game --no-game-pin --plain-wake */
+            ("--game --no-game-pin", "--game --no-game-pin"),
+            ("--game", "--game"),
             (
                 "--game --no-game-pin --plain-wake",
-                [true, true, true, true, false, true],
+                "--game --no-game-pin --plain-wake",
             ),
-            /* --game --plain-wake */
-            ("--game --plain-wake", [true, true, true, true, true, true]),
+            ("--game --plain-wake", "--game --plain-wake"),
         ] {
-            let [plain, plain_1x, plain_wake, plain_vtime, game_pin, gaming] = flags;
-
             for nr_cpus in [1usize, 14, 128] {
-                if let Err(error) = load_synthetic(shape, nr_cpus, flags, &mut log) {
-                    failures.push(format!(
-                        "{nr_cpus} CPUs plain={plain} 1x={plain_1x} \
-                         wake={plain_wake} vtime={plain_vtime} pin={game_pin} \
-                         gaming={gaming}: {error:#}"
-                    ));
+                if let Err(error) = load_synthetic(shape, args, nr_cpus, &mut log) {
+                    failures.push(format!("{nr_cpus} CPUs {shape}: {error:#}"));
                 }
             }
         }
