@@ -335,6 +335,7 @@ struct Mode {
     game_pin: bool,
     pin_grace_ns: u64,
     pin_max: u32,
+    stats: bool,
 }
 
 /// The `-d` defaults: the original DEADLINE_NS, and the gaming slice.
@@ -389,6 +390,13 @@ impl Mode {
                 0
             },
             pin_max: if game_pin { opts.pin_max } else { 0 },
+            /*
+             * The wait/census instrument and the distance histograms run
+             * only when the scheduler was started with --stats: the flag
+             * is fixed at load. The wait stamps stay unconditional; the
+             * starve-rescue timer reads them.
+             */
+            stats: opts.stats.is_some(),
         }
     }
 }
@@ -419,6 +427,12 @@ fn publish_mode(ro: &mut bpf_skel::types::rodata, mode: &Mode) {
     ro.game_pin = mode.game_pin;
     ro.pin_grace_ns = mode.pin_grace_ns;
     ro.pin_max = mode.pin_max;
+    /*
+     * The instrument gates every stats branch below it, so a shape that
+     * leaves it cold loads the profile production runs without --stats,
+     * and one that arms it loads the profile production runs with it.
+     */
+    ro.stats_enabled = mode.stats;
 }
 
 struct Scheduler<'a> {
@@ -502,12 +516,6 @@ impl<'a> Scheduler<'a> {
         let rodata = skel.maps.rodata_data.as_mut().unwrap();
         let mode = Mode::from_opts(opts);
         publish_mode(rodata, &mode);
-
-        // The wait/census instrument and the distance histograms run
-        // only when the scheduler was started with --stats: the flag
-        // is fixed at load. The wait stamps stay unconditional; the
-        // starve-rescue timer reads them.
-        rodata.stats_enabled = opts.stats.is_some();
 
         // Topology counts are rodata: the verifier folds every bound
         // check and prunes the hybrid arms when a tier is empty.
@@ -930,6 +938,23 @@ mod tests {
         assert!(!bench.gaming);
         assert!(bench.plain_vtime);
         assert_eq!(bench.deadline_us, 800);
+    }
+
+    /// `--stats` is resolved by the same publish pass as every other
+    /// rodata gate, so the synthetic matrix can load the instrument-on
+    /// profile production runs.
+    #[test]
+    fn stats_resolves_from_the_flag_into_the_mode() {
+        let default = Mode::from_opts(&Opts::try_parse_from(["scx_baby"]).unwrap());
+        assert!(!default.stats);
+
+        let on = Mode::from_opts(&Opts::try_parse_from(["scx_baby", "--stats", "1"]).unwrap());
+        assert!(on.stats);
+
+        let game =
+            Mode::from_opts(&Opts::try_parse_from(["scx_baby", "--game", "--stats", "1"]).unwrap());
+        assert!(game.stats && game.gaming && game.plain_vtime);
+        assert_eq!(game.deadline_us, 800);
     }
 
     /// The pin knobs bind their ranges at parse time: at most two slots
@@ -1458,9 +1483,11 @@ mod tests {
         let mut log = VerifierLog::from_env();
         /*
          * Every tuple Mode::from_opts can produce, named by the argv
-         * that produces it. Twelve shapes x three widths: a reachable
+         * that produces it. Fourteen shapes x three widths: a reachable
          * combination that is missing here is a load the verifier
-         * never sees.
+         * never sees. The last two arm the stats instrument, which is
+         * the one rodata gate no profile tuple above resolves: every
+         * other row loads the profile production runs without --stats.
          */
         for (shape, args) in [
             /* default */
@@ -1482,6 +1509,12 @@ mod tests {
                 "--game --no-game-pin --plain-wake",
             ),
             ("--game --plain-wake", "--game --plain-wake"),
+            /*
+             * The stats instrument on the two profiles that ship. The
+             * interval is inert at load: only stats_enabled is rodata.
+             */
+            ("default+stats", "--stats 1"),
+            ("--game+stats", "--game --stats 1"),
         ] {
             for nr_cpus in [1usize, 14, 128] {
                 if let Err(error) = load_synthetic(shape, args, nr_cpus, &mut log) {
