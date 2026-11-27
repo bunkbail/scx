@@ -58,6 +58,16 @@ __hidden bool balance_try_warm_seat(struct task_struct *p, struct task_ctx *tctx
 		u64 i, n_running = 0;
 		u32 best_rank = BABY_DIST_NR, rank;
 		s32 best = target;
+		/*
+		 * The relocation is limited to a waking arrival whose own
+		 * seat already holds two tasks, or whose fresh depth was
+		 * boosted. Both tests are loop-invariant, so they are
+		 * decided once; the scan still counts residency and seat
+		 * depth for every CPU, it just stops ranking seats the
+		 * arrival will not move to.
+		 */
+		bool scan_seats = (target_nr >= 2 || vlat) &&
+				  (enq_flags & SCX_ENQ_WAKEUP);
 
 		bpf_for(i, 0, nr_cpu_ids) {
 			u32 ci = (u32)i & (BABY_MAX_CPUS - 1);
@@ -87,9 +97,7 @@ __hidden bool balance_try_warm_seat(struct task_struct *p, struct task_ctx *tctx
 			if (i_lat)
 				lat_running++;
 
-			if ((s32)i == target ||
-			    (target_nr < 2 && !vlat) ||
-			    !(enq_flags & SCX_ENQ_WAKEUP) ||
+			if ((s32)i == target || !scan_seats ||
 			    !bpf_cpumask_test_cpu((s32)i, p->cpus_ptr))
 				continue;
 
@@ -248,30 +256,29 @@ __hidden bool balance_try_warm_seat(struct task_struct *p, struct task_ctx *tctx
 			 * so the arrival waits out the resident's slice
 			 * rather than displacing work that is making
 			 * progress.
+			 *
+			 * The seat path runs only outside plain mode, so
+			 * the guarded cut is the only cut there is.
 			 */
 			bool preempt = false;
 
 			if (lat) {
-				if (!plain) {
-					if (res && !(res->flags & PF_IDLE) &&
-					    rctx && !is_lat_cri(rctx)) {
-						u32 sidx = (u32)target &
-							   (BABY_MAX_CPUS - 1);
-						u64 ran_at =
-							cpu_state[sidx].running_at;
+				if (res && !(res->flags & PF_IDLE) &&
+				    rctx && !is_lat_cri(rctx)) {
+					u32 sidx = (u32)target &
+						   (BABY_MAX_CPUS - 1);
+					u64 ran_at =
+						cpu_state[sidx].running_at;
 
-						preempt = !is_pcpu_task(res) &&
-							  p->static_prio <=
-							  res->static_prio &&
-							  ran_at &&
-							  (s64)(now - ran_at) >=
-							  (s64)BABY_TICK_PREEMPT_PROTECT_NS &&
-							  fl_budget_avail(sidx,
-									  now) > 0 &&
-							  can_resched(rctx);
-					}
-				} else {
-					preempt = !rctx || !is_lat_cri(rctx);
+					preempt = !is_pcpu_task(res) &&
+						  p->static_prio <=
+						  res->static_prio &&
+						  ran_at &&
+						  (s64)(now - ran_at) >=
+						  (s64)BABY_TICK_PREEMPT_PROTECT_NS &&
+						  fl_budget_avail(sidx,
+								  now) > 0 &&
+						  can_resched(rctx);
 				}
 			}
 
