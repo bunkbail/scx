@@ -22,6 +22,35 @@ extern struct {
 } pin_slots SEC(".maps");
 
 /*
+ * The two accesses every slot reader repeats: a lookup under a key the
+ * caller holds, and the "slot 0, else slot 1" match that the enqueue,
+ * select and account paths each open-code. The key goes by pointer
+ * because the second helper has to leave the index it matched in the
+ * caller's variable, and an inlined copy of it is then the same stack
+ * object the open-coded version addressed.
+ *
+ * pin_slot_find() starts at the caller's key, which every site
+ * initializes to zero, and moves it to 1 only when the second slot is
+ * the one that matched.
+ */
+static __always_inline struct pin_slot *pin_slot_get(const u32 *k)
+{
+	return bpf_map_lookup_elem(&pin_slots, k);
+}
+
+static __always_inline struct pin_slot *pin_slot_find(u32 pid, u32 *key)
+{
+	struct pin_slot *slot = pin_slot_get(key);
+
+	if (slot && slot->pid == pid)
+		return slot;
+
+	*key = 1;
+	slot = pin_slot_get(key);
+	return (slot && slot->pid == pid) ? slot : NULL;
+}
+
+/*
  * Restart the grace window of a slot this task owns. ops.stopping() is
  * the instant the task leaves the CPU, so this is where a 20 ms window
  * that must cover an inter-frame gap has to start; the enqueue and wake
@@ -32,12 +61,12 @@ __hidden __noinline void pin_stopping_stamp(struct task_struct *p, u64 now)
 	struct pin_slot *slot;
 	u32 key = 0, pid = (u32)p->pid;
 
-	slot = bpf_map_lookup_elem(&pin_slots, &key);
+	slot = pin_slot_get(&key);
 	if (slot && READ_ONCE(slot->pid) == pid)
 		slot->active_until = now + pin_grace_ns;
 
 	key = 1;
-	slot = bpf_map_lookup_elem(&pin_slots, &key);
+	slot = pin_slot_get(&key);
 	if (slot && READ_ONCE(slot->pid) == pid)
 		slot->active_until = now + pin_grace_ns;
 }
@@ -80,7 +109,7 @@ __hidden __noinline void pin_mask_rebuild(void)
 
 	__builtin_memset(next_shield, 0, sizeof(next_shield));
 
-	slot = bpf_map_lookup_elem(&pin_slots, &key);
+	slot = pin_slot_get(&key);
 	if (slot && slot->pid) {
 		if (slot->home_cpu >= 0 && (u32)slot->home_cpu < nr_cpu_ids) {
 			next_shield[(u32)slot->home_cpu &
@@ -95,7 +124,7 @@ __hidden __noinline void pin_mask_rebuild(void)
 	}
 
 	key = 1;
-	slot = bpf_map_lookup_elem(&pin_slots, &key);
+	slot = pin_slot_get(&key);
 	if (slot && slot->pid) {
 		if (slot->home_cpu >= 0 && (u32)slot->home_cpu < nr_cpu_ids) {
 			next_shield[(u32)slot->home_cpu &
@@ -336,9 +365,9 @@ static __noinline void pin_try_promote(struct task_struct *p,
 
 	busy = pin_busy_sample(now);
 
-	slot0 = bpf_map_lookup_elem(&pin_slots, &key);
+	slot0 = pin_slot_get(&key);
 	key = 1;
-	slot1 = bpf_map_lookup_elem(&pin_slots, &key);
+	slot1 = pin_slot_get(&key);
 
 	/*
 	 * A slot 0 claim has to keep off the core slot 1 holds, or the
@@ -399,10 +428,10 @@ __hidden __noinline void pin_account(struct task_struct *p,
 	 * raw window rather than a blend, so the test binds from the
 	 * first window on.
 	 */
-	slot = bpf_map_lookup_elem(&pin_slots, &key);
+	slot = pin_slot_get(&key);
 	if (!slot || slot->pid != (u32)p->pid) {
 		key = 1;
-		slot = bpf_map_lookup_elem(&pin_slots, &key);
+		slot = pin_slot_get(&key);
 		if (!slot || slot->pid != (u32)p->pid)
 			slot = NULL;
 	}
@@ -419,8 +448,7 @@ __hidden __noinline void pin_account(struct task_struct *p,
 
 		if (key == 1) {
 			u32 zero = 0;
-			struct pin_slot *slot0 =
-				bpf_map_lookup_elem(&pin_slots, &zero);
+			struct pin_slot *slot0 = pin_slot_get(&zero);
 
 			pair_lost = slot0 && READ_ONCE(slot0->pid) &&
 				    READ_ONCE(slot0->tgid) != (u32)p->tgid;
@@ -458,12 +486,12 @@ __hidden bool pin_owns_cpu(s32 cpu, const struct task_struct *p)
 	if (cpu < 0)
 		return false;
 
-	slot = bpf_map_lookup_elem(&pin_slots, &key);
+	slot = pin_slot_get(&key);
 	if (slot && slot->pid == (u32)p->pid && slot->home_cpu == cpu)
 		return true;
 
 	key = 1;
-	slot = bpf_map_lookup_elem(&pin_slots, &key);
+	slot = pin_slot_get(&key);
 	if (slot && slot->pid == (u32)p->pid && slot->home_cpu == cpu)
 		return true;
 	return false;
@@ -491,7 +519,7 @@ __hidden __noinline bool is_cpu_shielded(s32 cpu, u64 now)
 	if (!pin_shield_cpu[(u32)cpu & (BABY_MAX_CPUS - 1)])
 		return false;
 
-	slot = bpf_map_lookup_elem(&pin_slots, &key);
+	slot = pin_slot_get(&key);
 	if (slot && slot->pid && (slot->home_cpu == cpu || slot->sib_cpu == cpu)) {
 		if ((s64)(now - slot->active_until) <= 0)
 			return true;
@@ -510,7 +538,7 @@ __hidden __noinline bool is_cpu_shielded(s32 cpu, u64 now)
 	}
 
 	key = 1;
-	slot = bpf_map_lookup_elem(&pin_slots, &key);
+	slot = pin_slot_get(&key);
 	if (slot && slot->pid && (slot->home_cpu == cpu || slot->sib_cpu == cpu)) {
 		if ((s64)(now - slot->active_until) <= 0)
 			return true;
@@ -536,11 +564,11 @@ static __noinline bool pin_pid_active(u32 pid)
 	if (!pid)
 		return false;
 
-	slot = bpf_map_lookup_elem(&pin_slots, &key);
+	slot = pin_slot_get(&key);
 	if (slot && slot->pid == pid)
 		return true;
 	key = 1;
-	slot = bpf_map_lookup_elem(&pin_slots, &key);
+	slot = pin_slot_get(&key);
 	return slot && slot->pid == pid;
 }
 
@@ -562,13 +590,9 @@ __hidden __noinline bool pin_enqueue_pinned(struct task_struct *p,
 	u32 key = 0, pid = (u32)p->pid;
 	s32 home;
 
-	slot = bpf_map_lookup_elem(&pin_slots, &key);
-	if (!slot || slot->pid != pid) {
-		key = 1;
-		slot = bpf_map_lookup_elem(&pin_slots, &key);
-		if (!slot || slot->pid != pid)
-			return false;
-	}
+	slot = pin_slot_find(pid, &key);
+	if (!slot)
+		return false;
 
 	/*
 	 * A home the task's affinity no longer allows is not a
@@ -693,13 +717,9 @@ __hidden __noinline bool pin_select_pinned(struct task_struct *p,
 	u32 key = 0, pid = (u32)p->pid;
 	s32 home;
 
-	slot = bpf_map_lookup_elem(&pin_slots, &key);
-	if (!slot || slot->pid != pid) {
-		key = 1;
-		slot = bpf_map_lookup_elem(&pin_slots, &key);
-		if (!slot || slot->pid != pid)
-			return false;
-	}
+	slot = pin_slot_find(pid, &key);
+	if (!slot)
+		return false;
 
 	home = slot->home_cpu;
 	if (home < 0 || (u32)home >= nr_cpu_ids ||
@@ -797,7 +817,7 @@ __hidden __noinline bool pin_release_stale(u64 now)
 	bool released = false;
 	u32 key = 0, pid;
 
-	slot = bpf_map_lookup_elem(&pin_slots, &key);
+	slot = pin_slot_get(&key);
 	if (slot) {
 		pid = READ_ONCE(slot->pid);
 		if (pid && now - READ_ONCE(slot->last_seen_ns) > BABY_PIN_STALE_NS &&
@@ -806,7 +826,7 @@ __hidden __noinline bool pin_release_stale(u64 now)
 	}
 
 	key = 1;
-	slot = bpf_map_lookup_elem(&pin_slots, &key);
+	slot = pin_slot_get(&key);
 	if (slot) {
 		pid = READ_ONCE(slot->pid);
 		if (pid && now - READ_ONCE(slot->last_seen_ns) > BABY_PIN_STALE_NS &&
@@ -830,11 +850,11 @@ __hidden __noinline bool pin_slot_live(void)
 	struct pin_slot *slot;
 	u32 key = 0;
 
-	slot = bpf_map_lookup_elem(&pin_slots, &key);
+	slot = pin_slot_get(&key);
 	if (slot && READ_ONCE(slot->pid))
 		return true;
 
 	key = 1;
-	slot = bpf_map_lookup_elem(&pin_slots, &key);
+	slot = pin_slot_get(&key);
 	return slot && READ_ONCE(slot->pid);
 }
