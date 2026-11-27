@@ -602,6 +602,7 @@ static __always_inline u64 calc_avg(u64 old_val, u64 new_val)
 __hidden struct task_ctx *try_lookup_task_ctx(const struct task_struct *p);
 __hidden struct task_ctx *init_task_ctx(struct task_struct *p);
 __hidden u32 cpu_dist(s32 a, s32 b);
+u32 balance_cpu_dist(s32 a, s32 b);
 
 /*
  * class.bpf.c: bursts, wake frequency, class predicates and deadline math.

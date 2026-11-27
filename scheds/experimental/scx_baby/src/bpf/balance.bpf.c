@@ -93,7 +93,7 @@ __hidden bool balance_try_warm_seat(struct task_struct *p, struct task_ctx *tctx
 			    !bpf_cpumask_test_cpu((s32)i, p->cpus_ptr))
 				continue;
 
-			rank = cpu_dist(prev_cpu, i);
+			rank = balance_cpu_dist(prev_cpu, i);
 			/*
 			 * A seat whose SMT sibling runs a latency-critical
 			 * task is half a core for that resident. Rank it

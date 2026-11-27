@@ -68,7 +68,7 @@ __hidden s32 cpu_smt_sibling(s32 cpu)
  * arms of a three-way compare would branch the scan's exploration and
  * blow past the jump-complexity limit (observed 8193-jump blowup).
  */
-__hidden u32 cpu_dist(s32 a, s32 b)
+static __always_inline u32 cpu_dist_core(s32 a, s32 b)
 {
 	u32 ia, ib;
 
@@ -91,6 +91,25 @@ __hidden u32 cpu_dist(s32 a, s32 b)
 		return BABY_DIST_NODE;
 
 	return BABY_DIST_BEYOND;
+}
+
+__hidden u32 cpu_dist(s32 a, s32 b)
+{
+	return cpu_dist_core(a, b);
+}
+
+/*
+ * The warm-seat scan reaches the same rank through a global
+ * subprogram: the verifier checks it once and treats the call as
+ * opaque inside balance_try_warm_seat, so the scan's per-queue states
+ * stop multiplying into the programs that contain it. The result is
+ * opaque to the caller, so it is only ever compared here and never
+ * used as an array index (main.bpf.c indexes nr_seat_move with
+ * cpu_dist instead).
+ */
+__noinline u32 balance_cpu_dist(s32 a, s32 b)
+{
+	return cpu_dist_core(a, b);
 }
 
 struct {
