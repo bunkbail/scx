@@ -82,14 +82,15 @@ tick_saturation_gate(struct task_struct *p, struct task_ctx *tctx, u64 now)
 	 *
 	 * A latency-critical resident is normally exempt: it is the class
 	 * the lane exists for, and a tick that cut it would trade two
-	 * protected tasks against each other. The seat guard makes the
-	 * exemption conditional, because under the guard a guarded seat
-	 * placement may legally park a latency-critical arrival behind a
-	 * latency-critical resident whose slice the guard also bounds;
-	 * without the gate that arrival waits out the fourfold slice with
-	 * no rung left to cut it.
+	 * protected tasks against each other. The exemption survives only
+	 * in the bare --plain baseline. Under the default profile the seat
+	 * guard may legally park a latency-critical arrival behind a
+	 * latency-critical resident whose slice it also bounds, and without
+	 * the gate that arrival waits out the fourfold slice with no rung
+	 * left to cut it; --plain-1x takes the tick for its own
+	 * bookkeeping. The gate is therefore plain_1x || !plain.
 	 */
-	if (plain_1x || (!plain && (!is_lat_cri(tctx) || seat_guard))) {
+	if (plain_1x || !plain) {
 		s32 cpu = scx_bpf_task_cpu(p);
 		u32 idx = (u32)cpu & (BABY_MAX_CPUS - 1);
 		u64 ran_at = cpu_running_at[idx];

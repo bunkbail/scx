@@ -649,7 +649,7 @@ void BPF_STRUCT_OPS(baby_dispatch, s32 cpu, struct task_struct *prev)
 		 * little tier is oversubscribed by more than its own
 		 * depth, the steal is worth the migration again.
 		 */
-		if (seat_guard &&
+		if (!plain &&
 		    now - READ_ONCE(seat_last_enq_ns) <= BABY_SEAT_FRESH_NS) {
 			bool multi_llc = nr_llc_ids > 1;
 			bool multi_node = nr_node_ids > 1;

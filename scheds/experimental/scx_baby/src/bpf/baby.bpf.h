@@ -143,16 +143,20 @@ _Static_assert(WAKELESS_DEMOTE_NS > 100ULL * NSEC_PER_MSEC / LAT_CRI_WAKE_FREQ,
 extern const volatile u64 deadline_ns;
 
 /*
- * Gaming profile: the plain virtual-time queue on an 800us slice. There
- * are no warm seats and no fast lane under it; a latency-critical wake
- * waits in the node's virtual-time queue like any other task.
- */
-extern const volatile bool gaming;
-
-/*
  * Plain EDF baseline (--plain): no warm seats, no two-lane split and no
  * lane arbitration. It exists for scheduler comparisons, not for
  * production.
+ *
+ * The seat guard is this flag's complement, so the reduced programs read
+ * `!plain` where the full scheduler tested a second rodata bool: a
+ * warm-seat placement has to earn its preemption and its deep rung, and
+ * a CPU about to idle may take one task off another CPU's seat. The
+ * guard exists because the two defaults it changes are only safe under
+ * the full scheduler: a latency-critical arrival seated behind any
+ * resident is handed a preemption kick, and a deep queue grants four
+ * slices to whatever joins the shared queue. --game implies plain, so
+ * every plain profile and --game prune the guarded branches and their
+ * rodata stays inert.
  */
 extern const volatile bool plain;
 
@@ -169,22 +173,6 @@ extern const volatile bool plain_wake;
  */
 extern const volatile bool plain_vtime;
 extern const volatile u64 vtime_lag_ns;
-
-/*
- * Seat guard (default profile): a warm-seat placement has to earn its
- * preemption and its deep rung, and a CPU about to idle may take one
- * task off another CPU's seat. The guard exists because the two
- * defaults it changes are only safe under the full scheduler: a
- * latency-critical arrival seated behind any resident is handed a
- * preemption kick, and a deep queue grants four slices to whatever
- * joins the shared queue.
- *
- * Userspace publishes it as !plain && !gaming, so every plain profile
- * and --game read it as false and the verifier prunes these branches
- * there. A game cell's rodata is then provably inert, and the guarded
- * code cannot reach plain or gaming behaviour.
- */
-extern const volatile bool seat_guard;
 
 /*
  * The wait/census instrument and the distance histograms run; set

@@ -88,7 +88,7 @@ __hidden void update_bursts(struct task_ctx *tctx, u64 now)
 	if (delta) {
 		account_bursts(tctx, delta, now);
 		tctx->last_acc_at = now;
-		if (seat_guard) {
+		if (!plain) {
 			tctx->wakeless_ns += delta;
 			if (tctx->peak_freq &&
 			    tctx->wakeless_ns > WAKELESS_DEMOTE_NS)
@@ -173,7 +173,7 @@ __hidden void class_on_runnable(struct task_ctx *tctx, u64 enq_flags, u64 now)
 	if (!(enq_flags & SCX_ENQ_WAKEUP))
 		return;
 
-	if (seat_guard)
+	if (!plain)
 		tctx->wakeless_ns = 0;
 
 	/*

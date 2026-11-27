@@ -162,19 +162,6 @@ __hidden bool balance_try_warm_seat(struct task_struct *p, struct task_ctx *tctx
 				try_lookup_task_ctx(res) : NULL;
 
 			/*
-			 * Gaming profile: a foreground resident is about
-			 * to run the frame itself, so seating a
-			 * latency-critical arrival behind it makes the
-			 * arrival wait out the fourfold slice. The arrival
-			 * joins the shared fast-lane queue instead, where
-			 * the earliest deadline wins. The default profile
-			 * keeps the seat: it is the cache the rotation is
-			 * built on.
-			 */
-			if (gaming && lat && rctx && is_foreground(rctx))
-				return false;
-
-			/*
 			 * The depth rung is bulk-only and is decided on the
 			 * seat the task actually joins: a non-foreground
 			 * latency-critical arrival granted four slices
@@ -265,7 +252,7 @@ __hidden bool balance_try_warm_seat(struct task_struct *p, struct task_ctx *tctx
 			bool preempt = false;
 
 			if (lat) {
-				if (seat_guard) {
+				if (!plain) {
 					if (res && !(res->flags & PF_IDLE) &&
 					    rctx && !is_lat_cri(rctx)) {
 						u32 sidx = (u32)target &

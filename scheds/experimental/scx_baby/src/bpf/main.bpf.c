@@ -18,15 +18,14 @@ char _license[] SEC("license") = "GPL";
 const volatile u64 deadline_ns = 1180000ULL;
 
 /*
- * Gaming profile: the plain virtual-time queue on an 800us slice. There
- * are no warm seats and no fast lane under it; a latency-critical wake
- * waits in the node's virtual-time queue like any other task.
- */
-const volatile bool gaming;
-
-/*
  * Plain EDF baseline (--plain): no warm seats, no two-lane split and no
  * lane arbitration. Every task waits in its node's deadline queue.
+ *
+ * The seat guard is this flag's complement, so the BPF side reads
+ * `!plain` directly rather than a second rodata bool. It bounds the
+ * preemption and the deep rung a warm-seat placement gets, and lets an
+ * about-to-idle CPU take one task off another seat. --game implies
+ * plain, so every plain profile prunes the guarded branches.
  */
 const volatile bool plain;
 
@@ -44,15 +43,6 @@ const volatile bool plain_wake;
  */
 const volatile bool plain_vtime;
 const volatile u64 vtime_lag_ns = 20000000ULL;
-
-/*
- * Seat guard: the default profile's alone. It bounds the preemption and
- * the deep rung a warm-seat placement gets, and lets an about-to-idle
- * CPU take one task off another seat. baby.bpf.h carries the rationale
- * and the branches; userspace publishes false for every plain profile
- * and for --game, where the verifier prunes them.
- */
-const volatile bool seat_guard;
 
 /*
  * The game pin, armed by --game/--profile gaming and cleared by
@@ -549,9 +539,16 @@ void BPF_STRUCT_OPS(baby_enqueue, struct task_struct *p, u64 enq_flags)
 				node_service_at[lat & 1][node &
 							 (BABY_NODE_CLOCK_NR - 1)] = now;
 
+			/*
+			 * `plain` is 0 in this arm, but keep the
+			 * substitution literal: collapsing it to `!lat`
+			 * re-colours the spills and moves every plain
+			 * and --game image by 32 bytes for no
+			 * behavioural change.
+			 */
 			slice = backlog_deep(lane_backlog) &&
 				 !tctx->tick_preempted &&
-				 !(seat_guard && lat)
+				 !(!plain && lat)
 				? 4 * deadline_ns : task_slice(tctx);
 
 			baby_insert_vtime(p, tctx, dsq, slice,

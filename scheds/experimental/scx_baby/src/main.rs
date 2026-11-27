@@ -335,7 +335,6 @@ struct Mode {
     game_pin: bool,
     pin_grace_ns: u64,
     pin_max: u32,
-    seat_guard: bool,
 }
 
 /// The `-d` defaults: the original DEADLINE_NS, and the gaming slice.
@@ -369,15 +368,6 @@ impl Mode {
         let plain = opts.plain || plain_1x;
         let game_pin = !opts.no_game_pin && (gaming || opts.game_pin) && plain_vtime;
 
-        /*
-         * The seat guard belongs to the default profile alone. Every
-         * plain variant runs the minimal EDF baseline, whose whole
-         * point is the placement without the guard, and --game has to
-         * stay verifier-DCE-isolated from the default's preemption and
-         * steal rules, so both resolve to false there.
-         */
-        let seat_guard = !plain && !gaming;
-
         Self {
             gaming,
             deadline_us,
@@ -399,7 +389,6 @@ impl Mode {
                 0
             },
             pin_max: if game_pin { opts.pin_max } else { 0 },
-            seat_guard,
         }
     }
 }
@@ -418,17 +407,10 @@ impl Mode {
 fn publish_mode(ro: &mut bpf_skel::types::rodata, mode: &Mode) {
     ro.deadline_ns = mode.deadline_us * 1000;
     ro.prio_offset_ns = scaled_prio_offsets(ro.deadline_ns);
-    ro.gaming = mode.gaming;
     ro.plain = mode.plain;
     ro.plain_1x = mode.plain_1x;
     ro.plain_wake = mode.plain_wake;
     ro.plain_vtime = mode.plain_vtime;
-    /*
-     * The seat guard is the default profile's alone; every plain variant
-     * and --game publish false, so their BPF branches are pruned by the
-     * verifier and their rodata stays inert.
-     */
-    ro.seat_guard = mode.seat_guard;
     /*
      * Gaming arms the pin; --no-game-pin or a run that never selects the
      * plain virtual-time queue clears it. The BPF branches below it are
@@ -1047,32 +1029,37 @@ mod tests {
         assert!(Opts::try_parse_from(["scx_baby", "--game-pin", "--no-game-pin"]).is_err());
     }
 
-    /// The seat guard is the default profile's flag alone: every plain
-    /// variant runs the minimal EDF baseline and --game has to stay
-    /// verifier-DCE-isolated from the default's preemption, deep-rung
-    /// and seat-steal rules, so both publish false.
+    /// The seat guard is the default profile's alone, and the BPF side
+    /// reads it as `!plain`. The substitution is exact only while
+    /// `!plain && !gaming == !plain` holds for every reachable argv:
+    /// gaming is the one profile that can set a flag while staying
+    /// outside the default, and it implies plain.
     #[test]
     fn seat_guard_resolves_to_the_default_profile_only() {
-        let cases: &[(&[&str], bool)] = &[
-            (&[], true),
-            (&["--game"], false),
-            (&["--profile", "gaming"], false),
-            (&["--game", "--no-game-pin"], false),
-            (&["--game", "-d", "1000"], false),
-            (&["--plain"], false),
-            (&["--plain-1x"], false),
-            (&["--plain-wake"], false),
-            (&["--plain-vtime"], false),
-            (&["--plain-vtime", "--game-pin"], false),
-            (&["--game", "--plain-wake"], false),
+        let cases: &[&[&str]] = &[
+            &[],
+            &["--game"],
+            &["--profile", "gaming"],
+            &["--game", "--no-game-pin"],
+            &["--game", "-d", "1000"],
+            &["--plain"],
+            &["--plain-1x"],
+            &["--plain-wake"],
+            &["--plain-vtime"],
+            &["--plain-vtime", "--game-pin"],
+            &["--game", "--plain-wake"],
         ];
 
-        for (args, want) in cases {
+        for args in cases {
             let mut argv = vec!["scx_baby"];
             argv.extend_from_slice(args);
             let mode = Mode::from_opts(&Opts::try_parse_from(&argv).unwrap());
 
-            assert_eq!(mode.seat_guard, *want, "{args:?}");
+            assert_eq!(!mode.plain && !mode.gaming, !mode.plain, "{args:?}");
+            assert!(
+                !(mode.gaming && !mode.plain),
+                "gaming implies plain: {args:?}"
+            );
         }
     }
 
@@ -1204,9 +1191,10 @@ mod tests {
 
     #[test]
     fn wakeless_demotion_is_off_outside_the_guard() {
-        // --game and every plain variant publish seat_guard false, so the
-        // verifier prunes the demotion branch there and their behaviour is
-        // unchanged no matter how long a task runs without waking.
+        // --game and every plain variant read the seat guard as !plain,
+        // which is false there, so the verifier prunes the demotion
+        // branch and their behaviour is unchanged no matter how long a
+        // task runs without waking.
         for args in [&["--game"][..], &["--plain"][..], &["--plain-1x"][..]] {
             let mut argv = vec!["scx_baby"];
             argv.extend_from_slice(args);
@@ -1214,7 +1202,7 @@ mod tests {
             let mode = Mode::from_opts(&Opts::try_parse_from(&argv).unwrap());
 
             assert_eq!(
-                wakeless_peak(mode.seat_guard, 12, &[3_000_000_000]),
+                wakeless_peak(!mode.plain, 12, &[3_000_000_000]),
                 12,
                 "{args:?}"
             );
