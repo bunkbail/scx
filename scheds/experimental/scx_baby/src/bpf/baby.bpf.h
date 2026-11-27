@@ -133,7 +133,6 @@ _Static_assert(FOREGROUND_WAKE_FREQ <= 100,
 _Static_assert(WAKELESS_DEMOTE_NS > 100ULL * NSEC_PER_MSEC / LAT_CRI_WAKE_FREQ,
 	       "a task at the latency bar must not be demoted between wakes");
 #define MIN_NICE		(-20)
-#define MAX_NICE		19
 #define MAX_RT_PRIO		100
 #define MAX_PRIO		(MAX_RT_PRIO + 40)
 #define PRIO_TO_NICE(prio)	((prio) - (MAX_RT_PRIO + 20))
@@ -142,9 +141,6 @@ _Static_assert(WAKELESS_DEMOTE_NS > 100ULL * NSEC_PER_MSEC / LAT_CRI_WAKE_FREQ,
  * Default deadline offset (1.18ms, the original DEADLINE_NS).
  */
 extern const volatile u64 deadline_ns;
-
-/* Report additional debugging information. */
-extern const volatile bool debug;
 
 /*
  * Gaming profile: the plain virtual-time queue on an 800us slice. There
@@ -195,11 +191,6 @@ extern const volatile bool seat_guard;
  * from --stats at load.
  */
 extern const volatile bool stats_enabled;
-
-#define dbg_msg(_fmt, ...) do {				\
-	if (debug)					\
-		bpf_printk(_fmt, ##__VA_ARGS__);	\
-} while(0)
 
 /*
  * Cache-topology distance rank, as published by userspace from the sysfs

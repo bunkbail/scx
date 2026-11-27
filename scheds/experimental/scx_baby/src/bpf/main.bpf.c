@@ -17,9 +17,6 @@ char _license[] SEC("license") = "GPL";
  */
 const volatile u64 deadline_ns = 1180000ULL;
 
-/* Report additional debugging information. */
-const volatile bool debug;
-
 /*
  * Gaming profile: the plain virtual-time queue on an 800us slice. There
  * are no warm seats and no fast lane under it; a latency-critical wake

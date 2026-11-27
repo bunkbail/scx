@@ -300,8 +300,8 @@ struct Opts {
     #[clap(long)]
     monitor: Option<f64>,
 
-    /// Enable BPF debugging via /sys/kernel/tracing/trace_pipe.
-    #[clap(short = 'D', long, action = clap::ArgAction::SetTrue)]
+    /// Deprecated; `-D`/`--debug` is accepted but has no effect.
+    #[clap(short = 'D', long, hide = true, action = clap::ArgAction::SetTrue)]
     debug: bool,
 
     /// Enable verbose output, including libbpf details.
@@ -477,10 +477,13 @@ impl<'a> Scheduler<'a> {
 
         skel.struct_ops.baby_ops_mut().exit_dump_len = opts.exit_dump_len;
 
+        if opts.debug {
+            warn!("-D/--debug is deprecated and has no effect");
+        }
+
         // Override default BPF scheduling parameters.
         let rodata = skel.maps.rodata_data.as_mut().unwrap();
         let mode = Mode::from_opts(opts);
-        rodata.debug = opts.debug;
         rodata.deadline_ns = mode.deadline_us * 1000;
         rodata.prio_offset_ns = scaled_prio_offsets(rodata.deadline_ns);
 

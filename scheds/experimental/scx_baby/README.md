@@ -375,8 +375,6 @@ policy.
 - `--stats <SECS>`: enable the stats report and run normally.
 - `--monitor <SECS>`: run in stats monitoring mode without launching the
   scheduler.
-- `-D, --debug`: enable BPF debugging via
-  `/sys/kernel/tracing/trace_pipe`.
 - `-v, --verbose`: verbose output, including libbpf details.
 - `--help-stats`: show descriptions for the statistics.
 - `--exit-dump-len <LEN>`: exit debug dump buffer length, 0 for the
